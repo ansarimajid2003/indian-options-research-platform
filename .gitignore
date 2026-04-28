@@ -1,0 +1,30 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.part
+~$*
+
+# Large market data inputs/outputs
+archive/
+cleaned_archive/
+NSE - NIFTY ALL INDEX DATA - Upto 2024/
+nifty50_1min_CANONICAL.csv
+
+# Optional generated local exports
+exports/
+downloads/

@@ -1,0 +1,2 @@
+rows,start,end,archive_end,recent_rows_used,duplicate_timestamps,source_counts,partial_days_lt_300_rows
+1041264,2015-01-09 09:15:00,2026-04-28 12:13:00,2026-04-08 10:23:00,2068,0,"{'archive': 1039196, 'yfinance_recent': 2068}",17
