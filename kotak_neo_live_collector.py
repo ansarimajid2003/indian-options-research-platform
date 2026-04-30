@@ -11,7 +11,7 @@ Usage:
     3. The script runs during market hours and auto-stops at 15:30 IST
 
 Requirements:
-    pip install "git+https://github.com/Kotak-Neo/kotak-neo-api.git"
+    pip install "git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.1#egg=neo_api_client"
     pip install pyotp pandas
 
 SEBI Static IP note:
@@ -32,14 +32,13 @@ try:
 except ImportError:
     raise SystemExit(
         'Install SDK first:\n'
-        '  pip install "git+https://github.com/Kotak-Neo/kotak-neo-api.git"'
+        '  pip install "git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.1#egg=neo_api_client"'
     )
 
 # ── CONFIG — fill these in ────────────────────────────────────────────────────
 CONSUMER_KEY    = "YOUR_CONSUMER_KEY"        # from Kotak Neo App > More > Trade API
-CONSUMER_SECRET = "YOUR_CONSUMER_SECRET"     # shown once when creating the app
 MOBILE_NUMBER   = "+91XXXXXXXXXX"            # your registered mobile number
-PASSWORD        = "YOUR_PASSWORD"            # Kotak Neo login password
+UCC             = "YOUR_UCC"                 # Unique Client Code from Kotak Neo profile
 MPIN            = "XXXXXX"                   # 6-digit MPIN
 TOTP_SECRET     = "YOUR_TOTP_SECRET"         # base32 secret from TOTP QR scan
 
@@ -168,7 +167,8 @@ def authenticate():
     print("Initialising Kotak Neo client...")
     client = NeoAPI(
         consumer_key=CONSUMER_KEY,
-        consumer_secret=CONSUMER_SECRET,
+        access_token=None,
+        neo_fin_key=None,
         environment="prod",
         on_message=on_message,
         on_error=on_error,
@@ -176,18 +176,18 @@ def authenticate():
         on_open=on_open,
     )
 
-    print("Step 1: Login with mobile + password...")
-    resp = client.login(
-        mobilenumber=MOBILE_NUMBER,
-        password=PASSWORD,
-    )
-    print("Login response:", resp)
-
-    print("Step 2: 2FA with TOTP + MPIN...")
+    print("Step 1: Login with mobile + UCC + TOTP...")
     totp_code = pyotp.TOTP(TOTP_SECRET).now()
-    otp_combined = totp_code + MPIN   # Kotak Neo expects TOTP+MPIN concatenated
-    resp2 = client.session_2fa(OTP=otp_combined)
-    print("2FA response:", resp2)
+    resp = client.totp_login(
+        mobile_number=MOBILE_NUMBER,
+        ucc=UCC,
+        totp=totp_code,
+    )
+    print("TOTP login response:", resp)
+
+    print("Step 2: Validate MPIN to generate trade token...")
+    resp2 = client.totp_validate(mpin=MPIN)
+    print("TOTP validate response:", resp2)
 
     return client
 

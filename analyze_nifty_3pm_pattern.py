@@ -4,7 +4,7 @@ import html
 import pandas as pd
 
 
-INPUT = Path("cleaned_archive/NIFTY 50_15minute.csv")
+from data_loader import load_nifty_15min  # noqa: E402  (after stdlib imports)
 OUT_DIR = Path("data_quality_reports")
 SUMMARY_DIR = OUT_DIR / "summaries"
 CHART_DIR = SUMMARY_DIR / "charts"
@@ -286,7 +286,7 @@ def generate_human_reports(
     main_report = f"""
 # NIFTY 50 3 PM Alpha Study
 
-Dataset: `{INPUT}`
+Dataset: `NIFTY 50 15min (IS: 2015-01-09 to 2024-04-07)`
 
 Period studied: `{date_start}` to `{date_end}`
 
@@ -548,7 +548,7 @@ Raw CSVs remain one folder up in `data_quality_reports/`.
 <body>
   <main>
     <h1>NIFTY 3 PM Pattern Charts</h1>
-    <p class="note">Generated from `{INPUT}`. These charts are self-contained and do not need internet access.</p>
+    <p class="note">Generated from NIFTY 50 15min IS data (2015-01-09 to 2024-04-07). These charts are self-contained and do not need internet access.</p>
     {html_bar_chart("Touch of Prior 3 PM Close: Next-Day Up Rate", touch_chart.to_dict("records"), "next_up_rate", "label", "%", 1, "#0f766e")}
     {html_bar_chart("Touch of Prior 3 PM Close: Avg Next-Day Open-to-Close Return", touch_chart.to_dict("records"), "avg_next_intraday_pct", "label", "%", 3, "#2563eb")}
     {html_bar_chart("3 PM + 3:15 Combo: Avg Next-Day Open-to-Close Return", combo_chart.to_dict("records"), "avg_next_intraday_pct", "label", "%", 3, "#7c3aed")}
@@ -563,8 +563,7 @@ Raw CSVs remain one folder up in `data_quality_reports/`.
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(INPUT, parse_dates=["datetime"]).sort_values("datetime")
-    df["date"] = df["datetime"].dt.date
+    df = load_nifty_15min()  # IS only via data_loader
 
     daily = df.groupby("date").agg(
         day_open=("open", "first"),

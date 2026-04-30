@@ -1,0 +1,7 @@
+edge,n,gap_up_rate,next_up_rate,avg_gap_pct,avg_oc_pct,median_oc_pct,avg_total_pct,touch_rate,close_above_level_rate,three_close_touched_next_day,period
+main_candidate,462,100.0,40.04329004329004,0.34472701647760956,-0.15516812410959857,-0.13756887834337367,0.18899484131434727,73.37662337662337,53.896103896103895,,
+main_candidate_touch_split,123,100.0,74.7967,0.5209,0.2421,0.3053,0.7645,0.0,90.2439,False,
+main_candidate_touch_split,339,100.0,27.4336,0.2808,-0.2993,-0.2878,-0.0198,100.0,40.708,True,
+main_candidate_period_validation,221,100.0,37.1041,0.2891,-0.1981,-0.1669,0.0902,75.5656,49.3213,,2015-2018
+main_candidate_period_validation,183,100.0,43.1694,0.4311,-0.0983,-0.116,0.3325,69.9454,60.6557,,2019-2022
+main_candidate_period_validation,58,100.0,41.3793,0.2842,-0.1711,-0.0925,0.1127,75.8621,50.0,,2023+

@@ -8,14 +8,13 @@
 4. Copy your **Consumer Key** (= API Access Token)
 5. From the same page, tap **Register for TOTP** and scan the QR code
    with Google Authenticator or Microsoft Authenticator
-6. Your **Consumer Secret** is shown once — save it securely
 
 You will need:
 - `consumer_key`      — from Step 3
-- `consumer_secret`   — from Step 6
 - `mobile_number`     — your Kotak Neo registered mobile (+91XXXXXXXXXX)
-- `password`          — your Kotak Neo login password
+- `ucc`               — your Unique Client Code from Kotak Neo profile
 - `mpin`              — your 6-digit MPIN
+- `totp_secret`       — base32 secret from your TOTP QR setup
 
 ## Step 2 — Static IP Whitelisting (SEBI Mandate, mandatory since April 1 2026)
 
@@ -40,7 +39,7 @@ update the whitelisted IP.
 ## Step 3 — Install the SDK
 
 ```
-pip install "git+https://github.com/Kotak-Neo/kotak-neo-api.git"
+pip install "git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.1#egg=neo_api_client"
 ```
 
 ## What the Kotak Neo API CAN and CANNOT do for data

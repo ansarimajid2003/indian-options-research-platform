@@ -11,6 +11,8 @@ venv/
 env/
 .env
 .env.*
+.firecrawl/
+.claude/skills/
 
 # Logs and temporary files
 *.log
@@ -22,6 +24,12 @@ env/
 # Large market data inputs/outputs
 archive/
 cleaned_archive/
+data/bhavcopy/
+data/spot/
+data/dhan_instruments_master.csv
+data/options/raw/
+data/options/normalized/
+data/options/reports/
 NSE - NIFTY ALL INDEX DATA - Upto 2024/
 nifty50_1min_CANONICAL.csv
 
