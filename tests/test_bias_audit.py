@@ -32,7 +32,7 @@ from options_backtest.engine import BacktestEngine
 from options_backtest.schemas import BacktestConfig, OptionType, Side
 from options_backtest.strategy import ShortStraddle
 
-RAW_ROOT = Path("data/options/raw/shoonya/nifty")
+RAW_ROOT = Path("data/raw/options/shoonya/nifty")
 SAMPLE_EXPIRY = "20240104"
 
 

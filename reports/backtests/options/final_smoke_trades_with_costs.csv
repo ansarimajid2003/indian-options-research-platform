@@ -1,0 +1,2 @@
+strategy,expiry,entry_time,exit_time,entry_reason,exit_reason,legs,gross_pnl,charges,net_pnl
+ShortStraddle,2024-01-04,2024-01-04 09:20:00,2024-01-04 15:20:00,entry,time_exit,"SELL:NIFTY04JAN24CE21600@37.1,SELL:NIFTY04JAN24PE21600@41.45",1230.0,100.85,1129.15

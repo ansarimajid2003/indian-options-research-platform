@@ -21,16 +21,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     normalize = sub.add_parser("normalize")
-    normalize.add_argument("--raw-root", default="data/options/raw/shoonya/nifty")
-    normalize.add_argument("--output-root", default="data/options/normalized")
+    normalize.add_argument("--raw-root", default="data/raw/options/shoonya/nifty")
+    normalize.add_argument("--output-root", default="data/processed/options/normalized")
     normalize.add_argument("--expiry", action="append")
     normalize.add_argument("--limit", type=int)
 
     audit = sub.add_parser("audit")
-    audit.add_argument("--raw-root", default="data/options/raw/shoonya/nifty")
+    audit.add_argument("--raw-root", default="data/raw/options/shoonya/nifty")
 
     run = sub.add_parser("run-backtest")
-    run.add_argument("--raw-root", default="data/options/raw/shoonya/nifty")
+    run.add_argument("--raw-root", default="data/raw/options/shoonya/nifty")
     run.add_argument("--strategy", choices=["short-straddle", "short-strangle", "iron-condor", "three-pm-directional", "three-pm-v2-put", "three-pm-v2-call-level-stop"], default="short-straddle")
     run.add_argument("--from-expiry")
     run.add_argument("--to-expiry")
@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--next-day-exit", action="store_true", help="Exit at market open the next calendar day (uses exit_time on next day)")
     run.add_argument("--entry-time", default=None, help="Entry time HH:MM (default 09:20, or 15:16 for three-pm-directional)")
     run.add_argument("--exit-time", default=None, help="Exit time HH:MM (default 15:20, or 09:16 for next-day-exit)")
-    run.add_argument("--output", default="data/options/reports/latest_trades.csv")
+    run.add_argument("--output", default="reports/backtests/options/latest_trades.csv")
     return parser
 
 

@@ -81,7 +81,7 @@ class Trade:
 
 @dataclass(frozen=True)
 class BacktestConfig:
-    raw_root: str = "data/options/raw/shoonya/nifty"
+    raw_root: str = "data/raw/options/shoonya/nifty"
     symbol: str = "NIFTY"
     lot_size: int = 50
     tick_size: float = 0.05

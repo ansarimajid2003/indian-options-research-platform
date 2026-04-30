@@ -10,7 +10,7 @@ Current phase: pattern discovery → backtest correctness → strategy expansion
 - Python 3.11+, pandas, numpy, pyarrow/parquet
 - Data: Shoonya 1-min OHLCV, Dhan expired options (pending), NSE spot/VIX CSV
 - Backtest engine: `options_backtest/` (custom, broker-neutral)
-- Live collector: `kotak_neo_live_collector.py` (Kotak Neo API)
+- Live collector: `scripts/live/kotak_neo_live_collector.py` (Kotak Neo API)
 - No ML frameworks until backtest is validated
 
 ## Active Alpha

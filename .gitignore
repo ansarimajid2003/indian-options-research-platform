@@ -22,6 +22,12 @@ env/
 ~$*
 
 # Large market data inputs/outputs
+data/raw/
+data/processed/
+data/options/
+logs/downloads/
+
+# Legacy locations kept ignored in case old scripts or manual downloads recreate them
 archive/
 cleaned_archive/
 data/bhavcopy/
