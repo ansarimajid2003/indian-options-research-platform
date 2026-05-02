@@ -87,7 +87,7 @@ def load_expiry_options(expiry_dir: Path, strikes: set[int] | None = None) -> pd
     frames = [
         load_option_file(path)
         for path in sorted(expiry_dir.glob("*.csv"))
-        if path.name != "nifty_spot.csv"
+        if OPTION_FILE_RE.match(path.name)
         and (strikes is None or _strike_from_filename(path) in strikes)
     ]
     if not frames:

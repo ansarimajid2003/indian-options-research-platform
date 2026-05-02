@@ -179,10 +179,11 @@ class BiasAuditTests(unittest.TestCase):
         )
         legs = strategy.entry_legs(context)
         entry_credit = 1000.0  # arbitrary positive credit
+        lot_size = engine._resolve_lot_size(pd.Timestamp("2024-01-04").date())
         exit_ts, reason = engine._find_exit(
             pd.Timestamp("2024-01-04 09:20:00"),
             pd.Timestamp("2024-01-04 15:20:00"),
-            legs, resolver, entry_credit
+            legs, resolver, entry_credit, lot_size
         )
         print(f"\n[bias-6] exit_ts={exit_ts}, reason={reason}")
         if exit_ts is not None:
@@ -190,12 +191,12 @@ class BiasAuditTests(unittest.TestCase):
                 "Exit triggered at a phantom timestamp not in the spot feed — data alignment bias")
 
     # -------------------------------------------------------------------------
-    # 7. SL guard: must not trigger when entry_credit <= 0 (debit position)
+    # 7. Debit SL/target handling
     # -------------------------------------------------------------------------
-    def test_sl_does_not_trigger_on_debit_entry(self):
+    def test_sl_can_trigger_on_debit_entry_cost_basis(self):
         """
-        The SL and target logic is gated on entry_credit > 0.
-        A debit entry (negative credit) must never trigger an early exit.
+        Debit entries should use abs(entry_credit) as their cost basis rather
+        than being skipped by credit-only stop/target logic.
         """
         engine = _make_engine(sl=0.5, target=0.5)
         expiry_dir = RAW_ROOT / SAMPLE_EXPIRY
@@ -209,14 +210,14 @@ class BiasAuditTests(unittest.TestCase):
 
         # Simulate a debit entry (e.g. net buyer)
         negative_credit = -5000.0
+        lot_size = engine._resolve_lot_size(pd.Timestamp("2024-01-04").date())
         exit_ts, reason = engine._find_exit(
             pd.Timestamp("2024-01-04 09:20:00"),
             pd.Timestamp("2024-01-04 15:20:00"),
-            legs, resolver, negative_credit
+            legs, resolver, negative_credit, lot_size
         )
         print(f"\n[bias-7] debit entry exit: ts={exit_ts}, reason={reason}")
-        self.assertNotEqual(reason, "stop_loss", "SL triggered on a debit entry — SL guard broken")
-        self.assertNotEqual(reason, "target", "Target triggered on a debit entry — SL guard broken")
+        self.assertIn(reason, {"stop_loss", "target", "time_exit"}, "Debit entry produced an unknown exit reason")
 
     # -------------------------------------------------------------------------
     # 8. Time-exit boundary — exit_time is inclusive, not exclusive

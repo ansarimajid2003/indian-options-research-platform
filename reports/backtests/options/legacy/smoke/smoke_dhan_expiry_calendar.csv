@@ -1,0 +1,4 @@
+strategy,expiry,entry_time,exit_time,entry_reason,exit_reason,legs,gross_pnl,charges,net_pnl,trade_count
+ThreePMDirectional,2021-01-07,2021-01-06 15:16:00,2021-01-07 09:15:00,entry,next_day_open,BUY:NIFTY_DHAN_14200CE@35.7,1217.5,54.59,1162.91,
+ThreePMDirectional,2021-01-14,2021-01-08 15:16:00,2021-01-11 09:15:00,entry,next_day_open,BUY:NIFTY_DHAN_14250CE@166.4,4140.0,78.43,4061.57,
+TOTAL,,,,,,,5357.5,133.02,5224.48,2

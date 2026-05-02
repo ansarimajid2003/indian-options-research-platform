@@ -83,7 +83,8 @@ class Trade:
 class BacktestConfig:
     raw_root: str = "data/raw/options/shoonya/nifty"
     symbol: str = "NIFTY"
-    lot_size: int = 50
+    # None = auto-resolve per trade date via nifty_lot_size(); set an int to override.
+    lot_size: int | None = None
     tick_size: float = 0.05
     slippage_points: float = 0.05
     entry_time: time = time(9, 20)

@@ -13,6 +13,8 @@ env/
 .env.*
 .firecrawl/
 .claude/skills/
+.claude/*.lock
+.claude/settings.local.json
 
 # Logs and temporary files
 *.log

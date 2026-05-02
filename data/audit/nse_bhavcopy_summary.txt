@@ -1,0 +1,44 @@
+================================================================
+NSE F&O BHAVCOPY AUDIT SUMMARY (NIFTY OPTIONS)
+================================================================
+  Years processed       : 2008 - 2026
+  Files processed       : 4512
+  Files with errors     : 0
+  Legacy-schema files   : 4065
+  UDiFF-schema files    : 447
+
+ROW COUNTS (NIFTY options only):
+  Total rows            : 8,074,841
+  Active (OPEN>0) rows  : 1,800,937
+  No-trade rows (flag)  : 6,273,904
+
+QUALITY:
+  True bad OHLC rows    : 0
+  Duplicate keys        : 0
+
+PER-YEAR ROW COUNTS:
+  2008:    144,988 NIFTY option rows
+  2009:    187,022 NIFTY option rows
+  2010:    189,346 NIFTY option rows
+  2011:    359,390 NIFTY option rows
+  2012:    354,632 NIFTY option rows
+  2013:    386,550 NIFTY option rows
+  2014:    472,902 NIFTY option rows
+  2015:    530,846 NIFTY option rows
+  2016:    514,250 NIFTY option rows
+  2017:    527,414 NIFTY option rows
+  2018:    564,154 NIFTY option rows
+  2019:    770,090 NIFTY option rows
+  2020:    731,639 NIFTY option rows
+  2021:    510,565 NIFTY option rows
+  2022:    562,041 NIFTY option rows
+  2023:    339,069 NIFTY option rows
+  2024:    394,150 NIFTY option rows
+  2025:    394,283 NIFTY option rows
+  2026:    141,510 NIFTY option rows
+
+QUALITY VERDICT:
+  OHLC integrity : PASS - zero true bad rows
+  Parse errors   : PASS - all files parsed
+  Duplicates     : PASS - zero duplicate keys
+================================================================

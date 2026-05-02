@@ -1,0 +1,2 @@
+strategy,expiry,entry_time,exit_time,entry_reason,exit_reason,legs,gross_pnl,charges,net_pnl,trade_count
+TOTAL,,,,,,,0.0,0.0,0.0,0

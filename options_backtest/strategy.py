@@ -33,6 +33,9 @@ class OptionStrategy:
     def entry_legs(self, context: StrategyContext) -> list[Leg]:
         raise NotImplementedError
 
+    def can_enter(self, trade_date: date, spot_by_date: dict) -> bool:
+        return True
+
 
 @dataclass(frozen=True)
 class SingleLegOption(OptionStrategy):
@@ -111,6 +114,15 @@ class ThreePMDirectional(OptionStrategy):
         contract = context.resolver.resolve_atm_offset(context.timestamp, 0, option_type)
         return [Leg(contract=contract, side=Side.BUY, lots=self.lots)]
 
+    def can_enter(self, trade_date: date, spot_by_date: dict) -> bool:
+        day_df = spot_by_date.get(trade_date)
+        if day_df is None:
+            return False
+        bar = _first_bar_at_or_after(day_df, trade_date, self.signal_time)
+        if bar is None:
+            return False
+        return float(bar["close"]) != float(bar["open"])
+
 
 @dataclass(frozen=True)
 class IronCondor(OptionStrategy):
@@ -179,6 +191,16 @@ class ThreePMV2Put(OptionStrategy):
     def get_spot_stop_level(self, context: StrategyContext) -> float | None:
         return None
 
+    def can_enter(self, trade_date: date, spot_by_date: dict) -> bool:
+        day_df = spot_by_date.get(trade_date)
+        if day_df is None:
+            return False
+        three_pm = _first_bar_at_or_after(day_df, trade_date, time(15, 0))
+        if three_pm is None or float(three_pm["close"]) <= float(three_pm["open"]):
+            return False
+        three_fifteen = _first_bar_at_or_after(day_df, trade_date, time(15, 15))
+        return three_fifteen is not None and float(three_fifteen["close"]) < float(three_fifteen["open"])
+
 
 @dataclass(frozen=True)
 class ThreePMV2CallLevelStop(OptionStrategy):
@@ -199,3 +221,13 @@ class ThreePMV2CallLevelStop(OptionStrategy):
     def get_spot_stop_level(self, context: StrategyContext) -> float | None:
         three_pm_close, _ = _check_three_pm_setup(context)
         return three_pm_close
+
+    def can_enter(self, trade_date: date, spot_by_date: dict) -> bool:
+        day_df = spot_by_date.get(trade_date)
+        if day_df is None:
+            return False
+        three_pm = _first_bar_at_or_after(day_df, trade_date, time(15, 0))
+        if three_pm is None or float(three_pm["close"]) <= float(three_pm["open"]):
+            return False
+        three_fifteen = _first_bar_at_or_after(day_df, trade_date, time(15, 15))
+        return three_fifteen is not None and float(three_fifteen["close"]) < float(three_fifteen["open"])

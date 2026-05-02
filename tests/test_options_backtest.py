@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import unittest
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
 
-from options_backtest.broker_sim import FillModel
+from options_backtest.broker_sim import ChargesConfig, FillModel
+from options_backtest.calendar import (
+    is_trading_day,
+    next_trading_day,
+    nifty_lot_size,
+    nifty_monthly_expiry_on_or_after,
+    nifty_weekly_expiry_on_or_after,
+)
+from options_backtest.cli import _default_output_path
 from options_backtest.contract_resolver import ContractResolver
 from options_backtest.data_store import list_expiry_dirs, load_expiry_options, load_expiry_spot, parse_option_filename, parse_ticker
 from options_backtest.engine import BacktestEngine
 from options_backtest.liquidity import LiquidityConfig, contract_is_liquid
-from options_backtest.reports import trade_ledger
+from options_backtest.reports import trade_ledger, trade_ledger_with_total, LEDGER_COLUMNS
 from options_backtest.schemas import BacktestConfig, OptionType, Side
 from options_backtest.strategy import ShortStraddle
 
@@ -80,6 +89,196 @@ class OptionsBacktestTests(unittest.TestCase):
     def test_trade_ledger_columns_for_empty_input(self) -> None:
         ledger = trade_ledger([])
         self.assertEqual(len(ledger), 0)
+        for col in LEDGER_COLUMNS:
+            self.assertIn(col, ledger.columns)
+
+    def test_nifty_weekly_expiry_calendar_handles_2025_transition(self) -> None:
+        self.assertEqual(nifty_weekly_expiry_on_or_after(pd.Timestamp("2025-08-28").date()), pd.Timestamp("2025-08-28").date())
+        self.assertEqual(
+            nifty_weekly_expiry_on_or_after(pd.Timestamp("2025-08-28").date(), min_dte=1),
+            pd.Timestamp("2025-09-02").date(),
+        )
+        self.assertEqual(nifty_weekly_expiry_on_or_after(pd.Timestamp("2025-08-29").date()), pd.Timestamp("2025-09-02").date())
+        self.assertEqual(nifty_weekly_expiry_on_or_after(pd.Timestamp("2025-09-02").date()), pd.Timestamp("2025-09-02").date())
+        self.assertEqual(
+            nifty_weekly_expiry_on_or_after(pd.Timestamp("2025-09-02").date(), min_dte=1),
+            pd.Timestamp("2025-09-09").date(),
+        )
+
+    def test_nifty_monthly_expiry_calendar_handles_2025_transition(self) -> None:
+        self.assertEqual(nifty_monthly_expiry_on_or_after(pd.Timestamp("2025-08-01").date()), pd.Timestamp("2025-08-28").date())
+        self.assertEqual(nifty_monthly_expiry_on_or_after(pd.Timestamp("2025-09-01").date()), pd.Timestamp("2025-09-30").date())
+
+    def test_trade_ledger_with_total_appends_summary_row(self) -> None:
+        ledger = pd.DataFrame([
+            {
+                "strategy": "A", "expiry": "2025-09-02",
+                "entry_date": "2025-09-01", "entry_time": "x",
+                "exit_date": "2025-09-02", "exit_time": "y",
+                "entry_reason": "entry", "exit_reason": "time_exit",
+                "dte_at_entry": 1, "day_of_week": "Monday", "exit_hour": 15,
+                "lot_size": 75,
+                "legs": "leg1", "gross_pnl": 10.0, "charges": 1.5, "net_pnl": 8.5,
+            },
+            {
+                "strategy": "A", "expiry": "2025-09-09",
+                "entry_date": "2025-09-08", "entry_time": "x",
+                "exit_date": "2025-09-09", "exit_time": "y",
+                "entry_reason": "entry", "exit_reason": "time_exit",
+                "dte_at_entry": 1, "day_of_week": "Monday", "exit_hour": 15,
+                "lot_size": 75,
+                "legs": "leg2", "gross_pnl": -4.0, "charges": 1.0, "net_pnl": -5.0,
+            },
+        ])
+        out = trade_ledger_with_total(ledger)
+        total = out.iloc[-1]
+        self.assertEqual(total["strategy"], "TOTAL")
+        self.assertEqual(total["trade_count"], 2)
+        self.assertEqual(total["gross_pnl"], 6.0)
+        self.assertEqual(total["charges"], 2.5)
+        self.assertEqual(total["net_pnl"], 3.5)
+
+    def test_default_backtest_output_path_is_timestamped(self) -> None:
+        path = _default_output_path("dhan", "three-pm-directional")
+        self.assertEqual(path.parent.as_posix(), "reports/backtests/options")
+        self.assertRegex(path.name, r"^\d{8}_\d{6}_dhan_three_pm_directional\.csv$")
+        no_cost_path = _default_output_path("dhan", "short-straddle", no_costs=True)
+        self.assertRegex(no_cost_path.name, r"^\d{8}_\d{6}_dhan_short_straddle_nocosts\.csv$")
+
+
+class NiftyLotSizeTests(unittest.TestCase):
+    """Verify lot-size schedule boundaries exactly match NSE circulars."""
+
+    def test_pre_2015_lot_is_25(self) -> None:
+        self.assertEqual(nifty_lot_size(date(2015, 10, 29)), 25)
+
+    def test_oct_2015_to_jun_2021_is_75(self) -> None:
+        self.assertEqual(nifty_lot_size(date(2015, 10, 30)), 75)
+        self.assertEqual(nifty_lot_size(date(2021, 6, 30)), 75)
+
+    def test_jul_2021_to_nov_2024_is_50(self) -> None:
+        self.assertEqual(nifty_lot_size(date(2021, 7, 1)), 50)
+        self.assertEqual(nifty_lot_size(date(2024, 11, 19)), 50)
+
+    def test_nov_2024_to_dec_2025_is_75(self) -> None:
+        self.assertEqual(nifty_lot_size(date(2024, 11, 20)), 75)
+        self.assertEqual(nifty_lot_size(date(2025, 12, 29)), 75)
+
+    def test_dec_2025_onwards_is_65(self) -> None:
+        self.assertEqual(nifty_lot_size(date(2025, 12, 30)), 65)
+        self.assertEqual(nifty_lot_size(date(2026, 4, 1)), 65)
+
+
+class ChargesConfigDateTests(unittest.TestCase):
+    """Verify STT and ETC rates change at correct regime boundaries."""
+
+    def test_stt_pre_2023_is_005pct(self) -> None:
+        c = ChargesConfig.for_date(date(2023, 3, 31))
+        self.assertAlmostEqual(c.stt_sell_rate, 0.0005)
+
+    def test_stt_2023_to_sep_2024_is_00625pct(self) -> None:
+        c = ChargesConfig.for_date(date(2023, 4, 1))
+        self.assertAlmostEqual(c.stt_sell_rate, 0.000625)
+        c2 = ChargesConfig.for_date(date(2024, 9, 30))
+        self.assertAlmostEqual(c2.stt_sell_rate, 0.000625)
+
+    def test_stt_oct_2024_to_mar_2026_is_010pct(self) -> None:
+        c = ChargesConfig.for_date(date(2024, 10, 1))
+        self.assertAlmostEqual(c.stt_sell_rate, 0.001)
+        c2 = ChargesConfig.for_date(date(2026, 3, 31))
+        self.assertAlmostEqual(c2.stt_sell_rate, 0.001)
+
+    def test_stt_from_apr_2026_is_015pct(self) -> None:
+        c = ChargesConfig.for_date(date(2026, 4, 1))
+        self.assertAlmostEqual(c.stt_sell_rate, 0.0015)
+
+    def test_etc_post_oct_2024_is_lower(self) -> None:
+        pre = ChargesConfig.for_date(date(2024, 9, 30))
+        post = ChargesConfig.for_date(date(2024, 10, 1))
+        self.assertGreater(pre.exchange_rate, post.exchange_rate)
+        self.assertAlmostEqual(post.exchange_rate, 0.0003553)
+
+    def test_exercise_stt_pre_2026_is_0125pct(self) -> None:
+        c = ChargesConfig.for_date(date(2025, 12, 31))
+        self.assertAlmostEqual(c.stt_exercise_rate, 0.00125)
+
+    def test_exercise_stt_from_apr_2026_is_015pct(self) -> None:
+        c = ChargesConfig.for_date(date(2026, 4, 1))
+        self.assertAlmostEqual(c.stt_exercise_rate, 0.0015)
+
+    def test_charges_increase_from_2021_to_2026(self) -> None:
+        """Total cost for same trade should be higher in 2026 than in 2021."""
+        model = FillModel(include_costs=True)
+        cost_2021 = model.estimate_charges(Side.SELL, 50, 100.0, trade_date=date(2021, 6, 1))
+        cost_2026 = model.estimate_charges(Side.SELL, 50, 100.0, trade_date=date(2026, 4, 1))
+        self.assertGreater(cost_2026, cost_2021)
+
+
+class TradingCalendarTests(unittest.TestCase):
+    """Verify is_trading_day and next_trading_day correctness."""
+
+    def test_weekday_non_holiday_is_trading_day(self) -> None:
+        # A random Monday that is not a known holiday
+        self.assertTrue(is_trading_day(date(2024, 3, 18)))  # Monday, not a holiday
+
+    def test_saturday_is_not_trading_day(self) -> None:
+        self.assertFalse(is_trading_day(date(2024, 1, 20)))  # Saturday
+
+    def test_sunday_is_not_trading_day(self) -> None:
+        self.assertFalse(is_trading_day(date(2026, 2, 1)))   # Sunday
+
+    def test_budget_day_saturday_is_special_session(self) -> None:
+        # Feb 1 2025 was a Saturday with a special NSE F&O session (Budget Day)
+        self.assertTrue(is_trading_day(date(2025, 2, 1)))
+
+    def test_republic_day_is_holiday(self) -> None:
+        self.assertFalse(is_trading_day(date(2024, 1, 26)))  # Friday Republic Day 2024
+
+    def test_christmas_is_holiday_when_weekday(self) -> None:
+        self.assertFalse(is_trading_day(date(2023, 12, 25)))  # Monday Christmas 2023
+
+    def test_next_trading_day_skips_weekend(self) -> None:
+        # Mar 22 2024 (Friday) → Mar 25 is Holi → result is Mar 26 (Tuesday)
+        friday = date(2024, 3, 22)
+        nxt = next_trading_day(friday)
+        self.assertEqual(nxt, date(2024, 3, 26))   # skip weekend + Holi
+        self.assertEqual(nxt.weekday(), 1)          # Tuesday
+        # May 31 2024 (Friday) → Jun 3 2024 (Monday, no holiday)
+        friday2 = date(2024, 5, 31)
+        nxt2 = next_trading_day(friday2)
+        self.assertEqual(nxt2, date(2024, 6, 3))
+
+    def test_next_trading_day_skips_holiday(self) -> None:
+        # Day before Republic Day → skip Republic Day → next trading day
+        before_republic = date(2024, 1, 25)  # Thursday
+        nxt = next_trading_day(before_republic)
+        # Jan 26 (Fri) = Republic Day, so next is Jan 27 (Sat) → Jan 28 (Sun) → Jan 29 (Mon)
+        self.assertEqual(nxt, date(2024, 1, 29))
+
+    def test_next_trading_day_is_always_weekday(self) -> None:
+        for d in [date(2024, 3, 22), date(2024, 3, 23), date(2024, 3, 24)]:
+            nxt = next_trading_day(d)
+            self.assertLess(nxt.weekday(), 5)
+            self.assertGreater(nxt, d)
+
+
+class LedgerColumnTests(unittest.TestCase):
+    """Verify new analysis columns are present and populated in trade_ledger output."""
+
+    def test_ledger_has_all_required_columns(self) -> None:
+        ledger = trade_ledger([])
+        for col in ["entry_date", "exit_date", "dte_at_entry", "day_of_week", "exit_hour", "lot_size"]:
+            self.assertIn(col, ledger.columns, f"Missing column: {col}")
+
+    def test_ledger_with_total_preserves_new_columns(self) -> None:
+        row = {col: None for col in LEDGER_COLUMNS}
+        row.update({"strategy": "SS", "gross_pnl": 100.0, "charges": 10.0, "net_pnl": 90.0,
+                    "dte_at_entry": 2, "day_of_week": "Tuesday", "exit_hour": 15, "lot_size": 75})
+        ledger = pd.DataFrame([row])
+        out = trade_ledger_with_total(ledger)
+        self.assertIn("dte_at_entry", out.columns)
+        self.assertIn("lot_size", out.columns)
+        self.assertEqual(out.iloc[-1]["strategy"], "TOTAL")
 
 
 if __name__ == "__main__":

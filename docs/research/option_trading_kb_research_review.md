@@ -1,6 +1,6 @@
 # Option Trading Research — NIFTY 50
 
-Last updated: 2026-04-30 (v2 — merged KB papers + EOD reversal literature + 2026 cost model)
+Last updated: 2026-05-01 (v3 — data inventory mapped, vendor comparison added, gaps restated against actual holdings)
 
 ---
 
@@ -259,10 +259,68 @@ Build daily snapshots of NIFTY option surface per (moneyness, DTE): call IV, put
 
 ---
 
+## Data Inventory — What We Actually Have
+
+*Audited 2026-05-01 from `data/manifests/data_inventory_manifest.csv` (502 datasets, 41,788 files, ~30 GB).*
+*Dhan options validated 2026-05-01 via `scripts/data/validate_dhan_options.py` — audit at `data/audit/dhan_options_audit.csv`.*
+
+### Confirmed Holdings
+
+| Role | Dataset | Path | Coverage | Quality Status |
+|---|---|---|---|---|
+| **NIFTY 50 spot 1-min (canonical)** | `processed_spot_nifty50_1min_canonical` | `data/processed/spot/nifty50_1min_CANONICAL.csv` | 2015–2026-04 | `research_ready_cleaned` |
+| **NIFTY 50 spot 15-min** | `processed_market_archive_cleaned_nifty50_15min` | `data/processed/market_archive_cleaned/NIFTY 50_15minute.csv` | 2015-01-09–2026-04-08 | `cleaned_non_destructive` |
+| **India VIX 1-min** | `processed_market_archive_cleaned_indiavix_1min` | `data/processed/market_archive_cleaned/INDIA VIX_minute.csv` | 2015-01-09–2026-04-08 | `research_ready_cleaned` |
+| **India VIX daily** | `processed_market_archive_cleaned_indiavix_daily` | `data/processed/market_archive_cleaned/INDIA VIX_day.csv` | 2015-01-01–2026-04-08 | `research_ready_cleaned` |
+| **NIFTY options 1-min (Shoonya, strike-level)** | `raw_shoonya_nifty_options_1min` | `data/raw/options/shoonya/nifty/` | 2024-01-04–2026-04-21 | `cleaned_non_destructive` (see audit) |
+| **NIFTY options 1-min (Dhan weekly, rolling ATM±10)** | `raw_dhan_nifty_week_expiry_code_1_*` | `data/raw/options/dhan/nifty/week/expiry_code_1/` | 2021-01-01–2026-04-30 | `validated_cleaned` — 41.4M bars, OHLC PASS, see audit |
+| **NIFTY options 1-min (Dhan monthly, rolling ATM±10)** | `raw_dhan_nifty_month_expiry_code_1_*` | `data/raw/options/dhan/nifty/month/expiry_code_1/` | 2021-05-01–2026-04-30 | `validated_cleaned` — included in audit above |
+| **Dhan instruments master** | `raw_dhan_instruments_master` | `data/raw/reference/dhan_instruments_master.csv` | Point-in-time | `raw_vendor_reference` |
+| **NSE F&O Bhavcopy EOD (NIFTY options, unified)** | `nse_bhavcopy_fo_nifty_options_eod_YYYY` | `data/processed/nse/bhavcopy/fo/nifty_options_eod_{year}.parquet` | 2008-01-01–2026-04 | `validated_cleaned` — 8.07M rows, OHLC PASS, 0 parse errors, 0 duplicates; see `data/audit/nse_bhavcopy_audit.csv` |
+
+**Total bhavcopy source files: 4,512** (2008–2026, 246 trading days/year avg). Two raw schemas merged: legacy (2008–2024-07-05, `OPTION_TYP` col) and UDiFF (2024-07-08+, `OptnTp` col); one early file (2008-02-05) uses `OPTIONTYPE` variant — handled. 8.07M NIFTY option rows total; 1.8M active (OPEN>0), 6.3M flagged `no_trade=True` (NSE untouched-strike convention, OPEN=HIGH=LOW=0). No bid/ask in raw source.
+
+**BANKNIFTY / FINNIFTY / MIDCPNIFTY** Dhan rolling options (weekly, ATM±10) also present for 2021-05-01–2026-04-30 — not needed for NIFTY 50 focus but available for regime cross-checks.
+
+---
+
+## Vendor Comparison — Overlapping NIFTY Option Data
+
+Both Shoonya and Dhan cover NIFTY options intraday. Their overlap period is **2024-01-04 to 2026-04-21** for NIFTY weeklies.
+
+| Dimension | Shoonya (primary backtest source) | Dhan rolling option API |
+|---|---|---|
+| **Format** | CSV per strike per expiry folder | JSON per rolling-ATM bucket (ATM±10 strikes) |
+| **Strike resolution** | Full chain — every 50-pt strike from deep ITM to OTM | Rolling relative only — no absolute strike, just ATM offset |
+| **Columns** | Date, Timestamp, Open, High, Low, Close, Volume, OI, Ticker | OHLCV + OI + IV + underlying spot embedded |
+| **Bid/ask** | No | No |
+| **IV** | No (must derive) | Yes — IV per bar included in API response |
+| **OI** | Yes | Yes |
+| **Depth of strike coverage** | Full chain available; deep OTM sparse | Only ATM±10 strikes per expiry bucket |
+| **Historical depth** | 2024-01-04 to present (2.3 years) | 2021-01-01 to present (5+ years) |
+| **Expiry types** | Weekly + monthly, identified by folder name | Weekly + monthly, identified by `expiry_code` |
+| **Quality flag** | `cleaned_non_destructive` | `raw_vendor_response_missing_bid_ask` |
+| **Known issues** | Two quarantined folders (20250925, 20251224); spot duplicated across folders | Raw JSON not yet normalised; row_count missing from manifest |
+
+**Priority ruling for overlapping period (2024-01-04 onward):**
+
+1. **Shoonya is primary** — it has full strike chain (needed for spread legs), is already cleaned, and has been audited (see [options_data_audit.md](options_data_audit.md)).
+2. **Dhan is the cross-check and IV source** — use Dhan ATM close prices to validate Shoonya on overlapping contracts. Any divergence > 5 ticks flags a data quality problem. Use Dhan's embedded IV field to avoid having to derive it.
+3. **Dhan is sole source for 2021–2023** — Shoonya data does not exist before 2024; all pre-2024 backtesting uses Dhan rolling option JSON. Note: Dhan provides rolling-ATM buckets only, not absolute strikes — the engine must resolve ATM offset to a strike price using the Dhan instruments master or the embedded spot price.
+
+**Quality checks to run before trusting any backtest result:**
+
+1. For 10 randomly sampled NIFTY expiry dates in 2024–2025, compare Shoonya ATM close vs Dhan ATM (offset 0) close at 09:15, 12:00, and 15:20. Flag if > 5-tick divergence.
+2. ~~Confirm Dhan JSON row counts are non-zero per file — the manifest shows `row_count` blank for all Dhan entries.~~ **DONE 2026-05-01** — all 5,292 files parsed, 41.4M clean bars, 0 parse errors. See `data/audit/dhan_options_audit.csv`.
+3. Verify India VIX timestamps: merge `INDIA VIX_15minute.csv` against `NIFTY 50_15minute.csv` on datetime — confirm they share the same trading-day calendar and no off-by-one bar shift.
+4. Quarantine `20250925` and `20251224` Shoonya folders as documented in [options_data_audit.md](options_data_audit.md).
+
+---
+
 ## Data Gaps and How to Fill Them
 
 *Verified 2026-04-30 via Tavily search + Firecrawl scrape of all source pages.*
-*Updated 2026-04-30: broker_sim.py patched (2026 STT, spread proxy), `scripts/download/download_nse_bhavcopy.py` and `scripts/download/scrape_nse_option_chain.py` written. VIX gaps confirmed filled (`data/processed/market_archive_cleaned/` covers 2015–April 2026 daily + 15-min).*
+*Updated 2026-05-01: Dhan weekly/monthly NIFTY rolling options confirmed present in manifest (2021–2026). Shoonya strike-level data confirmed present (2024–2026). VIX daily/1-min confirmed present. Gap 2 below is partially resolved by Dhan data already in hand.*
 
 ### Gap 1: No Bid/Ask Spreads on Option Data
 
@@ -286,32 +344,25 @@ Build daily snapshots of NIFTY option surface per (moneyness, DTE): call IV, put
 
 **Impact:** 462 signal observations in spot (2015–2024) is decent for pattern discovery, but the Shoonya options data is only ~2.3 years. That covers one regime (post-COVID recovery). It misses the 2020 crash, 2018 IL&FS, 2016 demonetisation — high-volatility environments where short-vol strategies blow up.
 
-**How to fill — free:**
-- **NSE F&O Bhavcopy Archives (2008–present)** — Full historical option chain EOD data going back to 2008. Two access paths:
-  - `nseindia.com/all-reports` → Derivatives section → "Archives of Daily/Monthly Reports (FO)" → zip files by date. Contains OHLC, LTP, volume, OI for every strike/expiry per day.
-  - `nseindia.com/report-detail/fo_eq_security` — Contract-wise Price Volume Data for a specific symbol/year/expiry; CSV download per query. Better for targeted pulls.
-  - Format change: files are now `.gz` binary (7-zip to extract). Pre-2024 files are plain CSV zip. Both parseable.
-  - Coverage: 15+ years. Gives IV proxy from ATM straddle price vs realised move, VRP series, expiry-day behavior in 2020/2018/2016.
-- **Shoonya Free Expired Options Data** — `shoonyatrader.in/free-historical-expired-options-contract-data/` provides free CSV downloads of expired NIFTY options from **2024-01-04 onward** via Dropbox. BANKNIFTY from 2026-02-24. No API needed — direct Dropbox link. Limited coverage but zero friction for the 2024–2025 period.
-  - NIFTY Dropbox: `dropbox.com/scl/fo/e4l104dzo5sj78q8rryx7/...` (see page for current link)
+**Status: Substantially resolved.** Dhan rolling option data is validated and cleaned at `data/processed/options/dhan/nifty/` covering 2021-01-01 to 2026-04-30 — 41.4M 1-min bars with embedded IV and OI. Extends the intraday backtest window from 2.3 years (Shoonya) to 5+ years. The remaining gap is 2015–2020 (pre-Dhan intraday) and full-chain strike coverage for 2021–2023 (Dhan covers ATM±10 only, not every strike).
 
-**How to fill — cheap:**
-- **Dhan expired options API** (₹0 with a funded Dhan account) — 5 years of 1-min OHLCV+OI+IV for expired F&O contracts via `api.dhan.co/v2/charts/intraday`. Note: poll in 90-day windows (API limit per call). Already integrated in `scripts/download/download_dhan_expired_options.py`. Activate and run. This is the highest-priority extension — it adds 5 years of intraday option data for free.
-- **Shoonya API** (already integrated) — extend the download window to cover all available history. The API is free with an active Shoonya account; just widen the date range in the downloader.
+**Remaining actions:**
+- ~~Validate Dhan JSON data quality~~ **DONE 2026-05-01** — see `data/audit/dhan_options_audit.csv`.
+- Resolve ATM offset to absolute strike using the instruments master or embedded spot price (Phase 4 step 14).
+- For 2015–2020 full-chain data: NSE F&O Bhavcopy archives give EOD OHLC back to 2008 — sufficient for VRP/IV proxy studies but not for intraday 1-min backtest. Accept this gap for Track 1 (directional); it only matters for Track 2 (short-vol) which requires surface history.
+- **NSE F&O Bhavcopy Archives (2008–present)** — **VALIDATED 2026-05-01.** 8.07M NIFTY option rows, OHLC PASS, 0 parse errors. Cleaned parquet per year at `data/processed/nse/bhavcopy/fo/nifty_options_eod_{year}.parquet`. Dual schema handled (legacy 2008–Jul-2024 + UDiFF Jul-2024+; 2008-02-05 variant also handled). No bid/ask. Use for VRP regime context and EOD settle cross-checks.
 
-**Cross-validation:** Once both Shoonya and Dhan data are available for the same period, compare close prices on overlapping contracts. Divergence > 5 ticks flags a data quality problem in one of them.
+**Cross-validation:** Use Dhan vs Shoonya on 2024–2025 overlap to confirm data quality before extending the backtest to 2021–2023 (see Phase 4 step 13).
 
 ---
 
-### Gap 3: No India VIX Alignment With Option Entry Timestamps
+### Gap 3: India VIX Timestamp Alignment Not Yet Validated
 
-**Impact:** We have `INDIA VIX_15minute.csv` but have not validated that VIX timestamps align with our option entry times. A misaligned VIX filter could create lookahead (using VIX computed after the trade bar) or miss the signal entirely.
+**Impact:** We have `INDIA VIX_15minute.csv` and `INDIA VIX_minute.csv` in `data/processed/market_archive_cleaned/` covering 2015–2026. The data is present. The gap is that timestamp alignment against option entry bars has not been verified — a misaligned VIX filter could create lookahead or miss the signal.
 
-**How to fill — free:**
-- **NSE India VIX Historical Data (daily OHLC, 2008–present)** — Direct download at `nseindia.com/reports-indices-historical-vix`. Select date range → CSV download. OHLC per day, free, no login. Goes back to 2008 (VIX launched on NSE in 2008). Also accessible from `nseindia.com/all-reports` → Indices section → "Historical India VIX Data."
-- **Yahoo Finance India VIX** — `finance.yahoo.com/quote/^INDIAVIX/history/` provides daily OHLC going back several years, downloadable as CSV. Useful as a secondary check on NSE values.
-- **For intraday VIX alignment** — Scrape the same NSE option chain JSON endpoint used in Gap 1 (it also returns the live VIX value). At 15-min polling, this builds a timestamped intraday VIX series from today forward at zero cost.
-- **Validate timestamps now:** Merge `INDIA VIX_15minute.csv` with spot bars. If VIX timestamps are at 09:15, 09:30, 09:45, etc., they are end-of-bar — safe to use as a filter at 15:00 without lookahead. Confirm this before wiring into the engine.
+**Status: Data is in hand. One validation step needed.**
+- Merge `INDIA VIX_15minute.csv` against `NIFTY 50_15minute.csv` on datetime — confirm they share the same trading calendar with no bar-shift. If VIX timestamps are end-of-bar (09:15, 09:30, …) they are safe to use as a 15:00 filter without lookahead.
+- Covered in Phase 4 step 18.
 
 ---
 
@@ -319,14 +370,11 @@ Build daily snapshots of NIFTY option surface per (moneyness, DTE): call IV, put
 
 **Impact:** We don't know how volume and liquidity evolve through the day. The optimal exit window (10 AM vs 11 AM vs level touch) should be validated against actual liquidity — an exit at 10 AM is only clean if ATM options have enough volume for a real fill.
 
-**How to fill — free:**
-- **NSE Equity Derivatives Watch** — `nseindia.com/market-data/equity-derivatives-watch` publishes live and historical total derivatives turnover. The daily derivatives market activity reports (accessible from `nseindia.com/resources/historical-reports-capital-market-daily-monthly-archives-derivative-market`) include turnover stats. Aggregate across dates to build a turnover-by-session profile.
-- **From our own Shoonya data** — compute median volume per 15-min bar across all collected ATM contracts. This gives a NIFTY option intraday volume profile for the 2.3-year covered period.
+**Status: Data to build this is already in hand.**
+- Shoonya ATM CSV files contain per-bar volume — compute median volume per 15-min bucket across the 2024–2026 period. This is a single `groupby` operation on existing data.
+- Dhan weekly ATM data (`data/raw/options/dhan/nifty/week/expiry_code_1/call/ATM/`) extends this profile back to 2021 once validated.
 
-**How to fill — cheap:**
-- **Dhan intraday API** (already available) — 1-min OHLCV+OI for any option contract going back 5 years. Pull ATM strikes for 1–2 years and compute median volume per 15-min bucket. This is the most reliable source for a full intraday volume profile.
-
-**What to do with it:** Plot average ATM option volume by 15-min bar. Confirm that 09:45–11:00 window has sufficient volume (median > 500 contracts/bar for a 1-lot trade to be clean). If not, the exit window narrows to after liquidity opens up, typically 09:30–10:30 on NSE.
+**What to do:** Compute median ATM volume per 15-min bar. Confirm that 09:45–11:00 window has median > 500 contracts/bar. If not, the exit window narrows. This is a 20-minute script, not a data acquisition task.
 
 ---
 
@@ -343,15 +391,18 @@ Build daily snapshots of NIFTY option surface per (moneyness, DTE): call IV, put
 
 ### Data Source Quick Reference
 
-| Source | What it gives | Cost | Coverage | Priority |
+| Source | What it gives | Cost | Coverage | Status |
 |---|---|---|---|---|
-| `nseindia.com/api/option-chain-indices` | Live bid/ask, OI, IV per strike (15-min scrape) | Free | Today forward | **BUILT** — run `scrape_nse_option_chain.py --loop` during market hours |
-| NSE F&O Bhavcopy archives (`nseindia.com/all-reports`) | EOD OHLC, volume, OI, bid/ask for all options | Free | 2008–present | **BUILT** — run `python scripts/download/download_nse_bhavcopy.py --from-date 2015-01-01` |
-| NSE India VIX historical (`nseindia.com/reports-indices-historical-vix`) | Daily VIX OHLC | Free | 2008–present | **ALREADY HAVE** — `data/processed/market_archive_cleaned/INDIA VIX_day.csv` covers 2015–2026 |
-| Dhan API (`api.dhan.co/v2/charts/intraday`) | 1-min OHLCV+OI+IV for expired F&O, 5 years | Free (funded account) | ~5 years back | Highest — activate `scripts/download/download_dhan_expired_options.py` (needs DHAN_ACCESS_TOKEN) |
-| Shoonya free CSV (`shoonyatrader.in`) | Expired NIFTY options CSV via Dropbox | Free | 2024-01-04 onward | Medium — quick patch for recent data |
-| True Data API (`truedata.in`) | 1-sec L1 bid/ask + option chain with Greeks | Quote on contact | Historical + live | Low — only if Dhan OI insufficient |
-| Yahoo Finance `^INDIAVIX` | Daily VIX OHLC | Free | Multi-year | **SKIP** — `data/processed/market_archive_cleaned/INDIA VIX_day.csv` already covers this |
+| **Shoonya strike-level CSV** | Full option chain OHLCV+OI, 1-min per strike | Free (already downloaded) | 2024-01-04–2026-04-21 | **IN HAND** — `data/raw/options/shoonya/nifty/`; primary backtest source; 2 folders quarantined |
+| **Dhan rolling option JSON (NIFTY weekly)** | ATM±10 strikes OHLCV+OI+IV, 1-min | Free (Dhan account) | 2021-01-01–2026-04-30 | **VALIDATED** — 41.4M clean bars; OHLC PASS, 0 parse errors; cleaned parquet at `data/processed/options/dhan/nifty/week/`; 1,797 IV spikes capped; 4.3M zero-vol bars retained; audit at `data/audit/dhan_options_audit.csv` |
+| **Dhan rolling option JSON (NIFTY monthly)** | ATM±10 strikes OHLCV+OI+IV, 1-min | Free (Dhan account) | 2021-05-01–2026-04-30 | **VALIDATED** — included in audit above; cleaned parquet at `data/processed/options/dhan/nifty/month/` |
+| **India VIX 1-min + daily (market archive)** | VIX OHLCV all timeframes | Free (already downloaded) | 2015–2026-04 | **IN HAND** — `data/processed/market_archive_cleaned/INDIA VIX_*.csv`; validate timestamp alignment before use |
+| **NIFTY 50 spot 1-min canonical** | Spot OHLCV, trading day calendar | Free (already downloaded) | 2015–2026-04 | **IN HAND** — `data/processed/spot/nifty50_1min_CANONICAL.csv`; use for signal detection and calendar |
+| **Dhan instruments master** | Symbol lookup, lot size, tick size, expiry dates | Free (already downloaded) | Point-in-time snapshot | **IN HAND** — `data/raw/reference/dhan_instruments_master.csv`; 241,994 rows; use to resolve Dhan ATM offset to absolute strike |
+| **NSE F&O Bhavcopy EOD (NIFTY options)** | EOD OHLC, settle, volume, OI, underlying spot | Free | 2008-01-01–2026-04 | **VALIDATED** — 8.07M rows, OHLC PASS, 0 errors; cleaned parquet at `data/processed/nse/bhavcopy/fo/nifty_options_eod_{year}.parquet`; audit at `data/audit/nse_bhavcopy_audit.csv`; no bid/ask; use for VRP/IV-proxy studies and EOD settle cross-checks |
+| NSE option chain live JSON | Live bid/ask, OI, IV per strike (15-min scrape) | Free | Today forward | **BUILT** — run `scrape_nse_option_chain.py --loop` during market hours |
+| Yahoo Finance `^INDIAVIX` | Daily VIX OHLC | Free | Multi-year | **SKIP** — `INDIA VIX_day.csv` already covers this fully |
+| True Data API | 1-sec L1 bid/ask + option chain with Greeks | Quote on contact | Historical + live | **LOW PRIORITY** — only if Dhan IV quality proves insufficient |
 | `broker_sim.py` spread proxy | Conservative half-spread (0.3% of mid or 1 tick) added to fill_price | N/A | N/A | **DONE** — active in all backtest runs immediately |
 
 ---
@@ -368,8 +419,8 @@ Build daily snapshots of NIFTY option surface per (moneyness, DTE): call IV, put
 
 ### Phase 2 — Exit Window Study (One Coding Session)
 
-6. **Intraday return decomposition on signal days.** Using existing spot data, compute average move from open to 10:00 AM, 10:30 AM, 11:00 AM, 13:00, and EOD — on the 462 signal days only. Confirm where the edge is realised.
-7. **Test three exits in backtest.** Level touch (prior 3 PM close), 11:00 AM time stop, EOD fallback. Compare net PnL, win rate, avg hold time across variants.
+6. **Intraday return decomposition on signal days.** Using `data/processed/market_archive_cleaned/NIFTY 50_15minute.csv`, compute average move from open to 10:00 AM, 10:30 AM, 11:00 AM, 13:00, and EOD — on the 462 signal days only. This data is already in hand. Confirm where the edge is realised before testing option exits.
+7. **Test three exits in backtest.** Level touch (prior 3 PM close), 11:00 AM time stop, EOD fallback. Compare net PnL, win rate, avg hold time across variants. Option data: use `data/raw/options/shoonya/nifty/` for 2024+ and `data/raw/options/dhan/nifty/week/` for 2021–2023 (after Dhan validation passes).
 
 ### Phase 3 — Structure (After Clean Exit Window Is Confirmed)
 
@@ -378,12 +429,15 @@ Build daily snapshots of NIFTY option surface per (moneyness, DTE): call IV, put
 10. **Add India VIX regime gate.** Enter only in VIX 13–25. Skip < 13 and > 25. Reduce size at VIX > 25.
 11. **Build option feature table.** For each trade: premium, DTE, moneyness, volume, OI, extrinsic value, India VIX at entry. Save to CSV. This becomes the audit trail for all future analysis.
 
-### Phase 4 — Data Expansion
+### Phase 4 — Data Integration and Validation
 
-12. **Run `scripts/download/download_dhan_expired_options.py`** to extend option history. Cross-validate close prices against Shoonya on overlapping dates.
-13. **Add NSE Bhavcopy EOD downloader.** Build bulk downloader for historical bhavcopy data (2015–2024). Gives daily IV proxy (ATM straddle / spot) for VRP calculations.
-14. **Add bid/ask proxy to broker_sim.** Use `close ± max(0.05, close × 0.003)` as interim spread model until true bid/ask data is available.
-15. **Validate India VIX timestamps.** Merge VIX series with spot bars. Confirm no lookahead before wiring into signal.
+12. **Validate Dhan row counts.** Parse 3 sample JSON files from `data/raw/options/dhan/nifty/week/expiry_code_1/call/ATM/` — confirm non-zero row counts. The manifest shows blank row counts for all Dhan entries. Block 2021–2023 backtest work until this passes.
+13. **Cross-validate Shoonya vs Dhan on 2024–2025 overlap.** For 10 randomly sampled NIFTY expiry dates, compare ATM close at 09:15, 12:00, 15:20. Divergence > 5 ticks = data quality flag. Use `data/raw/options/dhan/nifty/week/expiry_code_1/call/ATM/` vs Shoonya ATM folder for the same date.
+14. **Resolve Dhan ATM offset → absolute strike.** Dhan data uses relative ATM offsets (ATM, ATMp1, ATMm1…), not absolute strike prices. Use `data/raw/reference/dhan_instruments_master.csv` (SEM_STRIKE_PRICE + SEM_CUSTOM_SYMBOL columns) to build a lookup table: expiry_date + offset → strike. Required before the 2021–2023 data can be used in the backtest engine.
+15. **Use Dhan IV field directly.** Dhan API responses embed IV per bar. Extract this into the processed dataset as `iv` column. This is the primary source for VIX-regime entry filters and VRP ratio calculations — avoids deriving IV from OHLC.
+16. **Add NSE Bhavcopy EOD downloader.** Gives daily IV proxy and bid/ask for 2015–2024 — needed for Track 2 surface snapshot. Run `python scripts/download/download_nse_bhavcopy.py --from-date 2015-01-01`.
+17. **Add bid/ask proxy to broker_sim.** Use `close ± max(0.05, close × 0.003)` as interim spread model. Already done in broker_sim.py.
+18. **Validate India VIX timestamps.** Merge `INDIA VIX_15minute.csv` against `NIFTY 50_15minute.csv`. Confirm no bar-shift before wiring VIX into entry filter.
 
 ### Phase 5 — Short-Vol Track (Separate Build, After Phase 3 Is Done)
 
@@ -400,4 +454,12 @@ Build daily snapshots of NIFTY option surface per (moneyness, DTE): call IV, put
 
 ## Bottom Line
 
-The 3 PM signal is academically grounded. The losses in all three variants are structural — wrong expression, wrong exit window, wrong cost model, and three correctness bugs inflating the trade count. None of these require a new signal. Fix the engine, change the exit to intraday, switch to debit spreads, add a VIX gate. The short-vol track is the stronger long-run business but requires surface data infrastructure that does not yet exist. Build the directional track first, build the data infrastructure in parallel, then add short-vol once both are ready.
+The 3 PM signal is academically grounded. The losses in all three variants are structural — wrong expression, wrong exit window, wrong cost model, and three correctness bugs inflating the trade count. None of these require a new signal.
+
+**Data-wise, we are in good shape.** The core data stack is in hand: NIFTY 50 spot 1-min (2015–2026), India VIX 1-min and daily (2015–2026), Shoonya strike-level option data (2024–2026), Dhan rolling-ATM option data with embedded IV (2021–2026), and the Dhan instruments master for strike resolution. The remaining work is integration and validation — not acquisition.
+
+**The two blockers before serious backtesting begins:**
+1. Fix the three correctness bugs (expiry multiplication, calendar-day exit, debit stop gate).
+2. Validate Dhan JSON data (row counts, ATM offset → strike resolution, cross-check vs Shoonya on overlap period).
+
+After those pass: change the exit to intraday, switch to debit spreads, add a VIX gate. The short-vol track is the stronger long-run business but requires surface data infrastructure (NSE Bhavcopy bulk + Dhan IV normalisation) that is partially available but not yet wired up. Build the directional track first, validate it, then add short-vol.

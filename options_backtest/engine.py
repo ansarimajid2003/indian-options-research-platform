@@ -6,9 +6,9 @@ from pathlib import Path
 import pandas as pd
 
 from .broker_sim import FillModel, opposite_side
-from .calendar import combine_date_time, nearest_timestamp, parse_expiry_folder
+from .calendar import combine_date_time, nearest_timestamp, nifty_lot_size, parse_expiry_folder
 from .contract_resolver import ContractResolver
-from .data_store import load_expiry_options, load_expiry_spot, list_expiry_dirs
+from .data_store import load_expiry_options, load_expiry_spot, list_expiry_dirs, load_deduped_spot
 from .liquidity import LiquidityConfig, contract_is_liquid
 from .portfolio import finalize_trade
 from .reports import build_result
@@ -26,6 +26,11 @@ class BacktestEngine:
             include_costs=self.config.include_costs,
         )
 
+    def _resolve_lot_size(self, trade_date: datetime.date) -> int:
+        if self.config.lot_size is not None:
+            return self.config.lot_size
+        return nifty_lot_size(trade_date)
+
     def run(self, strategy: OptionStrategy, from_expiry: str | None = None, to_expiry: str | None = None, limit: int | None = None) -> BacktestResult:
         raw_root = Path(self.config.raw_root)
         bad = set(self.config.bad_expiries)
@@ -38,13 +43,55 @@ class BacktestEngine:
             expiry_dirs = expiry_dirs[:limit]
 
         trades: list[Trade] = []
-        for expiry_dir in expiry_dirs:
-            if self.config.next_day_exit:
-                trades.extend(self._run_expiry_daily(expiry_dir, strategy))
-            else:
+        if not self.config.next_day_exit:
+            for expiry_dir in expiry_dirs:
                 trade = self._run_expiry_single(expiry_dir, strategy)
                 if trade is not None:
                     trades.append(trade)
+            return build_result(self.config, trades)
+
+        # Build signal calendar once across all spot data so each trade_date maps
+        # to exactly one expiry folder (nearest weekly with DTE >= 1).
+        global_spot = load_deduped_spot(raw_root, bad)
+        if global_spot.empty:
+            return build_result(self.config, trades)
+
+        global_spot = global_spot.copy()
+        global_spot["timestamp"] = pd.to_datetime(global_spot["timestamp"])
+        global_spot_index = pd.DatetimeIndex(global_spot["timestamp"].sort_values())
+        all_trade_dates = sorted(global_spot["timestamp"].dt.date.unique())
+
+        # For each trade_date find entry_ts; skip dates with no valid entry bar.
+        signal_dates: dict[datetime.date, pd.Timestamp] = {}
+        for trade_date in all_trade_dates:
+            entry_target = combine_date_time(trade_date, self.config.entry_time)
+            entry_ts = nearest_timestamp(global_spot_index, entry_target)
+            if entry_ts is not None and entry_ts.date() == trade_date:
+                signal_dates[trade_date] = entry_ts
+
+        # Map each signal trade_date to one expiry folder: smallest DTE >= 1.
+        expiry_folder_map: dict[datetime.date, Path] = {}
+        for trade_date in signal_dates:
+            best_dir: Path | None = None
+            best_dte: int | None = None
+            for expiry_dir in expiry_dirs:
+                expiry_date = parse_expiry_folder(expiry_dir.name)
+                d = (expiry_date - trade_date).days
+                if d >= 1 and (best_dte is None or d < best_dte):
+                    best_dte = d
+                    best_dir = expiry_dir
+            if best_dir is not None:
+                expiry_folder_map[trade_date] = best_dir
+
+        # Group selected trade_dates by expiry folder, run _run_expiry_daily per folder.
+        from collections import defaultdict
+        folder_dates: dict[Path, list[datetime.date]] = defaultdict(list)
+        for trade_date, expiry_dir in expiry_folder_map.items():
+            folder_dates[expiry_dir].append(trade_date)
+
+        for expiry_dir, date_list in folder_dates.items():
+            trades.extend(self._run_expiry_daily(expiry_dir, strategy, trade_dates=sorted(date_list)))
+
         return build_result(self.config, trades)
 
     # ------------------------------------------------------------------
@@ -72,7 +119,7 @@ class BacktestEngine:
     # next_day_exit=True: one trade per trading day within the expiry
     # ------------------------------------------------------------------
 
-    def _run_expiry_daily(self, expiry_dir: Path, strategy: OptionStrategy) -> list[Trade]:
+    def _run_expiry_daily(self, expiry_dir: Path, strategy: OptionStrategy, trade_dates: list[datetime.date] | None = None) -> list[Trade]:
         spot_bars = load_expiry_spot(expiry_dir)
         if spot_bars.empty:
             return []
@@ -82,21 +129,27 @@ class BacktestEngine:
         spot_bars["timestamp"] = pd.to_datetime(spot_bars["timestamp"])
         spot_index = pd.DatetimeIndex(spot_bars["timestamp"].sort_values())
 
-        trading_days = sorted(spot_bars["timestamp"].dt.date.unique())
+        # Use only the caller-supplied dates; fall back to all dates in this expiry folder.
+        all_trading_days = sorted(spot_bars["timestamp"].dt.date.unique())
+        candidate_days = sorted(trade_dates) if trade_dates is not None else all_trading_days
 
         # Collect ATM strikes for every entry timestamp so we load only the
         # strikes we actually need instead of all 190 files.
         strike_step = 50
         needed_strikes: set[int] = set()
         day_entry_map: dict = {}
-        for trade_date in trading_days:
-            next_date = trade_date + datetime.timedelta(days=1)
+        for trade_date in candidate_days:
+            # Find the next actual trading day in this expiry's spot data.
+            later_days = [d for d in all_trading_days if d > trade_date]
+            if not later_days:
+                continue
+            next_date = later_days[0]
             entry_target = combine_date_time(trade_date, self.config.entry_time)
             exit_target = combine_date_time(next_date, self.config.exit_time)
             entry_ts = nearest_timestamp(spot_index, entry_target)
             if entry_ts is None or entry_ts.date() != trade_date:
                 continue
-            next_day_bars = spot_bars[spot_bars["timestamp"].dt.date > trade_date]
+            next_day_bars = spot_bars[spot_bars["timestamp"].dt.date == next_date]
             if next_day_bars.empty:
                 continue
             spot_close = float(spot_bars.loc[spot_bars["timestamp"] == entry_ts, "close"].iloc[0])
@@ -137,6 +190,9 @@ class BacktestEngine:
         spot_bars: pd.DataFrame,
         expiry: datetime.date,
     ) -> Trade | None:
+        trade_date = entry_ts.date()
+        lot_size = self._resolve_lot_size(trade_date)
+
         context = StrategyContext(timestamp=entry_ts, resolver=resolver)
         try:
             legs = strategy.entry_legs(context)
@@ -149,7 +205,7 @@ class BacktestEngine:
             if not contract_is_liquid(bars, leg.contract.strike, atm, self.liquidity_config):
                 return None
 
-        entry_fills = self._entry_fills(entry_ts, legs, resolver)
+        entry_fills = self._entry_fills(entry_ts, legs, resolver, lot_size, trade_date)
         if len(entry_fills) != len(legs):
             return None
 
@@ -166,15 +222,22 @@ class BacktestEngine:
             entry_reason="entry",
             exit_reason=None,
             entry_fills=entry_fills,
-            metadata={"entry_credit": self._close_value(entry_fills, legs)},
+            metadata={
+                "entry_credit": self._close_value(entry_fills, legs),
+                "lot_size": lot_size,
+            },
         )
 
-        exit_ts, exit_reason = self._find_exit(entry_ts, exit_target, legs, resolver, trade.metadata["entry_credit"], spot_stop_level=spot_stop_level)
+        exit_ts, exit_reason = self._find_exit(
+            entry_ts, exit_target, legs, resolver,
+            trade.metadata["entry_credit"], lot_size,
+            spot_stop_level=spot_stop_level,
+        )
         if exit_ts is None:
             return None
         trade.exit_time = exit_ts
         trade.exit_reason = exit_reason
-        trade.exit_fills = self._exit_fills(exit_ts, legs, resolver, exit_reason)
+        trade.exit_fills = self._exit_fills(exit_ts, legs, resolver, exit_reason, lot_size, trade_date)
         if len(trade.exit_fills) != len(legs):
             return None
         return finalize_trade(trade)
@@ -183,16 +246,34 @@ class BacktestEngine:
     def run_expiry(self, expiry_dir: Path, strategy: OptionStrategy) -> Trade | None:
         return self._run_expiry_single(expiry_dir, strategy)
 
-    def _entry_fills(self, timestamp: pd.Timestamp, legs: list[Leg], resolver: ContractResolver) -> list[Fill]:
+    def _entry_fills(
+        self,
+        timestamp: pd.Timestamp,
+        legs: list[Leg],
+        resolver: ContractResolver,
+        lot_size: int,
+        trade_date: datetime.date | None = None,
+    ) -> list[Fill]:
         fills = []
         for leg in legs:
             bar = resolver.bar_at(leg.contract, timestamp)
             if bar is None:
                 return []
-            fills.append(self.fill_model.fill(timestamp, leg.contract, leg.side, leg.lots, self.config.lot_size, float(bar["close"]), "entry"))
+            fills.append(self.fill_model.fill(
+                timestamp, leg.contract, leg.side, leg.lots, lot_size,
+                float(bar["close"]), "entry", trade_date=trade_date,
+            ))
         return fills
 
-    def _exit_fills(self, timestamp: pd.Timestamp, legs: list[Leg], resolver: ContractResolver, reason: str) -> list[Fill]:
+    def _exit_fills(
+        self,
+        timestamp: pd.Timestamp,
+        legs: list[Leg],
+        resolver: ContractResolver,
+        reason: str,
+        lot_size: int,
+        trade_date: datetime.date | None = None,
+    ) -> list[Fill]:
         # SL/target: trigger detected on bar[i] close, fill executes at bar[i+1] open.
         # time_exit: MOC-style, fill at close.
         # next_day_open: fill at open of the first bar on the next day.
@@ -202,7 +283,10 @@ class BacktestEngine:
             bar = resolver.bar_at(leg.contract, timestamp)
             if bar is None:
                 return []
-            fills.append(self.fill_model.fill(timestamp, leg.contract, opposite_side(leg.side), leg.lots, self.config.lot_size, float(bar[price_col]), reason))
+            fills.append(self.fill_model.fill(
+                timestamp, leg.contract, opposite_side(leg.side), leg.lots, lot_size,
+                float(bar[price_col]), reason, trade_date=trade_date,
+            ))
         return fills
 
     def _close_value(self, fills: list[Fill], legs: list[Leg]) -> float:
@@ -212,60 +296,100 @@ class BacktestEngine:
             value += signed
         return value
 
-    def _hypothetical_exit_cashflow(self, timestamp: pd.Timestamp, legs: list[Leg], resolver: ContractResolver, price_col: str = "close") -> float | None:
+    def _hypothetical_exit_cashflow(
+        self,
+        timestamp: pd.Timestamp,
+        legs: list[Leg],
+        resolver: ContractResolver,
+        lot_size: int,
+        price_col: str = "close",
+    ) -> float | None:
         cashflow = 0.0
         for leg in legs:
             bar = resolver.bar_at(leg.contract, timestamp)
             if bar is None:
                 return None
-            price = float(bar[price_col]) * leg.lots * self.config.lot_size
+            price = float(bar[price_col]) * leg.lots * lot_size
             exit_side = opposite_side(leg.side)
             signed = price if exit_side == Side.SELL else -price
             cashflow += signed
         return cashflow
 
-    def _find_exit(self, entry_ts: pd.Timestamp, exit_target: pd.Timestamp, legs: list[Leg], resolver: ContractResolver, entry_credit: float, spot_stop_level: float | None = None) -> tuple[pd.Timestamp | None, str | None]:
+    def _find_exit(
+        self,
+        entry_ts: pd.Timestamp,
+        exit_target: pd.Timestamp,
+        legs: list[Leg],
+        resolver: ContractResolver,
+        entry_credit: float,
+        lot_size: int,
+        spot_stop_level: float | None = None,
+    ) -> tuple[pd.Timestamp | None, str | None]:
         # Timestamps where every leg has a bar AND spot has a bar — avoids phantom exits.
-        spot_ts = set(resolver._spot_index.index)
-        leg_ts_sets = [
-            set(resolver._bars_cache[(leg.contract.strike, leg.contract.option_type.value)].index)
-            for leg in legs
-            if (leg.contract.strike, leg.contract.option_type.value) in resolver._bars_cache
-        ]
-        if not leg_ts_sets:
+        leg_frames = []
+        for leg in legs:
+            key = (leg.contract.strike, leg.contract.option_type.value)
+            frame = resolver._bars_cache.get(key)
+            if frame is None:
+                return None, None
+            leg_frames.append((leg, frame))
+        if not leg_frames:
             return None, None
-        option_ts = leg_ts_sets[0].intersection(*leg_ts_sets[1:])
-        timestamps = sorted(option_ts & spot_ts)
+        timestamps = leg_frames[0][1].index
+        for _, frame in leg_frames[1:]:
+            timestamps = timestamps.intersection(frame.index)
+        timestamps = timestamps.intersection(resolver._spot_index.index).sort_values()
+        timestamps = timestamps[(timestamps > entry_ts) & (timestamps <= exit_target)]
+
+        close_cashflow = None
+        for leg, frame in leg_frames:
+            exit_side = opposite_side(leg.side)
+            signed = 1.0 if exit_side == Side.SELL else -1.0
+            values = frame.loc[timestamps, "close"].astype(float) * leg.lots * lot_size * signed
+            close_cashflow = values if close_cashflow is None else close_cashflow + values
+        cashflow_values = close_cashflow.to_numpy() if close_cashflow is not None else []
+
+        spot_lows = None
+        if spot_stop_level is not None and len(timestamps):
+            spot_col = "low" if "low" in resolver._spot_index.columns else "close"
+            spot_lows = resolver._spot_index.loc[timestamps, spot_col].astype(float).to_numpy()
         # We evaluate SL/target using bar[i] close. When triggered, the fill happens at
         # bar[i+1] open — the first price observable after the signal bar closed.
         for i, ts in enumerate(timestamps):
-            if ts <= entry_ts:
-                continue
-            if ts > exit_target:
-                break
             # Spot-level stop: if spot bar touches or falls below the level, exit at next bar open
             if spot_stop_level is not None and ts.date() > entry_ts.date():
-                spot_row = resolver._spot_index.loc[ts] if ts in resolver._spot_index.index else None
-                if spot_row is not None:
-                    spot_low = float(spot_row["low"] if "low" in resolver._spot_index.columns else spot_row["close"])
-                    if spot_low <= spot_stop_level:
-                        next_ts = timestamps[i + 1] if i + 1 < len(timestamps) else ts
-                        fill_ts = min(next_ts, exit_target)
-                        return pd.Timestamp(fill_ts), "spot_level_stop"
-            check_cashflow = self._hypothetical_exit_cashflow(ts, legs, resolver, price_col="close")
-            if check_cashflow is None:
-                continue
+                if spot_lows is not None and spot_lows[i] <= spot_stop_level:
+                    next_ts = timestamps[i + 1] if i + 1 < len(timestamps) else ts
+                    fill_ts = min(next_ts, exit_target)
+                    return pd.Timestamp(fill_ts), "spot_level_stop"
+            check_cashflow = float(cashflow_values[i])
             pnl = entry_credit + check_cashflow
-            if self.config.stop_loss_pct is not None and entry_credit > 0:
-                if pnl <= -entry_credit * self.config.stop_loss_pct:
-                    next_ts = timestamps[i + 1] if i + 1 < len(timestamps) else ts
-                    fill_ts = min(next_ts, exit_target)
-                    return pd.Timestamp(fill_ts), "stop_loss"
-            if self.config.target_profit_pct is not None and entry_credit > 0:
-                if pnl >= entry_credit * self.config.target_profit_pct:
-                    next_ts = timestamps[i + 1] if i + 1 < len(timestamps) else ts
-                    fill_ts = min(next_ts, exit_target)
-                    return pd.Timestamp(fill_ts), "target"
-        scheduled_reason = "next_day_open" if self.config.next_day_exit else "time_exit"
+            if self.config.stop_loss_pct is not None:
+                if entry_credit > 0:
+                    triggered = pnl <= -entry_credit * self.config.stop_loss_pct
+                else:
+                    # debit: entry_credit < 0; cost basis is abs(entry_credit)
+                    triggered = pnl <= entry_credit * self.config.stop_loss_pct
+                if triggered:
+                    if i + 1 < len(timestamps):
+                        fill_ts = min(timestamps[i + 1], exit_target)
+                        return pd.Timestamp(fill_ts), "stop_loss"
+                    return pd.Timestamp(exit_target), "time_exit"
+            if self.config.target_profit_pct is not None:
+                if entry_credit > 0:
+                    triggered = pnl >= entry_credit * self.config.target_profit_pct
+                else:
+                    # debit: target on abs(cost basis)
+                    triggered = pnl >= abs(entry_credit) * self.config.target_profit_pct
+                if triggered:
+                    if i + 1 < len(timestamps):
+                        fill_ts = min(timestamps[i + 1], exit_target)
+                        return pd.Timestamp(fill_ts), "target"
+                    return pd.Timestamp(exit_target), "time_exit"
+        if self.config.next_day_exit:
+            next_day_ts = [ts for ts in timestamps if ts > entry_ts and ts.date() > entry_ts.date() and ts <= exit_target]
+            if next_day_ts:
+                return pd.Timestamp(next_day_ts[0]), "next_day_open"
+            return None, None
         eligible = [ts for ts in timestamps if entry_ts < ts <= exit_target]
-        return (pd.Timestamp(eligible[-1]), scheduled_reason) if eligible else (None, None)
+        return (pd.Timestamp(eligible[-1]), "time_exit") if eligible else (None, None)

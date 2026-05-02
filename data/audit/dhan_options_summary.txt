@@ -1,0 +1,66 @@
+================================================================
+DHAN OPTIONS DATA AUDIT SUMMARY
+================================================================
+  Files processed    : 5292
+  Files with errors  : 0
+  Coverage           : 2021-01-01 to 2026-04-30
+  Clean bars total   : 41,441,282
+
+CLEANING ACTIONS:
+  Bars outside mkt hours dropped  : 36,688
+  Duplicate timestamps dropped    : 0
+  Bad OHLC rows (flagged)         : 0
+  Zero-close bars (kept, flagged) : 0
+  Zero-volume bars (kept, flagged): 4,312,861
+  IV spikes >200% capped to NaN   : 1,797
+  IV=0 bars forward-filled        : 2,623,923
+
+PER-BUCKET CLEAN ROW COUNTS (nifty weekly only):
+  call ATM   :    509,046 bars
+  call ATMm1 :    509,047 bars
+  call ATMm10:    508,162 bars
+  call ATMm2 :    509,036 bars
+  call ATMm3 :    509,049 bars
+  call ATMm4 :    509,045 bars
+  call ATMm5 :    509,043 bars
+  call ATMm6 :    509,006 bars
+  call ATMm7 :    508,946 bars
+  call ATMm8 :    508,814 bars
+  call ATMm9 :    508,633 bars
+  call ATMp1 :    509,044 bars
+  call ATMp10:    509,050 bars
+  call ATMp2 :    509,035 bars
+  call ATMp3 :    509,038 bars
+  call ATMp4 :    509,039 bars
+  call ATMp5 :    509,049 bars
+  call ATMp6 :    509,049 bars
+  call ATMp7 :    509,050 bars
+  call ATMp8 :    509,049 bars
+  call ATMp9 :    509,047 bars
+  put  ATM   :    509,048 bars
+  put  ATMm1 :    509,047 bars
+  put  ATMm10:    509,050 bars
+  put  ATMm2 :    509,045 bars
+  put  ATMm3 :    509,048 bars
+  put  ATMm4 :    509,043 bars
+  put  ATMm5 :    509,046 bars
+  put  ATMm6 :    509,049 bars
+  put  ATMm7 :    509,048 bars
+  put  ATMm8 :    509,048 bars
+  put  ATMm9 :    509,050 bars
+  put  ATMp1 :    509,046 bars
+  put  ATMp10:    507,149 bars
+  put  ATMp2 :    509,048 bars
+  put  ATMp3 :    509,048 bars
+  put  ATMp4 :    509,042 bars
+  put  ATMp5 :    509,041 bars
+  put  ATMp6 :    508,995 bars
+  put  ATMp7 :    508,662 bars
+  put  ATMp8 :    508,624 bars
+  put  ATMp9 :    507,862 bars
+
+QUALITY VERDICT:
+  OHLC integrity : PASS -zero bad rows
+  Parse errors   : PASS -all files parsed
+  IV spikes      : WARN -1797 bars had IV>200% (expiry artefact, capped)
+================================================================

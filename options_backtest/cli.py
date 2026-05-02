@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from datetime import time
+from datetime import datetime, time
 from pathlib import Path
 
 from .data_store import normalize_shoonya_expiry
+from .dhan_loader import DhanBacktestEngine
 from .engine import BacktestEngine
+from .reports import trade_ledger_with_total
 from .schemas import BacktestConfig
 from .strategy import IronCondor, ShortStraddle, ShortStrangle, ThreePMDirectional, ThreePMV2Put, ThreePMV2CallLevelStop
 from .validation import audit_raw_shoonya
@@ -14,6 +16,13 @@ from .validation import audit_raw_shoonya
 def _parse_time(s: str) -> time:
     h, m = s.split(":")
     return time(int(h), int(m))
+
+
+def _default_output_path(vendor: str, strategy: str, *, no_costs: bool = False) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_strategy = strategy.replace("-", "_")
+    suffix = "_nocosts" if no_costs else ""
+    return Path("reports/backtests/options") / f"{stamp}_{vendor}_{safe_strategy}{suffix}.csv"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,7 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     audit = sub.add_parser("audit")
     audit.add_argument("--raw-root", default="data/raw/options/shoonya/nifty")
 
-    run = sub.add_parser("run-backtest")
+    # Legacy Shoonya backtest — kept for reference only
+    run = sub.add_parser("run-backtest-shoonya")
     run.add_argument("--raw-root", default="data/raw/options/shoonya/nifty")
     run.add_argument("--strategy", choices=["short-straddle", "short-strangle", "iron-condor", "three-pm-directional", "three-pm-v2-put", "three-pm-v2-call-level-stop"], default="short-straddle")
     run.add_argument("--from-expiry")
@@ -37,12 +47,29 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--limit", type=int)
     run.add_argument("--no-costs", action="store_true")
     run.add_argument("--slippage", type=float, default=0.05)
-    run.add_argument("--stop-loss-pct", type=float, default=0.5, help="Exit when loss >= this fraction of entry credit (0.5 = 50%%)")
-    run.add_argument("--target-profit-pct", type=float, default=0.5, help="Exit when profit >= this fraction of entry credit (0.5 = 50%%)")
-    run.add_argument("--next-day-exit", action="store_true", help="Exit at market open the next calendar day (uses exit_time on next day)")
-    run.add_argument("--entry-time", default=None, help="Entry time HH:MM (default 09:20, or 15:16 for three-pm-directional)")
-    run.add_argument("--exit-time", default=None, help="Exit time HH:MM (default 15:20, or 09:16 for next-day-exit)")
-    run.add_argument("--output", default="reports/backtests/options/latest_trades.csv")
+    run.add_argument("--stop-loss-pct", type=float, default=0.5)
+    run.add_argument("--target-profit-pct", type=float, default=0.5)
+    run.add_argument("--next-day-exit", action="store_true")
+    run.add_argument("--entry-time", default=None)
+    run.add_argument("--exit-time", default=None)
+    run.add_argument("--output")
+
+    # Primary backtest command — Dhan 5-year data
+    dhan = sub.add_parser("run-backtest")
+    dhan.add_argument("--dhan-root", default="data/processed/options/dhan")
+    dhan.add_argument("--expiry-type", choices=["week", "month"], default="week")
+    dhan.add_argument("--strategy", choices=["short-straddle", "short-strangle", "iron-condor", "three-pm-directional", "three-pm-v2-put", "three-pm-v2-call-level-stop"], default="short-straddle")
+    dhan.add_argument("--from-date", help="Start date YYYY-MM-DD")
+    dhan.add_argument("--to-date", help="End date YYYY-MM-DD")
+    dhan.add_argument("--entry-time", default=None)
+    dhan.add_argument("--exit-time", default=None)
+    dhan.add_argument("--stop-loss-pct", type=float, default=0.5)
+    dhan.add_argument("--target-profit-pct", type=float, default=0.5)
+    dhan.add_argument("--next-day-exit", action="store_true")
+    dhan.add_argument("--no-costs", action="store_true")
+    dhan.add_argument("--spot-path", default="data/processed/spot/nifty50_1min_CANONICAL.csv", help="Canonical NIFTY 50 1-min spot CSV for 3PM signal detection")
+    dhan.add_argument("--output")
+
     return parser
 
 
@@ -80,9 +107,8 @@ def main() -> int:
             print(f"{expiry_dir.name}: {paths.format} {paths.options_path}")
         return 0
 
-    if args.command == "run-backtest":
+    if args.command == "run-backtest-shoonya":
         next_day_exit = args.next_day_exit
-        # Sensible defaults for three-pm strategies when not explicitly overridden
         if args.strategy in ("three-pm-directional", "three-pm-v2-put", "three-pm-v2-call-level-stop"):
             entry_time = _parse_time(args.entry_time) if args.entry_time else time(15, 16)
             exit_time = _parse_time(args.exit_time) if args.exit_time else time(9, 16)
@@ -101,9 +127,43 @@ def main() -> int:
             next_day_exit=next_day_exit,
         )
         result = BacktestEngine(config).run(_strategy(args.strategy), args.from_expiry, args.to_expiry, args.limit)
-        output = Path(args.output)
+        output = Path(args.output) if args.output else _default_output_path("shoonya", args.strategy, no_costs=args.no_costs)
         output.parent.mkdir(parents=True, exist_ok=True)
-        result.trade_ledger.to_csv(output, index=False)
+        trade_ledger_with_total(result.trade_ledger).to_csv(output, index=False)
+        print(result.summary)
+        print(f"trade ledger: {output}")
+        return 0
+
+    if args.command in ("run-backtest", "run-dhan-backtest"):
+        next_day_exit = args.next_day_exit
+        if args.strategy in ("three-pm-directional", "three-pm-v2-put", "three-pm-v2-call-level-stop"):
+            entry_time = _parse_time(args.entry_time) if args.entry_time else time(15, 16)
+            exit_time = _parse_time(args.exit_time) if args.exit_time else time(9, 16)
+            next_day_exit = True
+        else:
+            entry_time = _parse_time(args.entry_time) if args.entry_time else time(9, 20)
+            exit_time = _parse_time(args.exit_time) if args.exit_time else time(15, 20)
+        config = BacktestConfig(
+            include_costs=not args.no_costs,
+            stop_loss_pct=args.stop_loss_pct,
+            target_profit_pct=args.target_profit_pct,
+            entry_time=entry_time,
+            exit_time=exit_time,
+            next_day_exit=next_day_exit,
+        )
+        result = DhanBacktestEngine(
+            config,
+            dhan_root=args.dhan_root,
+            expiry_type=args.expiry_type,
+            spot_path=args.spot_path,
+        ).run(
+            _strategy(args.strategy),
+            from_date=args.from_date,
+            to_date=args.to_date,
+        )
+        output = Path(args.output) if args.output else _default_output_path("dhan", args.strategy, no_costs=args.no_costs)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        trade_ledger_with_total(result.trade_ledger).to_csv(output, index=False)
         print(result.summary)
         print(f"trade ledger: {output}")
         return 0
