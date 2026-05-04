@@ -8,7 +8,9 @@ import pandas as pd
 
 from options_backtest.broker_sim import ChargesConfig, FillModel
 from options_backtest.calendar import (
+    expiry_on_or_after,
     is_trading_day,
+    lot_size,
     next_trading_day,
     nifty_lot_size,
     nifty_monthly_expiry_on_or_after,
@@ -69,7 +71,10 @@ class OptionsBacktestTests(unittest.TestCase):
     def test_fill_model_tick_rounding_and_charges(self) -> None:
         model = FillModel(tick_size=0.05, slippage_points=0.05, include_costs=True)
         self.assertEqual(model.round_tick(10.023), 10.0)
-        self.assertEqual(model.fill_price(10.0, Side.BUY), 10.1)
+        # close=10 hits far-OTM tier (1.5% spread): half_spread=0.15, slippage=0.05 → buy fill=10.20
+        self.assertEqual(model.fill_price(10.0, Side.BUY), 10.2)
+        # close=100 hits ATM tier (0.3% spread): half_spread=0.30, slippage=0.05 → buy fill=100.35
+        self.assertEqual(model.fill_price(100.0, Side.BUY), 100.35)
         self.assertGreater(model.estimate_charges(Side.SELL, 50, 100.0), 0)
 
     def test_short_straddle_small_sample_is_deterministic(self) -> None:
@@ -118,7 +123,7 @@ class OptionsBacktestTests(unittest.TestCase):
                 "entry_reason": "entry", "exit_reason": "time_exit",
                 "dte_at_entry": 1, "day_of_week": "Monday", "exit_hour": 15,
                 "lot_size": 75,
-                "legs": "leg1", "gross_pnl": 10.0, "charges": 1.5, "net_pnl": 8.5,
+                "entry_legs": "leg1", "exit_legs": "", "gross_pnl": 10.0, "charges": 1.5, "net_pnl": 8.5,
             },
             {
                 "strategy": "A", "expiry": "2025-09-09",
@@ -127,7 +132,7 @@ class OptionsBacktestTests(unittest.TestCase):
                 "entry_reason": "entry", "exit_reason": "time_exit",
                 "dte_at_entry": 1, "day_of_week": "Monday", "exit_hour": 15,
                 "lot_size": 75,
-                "legs": "leg2", "gross_pnl": -4.0, "charges": 1.0, "net_pnl": -5.0,
+                "entry_legs": "leg2", "exit_legs": "", "gross_pnl": -4.0, "charges": 1.0, "net_pnl": -5.0,
             },
         ])
         out = trade_ledger_with_total(ledger)
@@ -158,15 +163,50 @@ class NiftyLotSizeTests(unittest.TestCase):
 
     def test_jul_2021_to_nov_2024_is_50(self) -> None:
         self.assertEqual(nifty_lot_size(date(2021, 7, 1)), 50)
-        self.assertEqual(nifty_lot_size(date(2024, 11, 19)), 50)
+        self.assertEqual(nifty_lot_size(date(2024, 4, 25)), 50)
+
+    def test_may_2024_to_nov_2024_is_25(self) -> None:
+        self.assertEqual(nifty_lot_size(date(2024, 4, 26)), 25)
+        self.assertEqual(nifty_lot_size(date(2024, 11, 20)), 25)
 
     def test_nov_2024_to_dec_2025_is_75(self) -> None:
-        self.assertEqual(nifty_lot_size(date(2024, 11, 20)), 75)
-        self.assertEqual(nifty_lot_size(date(2025, 12, 29)), 75)
+        self.assertEqual(nifty_lot_size(date(2024, 11, 21)), 75)
+        self.assertEqual(nifty_lot_size(date(2025, 12, 30)), 75)
 
     def test_dec_2025_onwards_is_65(self) -> None:
-        self.assertEqual(nifty_lot_size(date(2025, 12, 30)), 65)
+        self.assertEqual(nifty_lot_size(date(2025, 12, 31)), 65)
         self.assertEqual(nifty_lot_size(date(2026, 4, 1)), 65)
+
+
+class InstrumentCalendarTests(unittest.TestCase):
+    def test_cross_index_lot_sizes(self) -> None:
+        self.assertEqual(lot_size("BANKNIFTY", date(2021, 8, 4)), 25)
+        self.assertEqual(lot_size("BANKNIFTY", date(2023, 7, 28)), 15)
+        self.assertEqual(lot_size("FINNIFTY", date(2024, 11, 21)), 65)
+        self.assertEqual(lot_size("MIDCPNIFTY", date(2025, 7, 31)), 140)
+        self.assertEqual(lot_size("MIDCPNIFTY", date(2026, 1, 1)), 120)
+
+    def test_cross_index_expiry_days(self) -> None:
+        self.assertEqual(expiry_on_or_after("BANKNIFTY", date(2023, 8, 31)), date(2023, 8, 31))
+        self.assertEqual(expiry_on_or_after("BANKNIFTY", date(2023, 9, 1)), date(2023, 9, 6))
+        self.assertEqual(expiry_on_or_after("FINNIFTY", date(2024, 11, 18)), date(2024, 11, 19))
+        self.assertEqual(expiry_on_or_after("MIDCPNIFTY", date(2024, 11, 18)), date(2024, 11, 18))
+
+    def test_discontinued_weeklies_fall_back_to_monthly(self) -> None:
+        self.assertEqual(expiry_on_or_after("BANKNIFTY", date(2024, 11, 14)), date(2024, 11, 27))
+        self.assertEqual(expiry_on_or_after("FINNIFTY", date(2024, 11, 20)), date(2024, 11, 26))
+        self.assertEqual(expiry_on_or_after("MIDCPNIFTY", date(2024, 11, 19)), date(2024, 11, 25))
+
+    def test_monthly_expiry_after_download_window_does_not_snap_back_forever(self) -> None:
+        trading_dates = {date(2026, 4, 29), date(2026, 4, 30)}
+        self.assertEqual(
+            expiry_on_or_after(
+                "BANKNIFTY",
+                date(2026, 4, 30),
+                trading_dates=trading_dates,
+            ),
+            date(2026, 5, 26),
+        )
 
 
 class ChargesConfigDateTests(unittest.TestCase):
@@ -196,7 +236,7 @@ class ChargesConfigDateTests(unittest.TestCase):
         pre = ChargesConfig.for_date(date(2024, 9, 30))
         post = ChargesConfig.for_date(date(2024, 10, 1))
         self.assertGreater(pre.exchange_rate, post.exchange_rate)
-        self.assertAlmostEqual(post.exchange_rate, 0.0003553)
+        self.assertAlmostEqual(post.exchange_rate, 0.0003503)
 
     def test_exercise_stt_pre_2026_is_0125pct(self) -> None:
         c = ChargesConfig.for_date(date(2025, 12, 31))

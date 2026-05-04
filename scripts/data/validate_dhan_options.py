@@ -10,8 +10,8 @@ and produces:
 
 Cleaning rules applied:
   1. Timestamps: unix epoch → IST datetime, drop any bar outside 09:15–15:29.
-  2. IV: cap extreme IV > 200 at NaN (expiry-day artefact); forward-fill NaN IV
-     within the same trading day only (no cross-day fill).
+  2. IV: preserve raw IV, flag extreme IV > 200 and IV=0, and write a separate
+     same-day-forward-filled iv_clean column. The original iv column is untouched.
   3. OHLC: flag bad rows (high < low etc.) -zero bad rows expected; assert or warn.
   4. Zero/negative close: flag but do NOT drop -may be genuine illiquid bars.
   5. Duplicate timestamps within a file: drop keep='first'.
@@ -41,7 +41,7 @@ AUDIT_DIR = ROOT / "data" / "audit"
 
 MARKET_OPEN = "09:15"
 MARKET_CLOSE = "15:29"
-IV_SPIKE_CAP = 200.0  # % -anything above is an expiry-day artefact
+IV_SPIKE_CAP = 200.0  # % -anything above is flagged as an expiry-day artefact
 
 INDICES = ["nifty", "banknifty", "finnifty", "midcpnifty"]
 EXPIRY_TYPES = ["week", "month"]
@@ -140,19 +140,21 @@ def _clean(df: pd.DataFrame, filename: str) -> tuple[pd.DataFrame, dict]:
     audit["neg_close_rows"] = int((df["close"] < 0).sum())
     audit["zero_volume_rows"] = int((df["volume"] == 0).sum())
 
-    # 6. IV: cap spikes, then forward-fill zero/NaN within day
+    # 6. IV: preserve raw values, flag bad vendor IV, and build a cleaned series.
+    df["iv_raw"] = df["iv"]
     iv_spike = df["iv"] > IV_SPIKE_CAP
     audit["iv_spike_capped"] = int(iv_spike.sum())
-    df.loc[iv_spike, "iv"] = np.nan
+    df["iv_spike_flag"] = iv_spike
 
     # Zero IV at end-of-day before expiry is a known Dhan artefact -treat as NaN
     iv_zero = df["iv"] == 0.0
     audit["iv_zero_ffilled"] = int(iv_zero.sum())
-    df.loc[iv_zero, "iv"] = np.nan
+    df["iv_zero_flag"] = iv_zero
+    df["iv_clean"] = df["iv"].mask(iv_spike | iv_zero)
 
     # Forward-fill NaN IV within each trading date (no cross-day fill)
     df["_date"] = df["timestamp"].dt.date
-    df["iv"] = df.groupby("_date")["iv"].ffill()
+    df["iv_clean"] = df.groupby("_date")["iv_clean"].ffill()
     df = df.drop(columns=["_date"])
 
     if len(df) > 0:
@@ -253,7 +255,7 @@ def _build_summary(df_audit: pd.DataFrame) -> str:
     ok = df_audit[df_audit.get("error", pd.Series(dtype=str)).isna()] if "error" in df_audit.columns else df_audit
     total_clean_rows = int(ok["clean_rows"].sum())
     total_bad_ohlc = int(ok["bad_ohlc_rows"].sum()) if "bad_ohlc_rows" in ok.columns else 0
-    total_iv_capped = int(ok["iv_spike_capped"].sum()) if "iv_spike_capped" in ok.columns else 0
+    total_iv_flagged = int(ok["iv_spike_capped"].sum()) if "iv_spike_capped" in ok.columns else 0
     total_iv_zero = int(ok["iv_zero_ffilled"].sum()) if "iv_zero_ffilled" in ok.columns else 0
     total_dropped_dup = int(ok["dropped_duplicates"].sum()) if "dropped_duplicates" in ok.columns else 0
     total_dropped_hours = int(ok["dropped_outside_hours"].sum()) if "dropped_outside_hours" in ok.columns else 0
@@ -261,8 +263,10 @@ def _build_summary(df_audit: pd.DataFrame) -> str:
     total_zero_vol = int(ok["zero_volume_rows"].sum()) if "zero_volume_rows" in ok.columns else 0
 
     if "date_min" in ok.columns:
-        date_min = ok["date_min"].dropna().min()
-        date_max = ok["date_max"].dropna().max()
+        date_min_values = ok["date_min"].replace("", pd.NA).dropna()
+        date_max_values = ok["date_max"].replace("", pd.NA).dropna()
+        date_min = date_min_values.min() if len(date_min_values) else "n/a"
+        date_max = date_max_values.max() if len(date_max_values) else "n/a"
     else:
         date_min = date_max = "n/a"
 
@@ -281,22 +285,22 @@ def _build_summary(df_audit: pd.DataFrame) -> str:
         f"  Bad OHLC rows (flagged)         : {total_bad_ohlc:,}",
         f"  Zero-close bars (kept, flagged) : {total_zero_close:,}",
         f"  Zero-volume bars (kept, flagged): {total_zero_vol:,}",
-        f"  IV spikes >200% capped to NaN   : {total_iv_capped:,}",
-        f"  IV=0 bars forward-filled        : {total_iv_zero:,}",
+        f"  IV spikes >200% flagged         : {total_iv_flagged:,}",
+        f"  IV=0 bars flagged               : {total_iv_zero:,}",
+        "  iv_clean same-day forward-filled for IV research; raw iv is preserved",
         "",
-        "PER-BUCKET CLEAN ROW COUNTS (nifty weekly only):",
+        "PER-BUCKET CLEAN ROW COUNTS:",
     ]
 
-    if "bucket" in ok.columns:
-        nifty_week = ok[(ok.get("index", pd.Series()) == "nifty") & (ok.get("expiry_type", pd.Series()) == "week")]
-        if len(nifty_week) > 0:
-            bucket_summary = (
-                nifty_week.groupby(["side", "bucket"])["clean_rows"].sum()
-                .reset_index()
-                .sort_values(["side", "bucket"])
-            )
-            for _, row in bucket_summary.iterrows():
-                lines.append(f"  {row['side']:4s} {row['bucket']:6s}: {int(row['clean_rows']):>10,} bars")
+    if "bucket" in ok.columns and len(ok) > 0:
+        bucket_summary = (
+            ok.groupby(["index", "expiry_type", "side", "bucket"])["clean_rows"].sum()
+            .reset_index()
+            .sort_values(["index", "expiry_type", "side", "bucket"])
+        )
+        for _, row in bucket_summary.iterrows():
+            label = f"{row['index']}/{row['expiry_type']}/{row['side']}/{row['bucket']}"
+            lines.append(f"  {label:36s}: {int(row['clean_rows']):>10,} bars")
 
     lines += [
         "",
@@ -312,8 +316,8 @@ def _build_summary(df_audit: pd.DataFrame) -> str:
     else:
         lines.append(f"  Parse errors   : FAIL -{errored} files failed (check audit CSV 'error' column)")
 
-    if total_iv_capped > 0:
-        lines.append(f"  IV spikes      : WARN -{total_iv_capped} bars had IV>200% (expiry artefact, capped)")
+    if total_iv_flagged > 0:
+        lines.append(f"  IV spikes      : WARN -{total_iv_flagged} bars had IV>200% (raw iv preserved; use iv_clean only deliberately)")
     else:
         lines.append("  IV spikes      : PASS")
 
@@ -327,13 +331,13 @@ def _build_summary(df_audit: pd.DataFrame) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate and clean Dhan options data")
-    parser.add_argument("--index", default="nifty", choices=INDICES, help="Index to process (default: nifty)")
+    parser.add_argument("--index", action="append", choices=INDICES, help="Index to process. Repeatable; default: nifty")
     parser.add_argument("--all-indices", action="store_true", help="Process all indices")
     parser.add_argument("--expiry-type", default=None, choices=EXPIRY_TYPES, help="week or month (default: both)")
     parser.add_argument("--dry-run", action="store_true", help="Audit only, skip parquet writes")
     args = parser.parse_args()
 
-    indices = INDICES if args.all_indices else [args.index]
+    indices = INDICES if args.all_indices else (args.index or ["nifty"])
     expiry_types = EXPIRY_TYPES if args.expiry_type is None else [args.expiry_type]
 
     all_audit: list[dict] = []
@@ -367,15 +371,22 @@ def main() -> None:
 
     # Save audit CSV
     AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    scope = "all" if args.all_indices else "_".join(indices)
     audit_csv = AUDIT_DIR / "dhan_options_audit.csv"
+    scoped_audit_csv = AUDIT_DIR / f"dhan_options_audit_{scope}.csv"
     df_audit.to_csv(audit_csv, index=False)
+    df_audit.to_csv(scoped_audit_csv, index=False)
     print(f"\nAudit CSV -> {audit_csv}")
+    print(f"Scoped CSV -> {scoped_audit_csv}")
 
     # Build and save summary
     summary = _build_summary(df_audit)
     summary_txt = AUDIT_DIR / "dhan_options_summary.txt"
+    scoped_summary_txt = AUDIT_DIR / f"dhan_options_summary_{scope}.txt"
     summary_txt.write_text(summary, encoding="utf-8")
+    scoped_summary_txt.write_text(summary, encoding="utf-8")
     print(f"Summary   -> {summary_txt}")
+    print(f"Scoped summary -> {scoped_summary_txt}")
     print()
     print(summary)
 

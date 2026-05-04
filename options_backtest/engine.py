@@ -6,10 +6,10 @@ from pathlib import Path
 import pandas as pd
 
 from .broker_sim import FillModel, opposite_side
-from .calendar import combine_date_time, nearest_timestamp, nifty_lot_size, parse_expiry_folder
+from .calendar import combine_date_time, lot_size, nearest_timestamp, parse_expiry_folder
 from .contract_resolver import ContractResolver
 from .data_store import load_expiry_options, load_expiry_spot, list_expiry_dirs, load_deduped_spot
-from .liquidity import LiquidityConfig, contract_is_liquid
+from .liquidity import LiquidityConfig, contract_is_liquid, oi_slippage_multiplier
 from .portfolio import finalize_trade
 from .reports import build_result
 from .schemas import BacktestConfig, BacktestResult, Fill, Leg, Side, Trade
@@ -29,7 +29,7 @@ class BacktestEngine:
     def _resolve_lot_size(self, trade_date: datetime.date) -> int:
         if self.config.lot_size is not None:
             return self.config.lot_size
-        return nifty_lot_size(trade_date)
+        return lot_size(self.config.symbol, trade_date)
 
     def run(self, strategy: OptionStrategy, from_expiry: str | None = None, to_expiry: str | None = None, limit: int | None = None) -> BacktestResult:
         raw_root = Path(self.config.raw_root)
@@ -214,6 +214,15 @@ class BacktestEngine:
         if get_stop is not None:
             spot_stop_level = get_stop(context)
 
+        # Spot close at a given timestamp — computed once, used for entry and exit.
+        _spot_ts_col = pd.to_datetime(spot_bars["timestamp"]) if not spot_bars.empty else None
+
+        def _spot_close(ts: pd.Timestamp) -> float | None:
+            if _spot_ts_col is None:
+                return None
+            rows = spot_bars.loc[_spot_ts_col == ts, "close"]
+            return round(float(rows.iloc[0]), 2) if not rows.empty else None
+
         trade = Trade(
             expiry=expiry,
             strategy=getattr(strategy, "name", strategy.__class__.__name__),
@@ -225,6 +234,7 @@ class BacktestEngine:
             metadata={
                 "entry_credit": self._close_value(entry_fills, legs),
                 "lot_size": lot_size,
+                "spot_entry": _spot_close(entry_ts),
             },
         )
 
@@ -235,6 +245,7 @@ class BacktestEngine:
         )
         if exit_ts is None:
             return None
+        trade.metadata["spot_exit"] = _spot_close(exit_ts)
         trade.exit_time = exit_ts
         trade.exit_reason = exit_reason
         trade.exit_fills = self._exit_fills(exit_ts, legs, resolver, exit_reason, lot_size, trade_date)
@@ -259,9 +270,14 @@ class BacktestEngine:
             bar = resolver.bar_at(leg.contract, timestamp)
             if bar is None:
                 return []
+            # Zero-volume bar is a data artifact — no real market activity, skip trade
+            if "volume" in bar.index and float(bar["volume"]) == 0:
+                return []
+            oi = float(bar["oi"]) if "oi" in bar.index else 1000.0
+            mult = oi_slippage_multiplier(oi)
             fills.append(self.fill_model.fill(
                 timestamp, leg.contract, leg.side, leg.lots, lot_size,
-                float(bar["close"]), "entry", trade_date=trade_date,
+                float(bar["close"]), "entry", trade_date=trade_date, slippage_multiplier=mult,
             ))
         return fills
 
@@ -277,15 +293,20 @@ class BacktestEngine:
         # SL/target: trigger detected on bar[i] close, fill executes at bar[i+1] open.
         # time_exit: MOC-style, fill at close.
         # next_day_open: fill at open of the first bar on the next day.
-        price_col = "open" if reason in ("stop_loss", "target", "next_day_open") else "close"
+        price_col = "open" if reason in ("stop_loss", "target", "trail_stop", "next_day_open") else "close"
         fills = []
         for leg in legs:
             bar = resolver.bar_at(leg.contract, timestamp)
             if bar is None:
                 return []
+            # Zero-volume bar is a data artifact — no real market activity, skip trade
+            if "volume" in bar.index and float(bar["volume"]) == 0:
+                return []
+            oi = float(bar["oi"]) if "oi" in bar.index else 1000.0
+            mult = oi_slippage_multiplier(oi)
             fills.append(self.fill_model.fill(
                 timestamp, leg.contract, opposite_side(leg.side), leg.lots, lot_size,
-                float(bar[price_col]), reason, trade_date=trade_date,
+                float(bar[price_col]), reason, trade_date=trade_date, slippage_multiplier=mult,
             ))
         return fills
 
@@ -355,6 +376,8 @@ class BacktestEngine:
             spot_lows = resolver._spot_index.loc[timestamps, spot_col].astype(float).to_numpy()
         # We evaluate SL/target using bar[i] close. When triggered, the fill happens at
         # bar[i+1] open — the first price observable after the signal bar closed.
+        _trail_peak: float = 0.0   # peak combined close value since trail was activated
+        _trail_active: bool = False
         for i, ts in enumerate(timestamps):
             # Spot-level stop: if spot bar touches or falls below the level, exit at next bar open
             if spot_stop_level is not None and ts.date() > entry_ts.date():
@@ -386,6 +409,23 @@ class BacktestEngine:
                         fill_ts = min(timestamps[i + 1], exit_target)
                         return pd.Timestamp(fill_ts), "target"
                     return pd.Timestamp(exit_target), "time_exit"
+            # Trailing stop — long (debit) positions only; never applies to credit trades
+            if (
+                self.config.trail_trigger_pct is not None
+                and self.config.trail_stop_pct is not None
+                and entry_credit <= 0
+            ):
+                cost_basis = abs(entry_credit)
+                if not _trail_active and pnl >= cost_basis * self.config.trail_trigger_pct:
+                    _trail_active = True
+                    _trail_peak = check_cashflow
+                if _trail_active:
+                    if check_cashflow > _trail_peak:
+                        _trail_peak = check_cashflow
+                    trail_floor = _trail_peak * (1.0 - self.config.trail_stop_pct)
+                    if check_cashflow <= trail_floor:
+                        fill_ts = timestamps[i + 1] if i + 1 < len(timestamps) else ts
+                        return pd.Timestamp(min(fill_ts, exit_target)), "trail_stop"
         if self.config.next_day_exit:
             next_day_ts = [ts for ts in timestamps if ts > entry_ts and ts.date() > entry_ts.date() and ts <= exit_target]
             if next_day_ts:

@@ -31,7 +31,7 @@ _STT_EXERCISE_SCHEDULE: tuple[tuple[date, float], ...] = (
 
 # NSE exchange transaction charge (ETC) on options premium, both sides
 _ETC_SCHEDULE: tuple[tuple[date, float], ...] = (
-    (date(2024, 10, 1), 0.0003553),  # SEBI "true to label" revision: 0.03553%
+    (date(2024, 10, 1), 0.0003503),  # NSE revised flat rate: 0.03503% (₹35.03/lakh)
     (date(2023, 4,  1), 0.0005000),  # Rolled back to 0.05%
     (date(2022, 1,  1), 0.0005300),  # Jan 2022 increase: ~0.053%
     (date(2004, 1,  1), 0.0005000),  # Base rate: 0.05%
@@ -54,11 +54,11 @@ def _rate_for_date(schedule: tuple[tuple[date, float], ...], d: date) -> float:
 
 @dataclass(frozen=True)
 class ChargesConfig:
-    # ₹20 flat per executed order (Zerodha model; ₹40 round-trip per single leg)
-    brokerage_per_order: float = 20.0
+    # ₹10 flat per executed order (Kotak Neo; ₹20 round-trip per single leg)
+    brokerage_per_order: float = 10.0
     stt_sell_rate: float = 0.001500    # options sell STT on premium
     stt_exercise_rate: float = 0.001500  # ITM exercise STT on intrinsic value
-    exchange_rate: float = 0.0003553   # NSE ETC (post-Oct 2024)
+    exchange_rate: float = 0.0003503   # NSE ETC (post-Oct 2024)
     sebi_rate: float = 0.000001        # SEBI turnover fee (₹10/crore)
     stamp_buy_rate: float = 0.00003    # stamp duty on buy side
     gst_rate: float = 0.18             # GST on brokerage + ETC + SEBI
@@ -84,11 +84,17 @@ class FillModel:
     def round_tick(self, price: float) -> float:
         return round(round(price / self.tick_size) * self.tick_size, 2)
 
-    def fill_price(self, close: float, side: Side) -> float:
-        # Conservative half-spread proxy: 0.3% of mid or 1 tick, whichever is larger.
-        # Applied in addition to slippage; replaces mid-price optimism when no bid/ask data.
-        half_spread = max(self.tick_size, round(close * 0.003 / self.tick_size) * self.tick_size)
-        adjustment = self.slippage_points + half_spread if side == Side.BUY else -(self.slippage_points + half_spread)
+    def fill_price(
+        self,
+        close: float,
+        side: Side,
+        dte: int | None = None,
+        slippage_multiplier: float = 1.0,
+    ) -> float:
+        spread_pct = _tiered_spread_pct(close, dte)
+        half_spread = max(self.tick_size, round(close * spread_pct / self.tick_size) * self.tick_size)
+        slippage = self.slippage_points * slippage_multiplier
+        adjustment = slippage + half_spread if side == Side.BUY else -(slippage + half_spread)
         return max(self.tick_size, self.round_tick(close + adjustment))
 
     def estimate_charges(
@@ -128,9 +134,14 @@ class FillModel:
         close: float,
         reason: str,
         trade_date: date | None = None,
+        slippage_multiplier: float = 1.0,
     ) -> Fill:
         quantity = int(lots * lot_size)
-        price = self.fill_price(float(close), side)
+        dte = (contract.expiry - trade_date).days if (trade_date is not None and contract.expiry is not None) else None
+        # Buying to close a short position requires taking liquidity in a moving market —
+        # apply a wider slippage floor to reflect the adversity of forced buy-backs.
+        effective_multiplier = max(slippage_multiplier, 1.5) if reason != "entry" and side == Side.BUY else slippage_multiplier
+        price = self.fill_price(float(close), side, dte=dte, slippage_multiplier=effective_multiplier)
         gross_value = quantity * price
         charges = self.estimate_charges(side, quantity, price, trade_date=trade_date)
         return Fill(
@@ -147,3 +158,21 @@ class FillModel:
 
 def opposite_side(side: Side) -> Side:
     return Side.BUY if side == Side.SELL else Side.SELL
+
+
+def _tiered_spread_pct(close: float, dte: int | None) -> float:
+    """Half-spread as fraction of close, tiered by moneyness proxy (close price) and DTE.
+
+    Thresholds calibrated to NIFTY practitioner consensus:
+      ATM liquid (close > 80):        0.3%
+      near-OTM (close 30–80):         0.5%
+      far OTM (close < 30):           1.5%
+      expiry-day far OTM (dte=0, <50): 2.0%
+    """
+    if dte is not None and dte == 0 and close < 50:
+        return 0.020
+    if close < 30:
+        return 0.015
+    if close < 80:
+        return 0.005
+    return 0.003

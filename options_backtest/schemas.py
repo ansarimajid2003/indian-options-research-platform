@@ -95,8 +95,19 @@ class BacktestConfig:
     stop_loss_pct: float | None = 0.5
     # Exit when profit >= target_profit_pct * entry_credit (e.g. 0.5 = exit at 50% profit)
     target_profit_pct: float | None = 0.5
+    # Trailing stop for long (debit) positions only.
+    # trail_trigger_pct: activate when pnl >= trail_trigger_pct * |entry_credit|
+    # trail_stop_pct: exit when combined close value drops this fraction below its peak
+    trail_trigger_pct: float | None = None
+    trail_stop_pct: float | None = None
     include_costs: bool = True
     bad_expiries: tuple[str, ...] = ("20250925", "20251224")
+    # Starting account balance for equity curve and percentage-based metrics
+    initial_capital: float = 1_000_000.0
+    # Path to NIFTY 1-min spot CSV for buy-and-hold baseline; None disables it
+    spot_csv: str = "data/processed/spot/nifty50_1min_CANONICAL.csv"
+    # Minimum calendar days to expiry at entry; trades with dte < min_dte are skipped.
+    min_dte: int = 0
 
 
 @dataclass

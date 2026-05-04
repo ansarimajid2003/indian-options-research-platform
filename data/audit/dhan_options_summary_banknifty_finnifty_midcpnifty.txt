@@ -1,19 +1,19 @@
 ================================================================
 DHAN OPTIONS DATA AUDIT SUMMARY
 ================================================================
-  Files processed    : 12978
+  Files processed    : 7686
   Files with errors  : 1295
-  Coverage           : 2021-01-01 to 2026-04-30
-  Clean bars total   : 87,924,800
+  Coverage           : 2021-08-04 to 2026-04-30
+  Clean bars total   : 46,483,518
 
 CLEANING ACTIONS:
-  Bars outside mkt hours dropped  : 78,343
+  Bars outside mkt hours dropped  : 41,655
   Duplicate timestamps dropped    : 0
   Bad OHLC rows (flagged)         : 0
   Zero-close bars (kept, flagged) : 0
-  Zero-volume bars (kept, flagged): 14,190,100
-  IV spikes >200% flagged         : 11,914
-  IV=0 bars flagged               : 5,162,553
+  Zero-volume bars (kept, flagged): 9,877,239
+  IV spikes >200% flagged         : 10,117
+  IV=0 bars flagged               : 2,538,630
   iv_clean same-day forward-filled for IV research; raw iv is preserved
 
 PER-BUCKET CLEAN ROW COUNTS:
@@ -143,93 +143,9 @@ PER-BUCKET CLEAN ROW COUNTS:
   midcpnifty/week/put/ATMp7           :    260,129 bars
   midcpnifty/week/put/ATMp8           :    257,028 bars
   midcpnifty/week/put/ATMp9           :    254,679 bars
-  nifty/month/call/ATM                :    478,311 bars
-  nifty/month/call/ATMm1              :    478,295 bars
-  nifty/month/call/ATMm10             :    474,880 bars
-  nifty/month/call/ATMm2              :    478,248 bars
-  nifty/month/call/ATMm3              :    478,075 bars
-  nifty/month/call/ATMm4              :    477,949 bars
-  nifty/month/call/ATMm5              :    477,867 bars
-  nifty/month/call/ATMm6              :    477,607 bars
-  nifty/month/call/ATMm7              :    477,185 bars
-  nifty/month/call/ATMm8              :    476,284 bars
-  nifty/month/call/ATMm9              :    475,549 bars
-  nifty/month/call/ATMp1              :    478,216 bars
-  nifty/month/call/ATMp10             :    478,168 bars
-  nifty/month/call/ATMp2              :    478,298 bars
-  nifty/month/call/ATMp3              :    478,277 bars
-  nifty/month/call/ATMp4              :    478,236 bars
-  nifty/month/call/ATMp5              :    478,201 bars
-  nifty/month/call/ATMp6              :    478,234 bars
-  nifty/month/call/ATMp7              :    478,216 bars
-  nifty/month/call/ATMp8              :    478,201 bars
-  nifty/month/call/ATMp9              :    478,209 bars
-  nifty/month/put/ATM                 :    478,309 bars
-  nifty/month/put/ATMm1               :    478,312 bars
-  nifty/month/put/ATMm10              :    478,082 bars
-  nifty/month/put/ATMm2               :    478,264 bars
-  nifty/month/put/ATMm3               :    478,258 bars
-  nifty/month/put/ATMm4               :    478,240 bars
-  nifty/month/put/ATMm5               :    478,235 bars
-  nifty/month/put/ATMm6               :    478,181 bars
-  nifty/month/put/ATMm7               :    478,055 bars
-  nifty/month/put/ATMm8               :    478,027 bars
-  nifty/month/put/ATMm9               :    478,075 bars
-  nifty/month/put/ATMp1               :    478,288 bars
-  nifty/month/put/ATMp10              :    475,324 bars
-  nifty/month/put/ATMp2               :    478,247 bars
-  nifty/month/put/ATMp3               :    478,185 bars
-  nifty/month/put/ATMp4               :    478,105 bars
-  nifty/month/put/ATMp5               :    477,977 bars
-  nifty/month/put/ATMp6               :    477,786 bars
-  nifty/month/put/ATMp7               :    477,266 bars
-  nifty/month/put/ATMp8               :    477,048 bars
-  nifty/month/put/ATMp9               :    476,196 bars
-  nifty/week/call/ATM                 :    509,046 bars
-  nifty/week/call/ATMm1               :    509,047 bars
-  nifty/week/call/ATMm10              :    508,162 bars
-  nifty/week/call/ATMm2               :    509,036 bars
-  nifty/week/call/ATMm3               :    509,049 bars
-  nifty/week/call/ATMm4               :    509,045 bars
-  nifty/week/call/ATMm5               :    509,043 bars
-  nifty/week/call/ATMm6               :    509,006 bars
-  nifty/week/call/ATMm7               :    508,946 bars
-  nifty/week/call/ATMm8               :    508,814 bars
-  nifty/week/call/ATMm9               :    508,633 bars
-  nifty/week/call/ATMp1               :    509,044 bars
-  nifty/week/call/ATMp10              :    509,050 bars
-  nifty/week/call/ATMp2               :    509,035 bars
-  nifty/week/call/ATMp3               :    509,038 bars
-  nifty/week/call/ATMp4               :    509,039 bars
-  nifty/week/call/ATMp5               :    509,049 bars
-  nifty/week/call/ATMp6               :    509,049 bars
-  nifty/week/call/ATMp7               :    509,050 bars
-  nifty/week/call/ATMp8               :    509,049 bars
-  nifty/week/call/ATMp9               :    509,047 bars
-  nifty/week/put/ATM                  :    509,048 bars
-  nifty/week/put/ATMm1                :    509,047 bars
-  nifty/week/put/ATMm10               :    509,050 bars
-  nifty/week/put/ATMm2                :    509,045 bars
-  nifty/week/put/ATMm3                :    509,048 bars
-  nifty/week/put/ATMm4                :    509,043 bars
-  nifty/week/put/ATMm5                :    509,046 bars
-  nifty/week/put/ATMm6                :    509,049 bars
-  nifty/week/put/ATMm7                :    509,048 bars
-  nifty/week/put/ATMm8                :    509,048 bars
-  nifty/week/put/ATMm9                :    509,050 bars
-  nifty/week/put/ATMp1                :    509,046 bars
-  nifty/week/put/ATMp10               :    507,149 bars
-  nifty/week/put/ATMp2                :    509,048 bars
-  nifty/week/put/ATMp3                :    509,048 bars
-  nifty/week/put/ATMp4                :    509,042 bars
-  nifty/week/put/ATMp5                :    509,041 bars
-  nifty/week/put/ATMp6                :    508,995 bars
-  nifty/week/put/ATMp7                :    508,662 bars
-  nifty/week/put/ATMp8                :    508,624 bars
-  nifty/week/put/ATMp9                :    507,862 bars
 
 QUALITY VERDICT:
   OHLC integrity : PASS -zero bad rows
   Parse errors   : FAIL -1295 files failed (check audit CSV 'error' column)
-  IV spikes      : WARN -11914 bars had IV>200% (raw iv preserved; use iv_clean only deliberately)
+  IV spikes      : WARN -10117 bars had IV>200% (raw iv preserved; use iv_clean only deliberately)
 ================================================================

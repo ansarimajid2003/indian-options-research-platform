@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from calendar import monthrange
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
 import pandas as pd
@@ -11,8 +12,11 @@ SESSION_END = time(15, 30)
 
 NIFTY_LAST_THURSDAY_EXPIRY = date(2025, 8, 28)
 NIFTY_FIRST_TUESDAY_EXPIRY = date(2025, 9, 2)
+NIFTY_LAST_THURSDAY_MONTHLY_EXPIRY = date(2025, 8, 28)
 _THURSDAY = 3
 _TUESDAY = 1
+_WEDNESDAY = 2
+_MONDAY = 0
 
 # ──────────────────────────────────────────────────────────────────────────────
 # NSE lot-size history (NIFTY 50 index derivatives)
@@ -38,6 +42,131 @@ def nifty_lot_size(trade_date: date) -> int:
         if trade_date >= effective_from:
             return size
     return 200  # pre-Jun-2000 fallback
+
+
+@dataclass(frozen=True)
+class InstrumentSpec:
+    """Exchange-contract metadata needed by the backtest engine."""
+
+    symbol: str
+    dhan_folder: str
+    display_name: str
+    strike_step: int
+    default_lot_size: int
+    lot_size_schedule: tuple[tuple[date, int], ...]
+    weekly_discontinued_after: date | None = None
+    spot_csv: str | None = None
+
+
+def _normalise_symbol(symbol: str | None) -> str:
+    value = (symbol or "NIFTY").upper().replace(" ", "").replace("-", "").replace("_", "")
+    aliases = {
+        "NIFTY": "NIFTY",
+        "NIFTY50": "NIFTY",
+        "BANKNIFTY": "BANKNIFTY",
+        "NIFTYBANK": "BANKNIFTY",
+        "FINNIFTY": "FINNIFTY",
+        "NIFTYFINSERVICE": "FINNIFTY",
+        "NIFTYFINANCIALSERVICES": "FINNIFTY",
+        "MIDCPNIFTY": "MIDCPNIFTY",
+        "MIDCAPNIFTY": "MIDCPNIFTY",
+        "NIFTYMIDCAPSELECT": "MIDCPNIFTY",
+    }
+    if value not in aliases:
+        raise ValueError(f"Unsupported index symbol: {symbol}")
+    return aliases[value]
+
+
+# Boundaries are trade-date approximations for backtests. Around exchange
+# transition months, circulars apply by contract introduction; this table uses
+# the first practical front-expiry date where a backtest should use the new
+# contract multiplier.
+INSTRUMENT_SPECS: dict[str, InstrumentSpec] = {
+    "NIFTY": InstrumentSpec(
+        symbol="NIFTY",
+        dhan_folder="nifty",
+        display_name="NIFTY 50",
+        strike_step=50,
+        default_lot_size=200,
+        lot_size_schedule=(
+            (date(2025, 12, 31), 65),  # NSE/FAOP/70616: Jan 2026 contracts onward
+            (date(2024, 11, 21), 75),  # NSE/FAOP/64625: Jan 2025 contracts onward
+            (date(2024, 4, 26), 25),   # NSE/FAOP/61791: May/Jul 2024 contracts onward
+            (date(2021, 7, 1), 50),    # NSE/FAOP/47854: Jul 2021 contracts onward
+            (date(2015, 10, 30), 75),
+            (date(2014, 10, 31), 25),
+            (date(2007, 2, 23), 50),
+            (date(2005, 4, 1), 100),
+            (date(2000, 6, 12), 200),
+        ),
+        spot_csv="data/processed/spot/nifty50_1min_CANONICAL.csv",
+    ),
+    "BANKNIFTY": InstrumentSpec(
+        symbol="BANKNIFTY",
+        dhan_folder="banknifty",
+        display_name="NIFTY BANK",
+        strike_step=100,
+        default_lot_size=25,
+        lot_size_schedule=(
+            (date(2025, 12, 31), 30),
+            (date(2025, 7, 31), 35),
+            (date(2024, 11, 21), 30),
+            (date(2023, 7, 28), 15),
+            (date(2000, 1, 1), 25),
+        ),
+        weekly_discontinued_after=date(2024, 11, 13),
+        spot_csv="data/processed/spot/banknifty_1min_DHAN.csv",
+    ),
+    "FINNIFTY": InstrumentSpec(
+        symbol="FINNIFTY",
+        dhan_folder="finnifty",
+        display_name="NIFTY FIN SERVICE",
+        strike_step=50,
+        default_lot_size=40,
+        lot_size_schedule=(
+            (date(2025, 12, 31), 60),
+            (date(2024, 11, 21), 65),
+            (date(2024, 7, 30), 25),
+            (date(2021, 1, 11), 40),
+        ),
+        weekly_discontinued_after=date(2024, 11, 19),
+        spot_csv="data/processed/spot/finnifty_1min_DHAN.csv",
+    ),
+    "MIDCPNIFTY": InstrumentSpec(
+        symbol="MIDCPNIFTY",
+        dhan_folder="midcpnifty",
+        display_name="NIFTY MIDCAP SELECT",
+        strike_step=25,
+        default_lot_size=75,
+        lot_size_schedule=(
+            (date(2025, 12, 31), 120),
+            (date(2025, 7, 31), 140),
+            (date(2024, 11, 21), 120),
+            (date(2024, 7, 29), 50),
+            (date(2022, 1, 24), 75),
+        ),
+        weekly_discontinued_after=date(2024, 11, 18),
+        spot_csv="data/processed/spot/midcpnifty_1min_DHAN.csv",
+    ),
+}
+
+
+def get_instrument_spec(symbol: str | None = "NIFTY") -> InstrumentSpec:
+    return INSTRUMENT_SPECS[_normalise_symbol(symbol)]
+
+
+def lot_size(symbol: str, trade_date: date) -> int:
+    """Return the index-derivatives lot size in effect for *symbol*."""
+    spec = get_instrument_spec(symbol)
+    for effective_from, size in spec.lot_size_schedule:
+        if trade_date >= effective_from:
+            return size
+    return spec.default_lot_size
+
+
+def nifty_lot_size(trade_date: date) -> int:
+    """Compatibility wrapper for older callers."""
+    return lot_size("NIFTY", trade_date)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -280,41 +409,91 @@ def _last_weekday(year: int, month: int, weekday: int) -> date:
 
 
 def _adjust_to_trading_day(candidate: date, trading_dates: set[date] | None) -> date:
-    if not trading_dates or candidate in trading_dates:
+    if trading_dates is None:
+        while not is_trading_day(candidate):
+            candidate -= timedelta(days=1)
+        return candidate
+    if candidate in trading_dates:
+        return candidate
+    if trading_dates and candidate > max(trading_dates):
+        while not is_trading_day(candidate):
+            candidate -= timedelta(days=1)
         return candidate
     previous = [day for day in trading_dates if day < candidate]
     return max(previous) if previous else candidate
 
 
-def nifty_weekly_expiry_on_or_after(
+def _weekly_expiry_weekday(symbol: str, anchor: date) -> int:
+    symbol = get_instrument_spec(symbol).symbol
+    if symbol == "NIFTY":
+        return _THURSDAY if anchor <= NIFTY_LAST_THURSDAY_EXPIRY else _TUESDAY
+    if symbol == "BANKNIFTY":
+        return _THURSDAY if anchor < date(2023, 9, 1) else _WEDNESDAY
+    if symbol == "FINNIFTY":
+        return _THURSDAY if anchor < date(2021, 10, 14) else _TUESDAY
+    if symbol == "MIDCPNIFTY":
+        return _WEDNESDAY if anchor < date(2023, 8, 21) else _MONDAY
+    raise ValueError(f"Unsupported index symbol: {symbol}")
+
+
+def _monthly_expiry_weekday(symbol: str, year: int, month: int) -> int:
+    symbol = get_instrument_spec(symbol).symbol
+    if symbol == "NIFTY":
+        return _THURSDAY if (year, month) <= (2025, 8) else _TUESDAY
+    if symbol == "BANKNIFTY":
+        if (year, month) < (2024, 3):
+            return _THURSDAY
+        if (year, month) < (2025, 1):
+            return _WEDNESDAY
+        return _THURSDAY if (year, month) <= (2025, 8) else _TUESDAY
+    if symbol == "FINNIFTY":
+        if (year, month) < (2021, 10):
+            return _THURSDAY
+        if (year, month) < (2025, 1):
+            return _TUESDAY
+        return _THURSDAY if (year, month) <= (2025, 8) else _TUESDAY
+    if symbol == "MIDCPNIFTY":
+        if (year, month) < (2023, 8):
+            return _WEDNESDAY
+        if (year, month) < (2025, 1):
+            return _MONDAY
+        return _THURSDAY if (year, month) <= (2025, 8) else _TUESDAY
+    raise ValueError(f"Unsupported index symbol: {symbol}")
+
+
+def weekly_expiry_on_or_after(
+    symbol: str,
     trade_date: date,
     *,
     min_dte: int = 0,
     trading_dates: list[date] | set[date] | None = None,
 ) -> date:
-    """
-    Return the NIFTY weekly expiry to trade from ``trade_date``.
-
-    NSE weekly NIFTY expiries were Thursday through 2025-08-28. Contracts
-    expiring on/after 2025-09-01 use Tuesday expiry, with the first weekly
-    Tuesday expiry on 2025-09-02. If a scheduled expiry is a holiday, the
-    provided trading calendar moves it to the previous trading session.
-    """
+    """Return the front weekly expiry for the requested index symbol."""
     if min_dte < 0:
         raise ValueError("min_dte must be >= 0")
-    trading_set = set(trading_dates) if trading_dates is not None else None
+    spec = get_instrument_spec(symbol)
     earliest = trade_date + timedelta(days=min_dte)
+    if spec.weekly_discontinued_after is not None and earliest > spec.weekly_discontinued_after:
+        return monthly_expiry_on_or_after(
+            spec.symbol,
+            trade_date,
+            min_dte=min_dte,
+            trading_dates=trading_dates,
+        )
+    trading_set = set(trading_dates) if trading_dates is not None else None
     anchor = trade_date
     while True:
-        if anchor <= NIFTY_LAST_THURSDAY_EXPIRY:
-            candidate = _next_weekday(anchor, _THURSDAY)
-            if candidate > NIFTY_LAST_THURSDAY_EXPIRY:
-                candidate = NIFTY_FIRST_TUESDAY_EXPIRY
-        else:
-            candidate = _next_weekday(anchor, _TUESDAY)
-            if candidate < NIFTY_FIRST_TUESDAY_EXPIRY:
-                candidate = NIFTY_FIRST_TUESDAY_EXPIRY
-
+        weekday = _weekly_expiry_weekday(spec.symbol, anchor)
+        candidate = _next_weekday(anchor, weekday)
+        if spec.symbol == "NIFTY" and candidate > NIFTY_LAST_THURSDAY_EXPIRY and weekday == _THURSDAY:
+            candidate = NIFTY_FIRST_TUESDAY_EXPIRY
+        if spec.weekly_discontinued_after is not None and candidate > spec.weekly_discontinued_after:
+            return monthly_expiry_on_or_after(
+                spec.symbol,
+                trade_date,
+                min_dte=min_dte,
+                trading_dates=trading_dates,
+            )
         unadjusted = candidate
         candidate = _adjust_to_trading_day(unadjusted, trading_set)
         if candidate >= earliest:
@@ -322,20 +501,22 @@ def nifty_weekly_expiry_on_or_after(
         anchor = unadjusted + timedelta(days=1)
 
 
-def nifty_monthly_expiry_on_or_after(
+def monthly_expiry_on_or_after(
+    symbol: str,
     trade_date: date,
     *,
     min_dte: int = 0,
     trading_dates: list[date] | set[date] | None = None,
 ) -> date:
-    """Return the front NIFTY monthly expiry across the 2025 Tuesday transition."""
+    """Return the front monthly expiry for the requested index symbol."""
     if min_dte < 0:
         raise ValueError("min_dte must be >= 0")
+    spec = get_instrument_spec(symbol)
     trading_set = set(trading_dates) if trading_dates is not None else None
     earliest = trade_date + timedelta(days=min_dte)
     year, month = trade_date.year, trade_date.month
     while True:
-        weekday = _THURSDAY if (year, month) <= (2025, 8) else _TUESDAY
+        weekday = _monthly_expiry_weekday(spec.symbol, year, month)
         candidate = _adjust_to_trading_day(_last_weekday(year, month, weekday), trading_set)
         if candidate >= earliest:
             return candidate
@@ -345,7 +526,8 @@ def nifty_monthly_expiry_on_or_after(
             month = 1
 
 
-def nifty_expiry_on_or_after(
+def expiry_on_or_after(
+    symbol: str,
     trade_date: date,
     *,
     expiry_type: str = "week",
@@ -353,10 +535,39 @@ def nifty_expiry_on_or_after(
     trading_dates: list[date] | set[date] | None = None,
 ) -> date:
     if expiry_type == "week":
-        return nifty_weekly_expiry_on_or_after(trade_date, min_dte=min_dte, trading_dates=trading_dates)
+        return weekly_expiry_on_or_after(symbol, trade_date, min_dte=min_dte, trading_dates=trading_dates)
     if expiry_type == "month":
-        return nifty_monthly_expiry_on_or_after(trade_date, min_dte=min_dte, trading_dates=trading_dates)
-    raise ValueError(f"Unsupported NIFTY expiry_type: {expiry_type}")
+        return monthly_expiry_on_or_after(symbol, trade_date, min_dte=min_dte, trading_dates=trading_dates)
+    raise ValueError(f"Unsupported expiry_type: {expiry_type}")
+
+
+def nifty_weekly_expiry_on_or_after(
+    trade_date: date,
+    *,
+    min_dte: int = 0,
+    trading_dates: list[date] | set[date] | None = None,
+) -> date:
+    return weekly_expiry_on_or_after("NIFTY", trade_date, min_dte=min_dte, trading_dates=trading_dates)
+
+
+def nifty_monthly_expiry_on_or_after(
+    trade_date: date,
+    *,
+    min_dte: int = 0,
+    trading_dates: list[date] | set[date] | None = None,
+) -> date:
+    """Return the front NIFTY monthly expiry across the 2025 Tuesday transition."""
+    return monthly_expiry_on_or_after("NIFTY", trade_date, min_dte=min_dte, trading_dates=trading_dates)
+
+
+def nifty_expiry_on_or_after(
+    trade_date: date,
+    *,
+    expiry_type: str = "week",
+    min_dte: int = 0,
+    trading_dates: list[date] | set[date] | None = None,
+) -> date:
+    return expiry_on_or_after("NIFTY", trade_date, expiry_type=expiry_type, min_dte=min_dte, trading_dates=trading_dates)
 
 
 def nearest_timestamp(index: pd.DatetimeIndex, target: pd.Timestamp) -> pd.Timestamp | None:

@@ -44,3 +44,21 @@ nifty50_1min_CANONICAL.csv
 # Optional generated local exports
 exports/
 downloads/
+
+# Generated backtest run output (large trade ledger CSVs)
+reports/backtests/options/focused/
+reports/backtests/options/legacy/runs/newer/
+reports/backtests/options/*.csv
+
+# Generated analysis and data-quality reports
+reports/analysis/
+reports/data_quality/dhan_*.md
+reports/research/cross_index_*.md
+
+# Generated audit CSVs (large; keep .txt summaries and original dhan_options_audit.csv)
+data/audit/dhan_options_audit_all.csv
+data/audit/dhan_options_audit_banknifty_finnifty_midcpnifty.csv
+data/audit/dhan_spot_audit.csv
+
+# Scratch planning files
+kimi_plan.md

@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from options_backtest.dhan_loader import DhanBacktestEngine, load_dhan_data
-from options_backtest.reports import trade_ledger_with_total
+from options_backtest.reports import batch_summary_md, trade_ledger_with_total
 from options_backtest.schemas import BacktestConfig
 from options_backtest.strategy import (
     ShortStraddle,
@@ -22,23 +22,24 @@ from options_backtest.strategy import (
 )
 
 
-def _path(run_stamp: str, name: str) -> Path:
-    return Path("reports/backtests/options") / f"{run_stamp}_dhan_{name}.csv"
+def _path(run_stamp: str, symbol: str, name: str) -> Path:
+    return Path("reports/backtests/options") / f"{run_stamp}_dhan_{symbol.lower()}_{name}.csv"
 
 
-def _config(*, next_day: bool = False, no_costs: bool = False) -> BacktestConfig:
+def _config(*, symbol: str, next_day: bool = False, no_costs: bool = False) -> BacktestConfig:
     if next_day:
         return BacktestConfig(
+            symbol=symbol,
             include_costs=not no_costs,
             entry_time=time(15, 16),
             exit_time=time(9, 16),
             next_day_exit=True,
         )
-    return BacktestConfig(include_costs=not no_costs)
+    return BacktestConfig(symbol=symbol, include_costs=not no_costs)
 
 
-def _short_premium_config(*, no_costs: bool = False) -> BacktestConfig:
-    return BacktestConfig(include_costs=not no_costs, stop_loss_pct=None)
+def _short_premium_config(*, symbol: str, no_costs: bool = False) -> BacktestConfig:
+    return BacktestConfig(symbol=symbol, include_costs=not no_costs, stop_loss_pct=None)
 
 
 def _run_job(
@@ -51,7 +52,7 @@ def _run_job(
 ) -> tuple[str, dict, Path]:
     engine = DhanBacktestEngine(config, dhan_root=args.dhan_root, expiry_type=args.expiry_type)
     result = engine.run(strategy, from_date=args.from_date, to_date=args.to_date, data=data)
-    output = _path(run_stamp, name)
+    output = _path(run_stamp, config.symbol, name)
     output.parent.mkdir(parents=True, exist_ok=True)
     trade_ledger_with_total(result.trade_ledger).to_csv(output, index=False)
     return name, result.summary, output
@@ -60,6 +61,7 @@ def _run_job(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the standard Dhan NIFTY backtest pack.")
     parser.add_argument("--dhan-root", default="data/processed/options/dhan")
+    parser.add_argument("--symbol", default="NIFTY", choices=["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
     parser.add_argument("--expiry-type", choices=["week", "month"], default="week")
     parser.add_argument("--from-date")
     parser.add_argument("--to-date")
@@ -68,13 +70,13 @@ def main() -> int:
     args = parser.parse_args()
 
     run_stamp = args.run_stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
-    data = load_dhan_data(args.dhan_root, args.expiry_type)
+    data = load_dhan_data(args.dhan_root, args.expiry_type, args.symbol)
     jobs = [
-        ("short_straddle", ShortStraddle(), _short_premium_config()),
-        ("short_strangle", ShortStrangle(), _short_premium_config()),
-        ("three_pm_directional", ThreePMDirectional(), _config(next_day=True)),
-        ("three_pm_v2_call", ThreePMV2CallLevelStop(), _config(next_day=True)),
-        ("three_pm_v2_put", ThreePMV2Put(), _config(next_day=True)),
+        ("short_straddle", ShortStraddle(), _short_premium_config(symbol=args.symbol)),
+        ("short_strangle", ShortStrangle(), _short_premium_config(symbol=args.symbol)),
+        ("three_pm_directional", ThreePMDirectional(), _config(symbol=args.symbol, next_day=True)),
+        ("three_pm_v2_call", ThreePMV2CallLevelStop(), _config(symbol=args.symbol, next_day=True)),
+        ("three_pm_v2_put", ThreePMV2Put(), _config(symbol=args.symbol, next_day=True)),
     ]
 
     workers = args.workers or len(jobs)
@@ -92,11 +94,17 @@ def main() -> int:
             idx = futures[future]
             results[idx] = future.result()
 
+    summary_pairs: list[tuple[str, dict]] = []
     for result in results:
         if result is None:
             continue
         name, summary, output = result
         print(f"{name}: {summary} -> {output}")
+        summary_pairs.append((name, summary))
+
+    summary_path = Path("reports/backtests/options") / f"{run_stamp}_summary.md"
+    summary_path.write_text(batch_summary_md(summary_pairs, run_stamp), encoding="utf-8")
+    print(f"summary -> {summary_path}")
 
     return 0
 

@@ -57,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Primary backtest command — Dhan 5-year data
     dhan = sub.add_parser("run-backtest")
     dhan.add_argument("--dhan-root", default="data/processed/options/dhan")
+    dhan.add_argument("--symbol", default="NIFTY", choices=["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
     dhan.add_argument("--expiry-type", choices=["week", "month"], default="week")
     dhan.add_argument("--strategy", choices=["short-straddle", "short-strangle", "iron-condor", "three-pm-directional", "three-pm-v2-put", "three-pm-v2-call-level-stop"], default="short-straddle")
     dhan.add_argument("--from-date", help="Start date YYYY-MM-DD")
@@ -144,6 +145,7 @@ def main() -> int:
             entry_time = _parse_time(args.entry_time) if args.entry_time else time(9, 20)
             exit_time = _parse_time(args.exit_time) if args.exit_time else time(15, 20)
         config = BacktestConfig(
+            symbol=args.symbol,
             include_costs=not args.no_costs,
             stop_loss_pct=args.stop_loss_pct,
             target_profit_pct=args.target_profit_pct,

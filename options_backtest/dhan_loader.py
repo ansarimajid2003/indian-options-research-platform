@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from .calendar import combine_date_time, is_trading_day, nearest_timestamp, next_trading_day, nifty_expiry_on_or_after
+from .calendar import (
+    combine_date_time,
+    expiry_on_or_after,
+    get_instrument_spec,
+    is_trading_day,
+    nearest_timestamp,
+    next_trading_day,
+)
 from .engine import BacktestEngine
 from .reports import build_result
 from .schemas import BacktestConfig, BacktestResult, Contract, OptionType
@@ -40,11 +47,11 @@ def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _add_expiry_column(df: pd.DataFrame, expiry_type: str, trading_dates: list[date]) -> pd.DataFrame:
+def _add_expiry_column(df: pd.DataFrame, symbol: str, expiry_type: str, trading_dates: list[date]) -> pd.DataFrame:
     df = df.copy()
     df["trade_date"] = df["timestamp"].dt.date
     expiry_by_date = {
-        day: nifty_expiry_on_or_after(day, expiry_type=expiry_type, min_dte=0, trading_dates=trading_dates)
+        day: expiry_on_or_after(symbol, day, expiry_type=expiry_type, min_dte=0, trading_dates=trading_dates)
         for day in df["trade_date"].unique()
     }
     df["expiry"] = df["trade_date"].map(expiry_by_date)
@@ -53,6 +60,7 @@ def _add_expiry_column(df: pd.DataFrame, expiry_type: str, trading_dates: list[d
 
 @dataclass
 class DhanOptionData:
+    symbol: str
     calls: dict[str, pd.DataFrame]
     puts: dict[str, pd.DataFrame]
     # Full cache: (strike, option_type.value) -> timestamp-indexed DataFrame
@@ -94,9 +102,10 @@ def _build_bars_cache(calls: dict[str, pd.DataFrame], puts: dict[str, pd.DataFra
     return result
 
 
-def load_dhan_data(dhan_root: str | Path, expiry_type: str = "week") -> DhanOptionData:
+def load_dhan_data(dhan_root: str | Path, expiry_type: str = "week", symbol: str = "NIFTY") -> DhanOptionData:
     root = Path(dhan_root)
-    base = root / "nifty" / expiry_type / "expiry_code_1"
+    spec = get_instrument_spec(symbol)
+    base = root / spec.dhan_folder / expiry_type / "expiry_code_1"
     calls: dict[str, pd.DataFrame] = {}
     puts: dict[str, pd.DataFrame] = {}
     for key in _OFFSET_NAMES:
@@ -140,8 +149,8 @@ def load_dhan_data(dhan_root: str | Path, expiry_type: str = "week") -> DhanOpti
 
     bars_cache: dict[tuple[int, str], pd.DataFrame] = {}
     if trading_dates:
-        calls = {key: _add_expiry_column(df, expiry_type, trading_dates) for key, df in calls.items()}
-        puts = {key: _add_expiry_column(df, expiry_type, trading_dates) for key, df in puts.items()}
+        calls = {key: _add_expiry_column(df, spec.symbol, expiry_type, trading_dates) for key, df in calls.items()}
+        puts = {key: _add_expiry_column(df, spec.symbol, expiry_type, trading_dates) for key, df in puts.items()}
         bars_cache = _build_bars_cache(calls, puts)
 
     atm_timestamps_by_date: dict[date, pd.DatetimeIndex] = {}
@@ -175,6 +184,7 @@ def load_dhan_data(dhan_root: str | Path, expiry_type: str = "week") -> DhanOpti
 
     logger.info("Cache built: %d (strike, type) pairs, %d trading dates", len(bars_cache), len(trading_dates))
     return DhanOptionData(
+        symbol=spec.symbol,
         calls=calls,
         puts=puts,
         bars_cache=bars_cache,
@@ -200,7 +210,7 @@ class DhanContractResolver:
     def __init__(self, data: DhanOptionData, trade_date: date, exit_date: date | None = None, expiry: date | None = None) -> None:
         self._data = data
         self._trade_date = trade_date
-        self.expiry = expiry or nifty_expiry_on_or_after(trade_date, expiry_type="week")
+        self.expiry = expiry or expiry_on_or_after(data.symbol, trade_date, expiry_type="week")
         window_end = exit_date if exit_date is not None else trade_date
         # Merge per-date buckets for the window — O(days_in_window) dict lookups
         self._window_dates = [day for day in data.trading_dates if trade_date <= day <= window_end]
@@ -243,7 +253,7 @@ class DhanContractResolver:
         strike = self._data.offset_strike_by_date.get((side_name, key, timestamp.date(), self.expiry))
         if strike is None:
             raise KeyError(f"No Dhan bar for {key} {option_type.value} on {timestamp.date()} expiry {self.expiry}")
-        ticker = f"NIFTY_DHAN_{strike}{option_type.value}"
+        ticker = f"{self._data.symbol}_DHAN_{strike}{option_type.value}"
         return Contract(expiry=self.expiry, strike=strike, option_type=option_type, ticker=ticker)
 
     def bar_at(self, contract: Contract, timestamp: pd.Timestamp) -> pd.Series | None:
@@ -259,10 +269,9 @@ class DhanContractResolver:
         indexed = self._contract_frame(key)
         if indexed is None:
             return pd.DataFrame()
-        df = indexed.reset_index()
-        week_start = contract.expiry - timedelta(days=6)
-        mask = (df["timestamp"].dt.date >= week_start) & (df["timestamp"].dt.date <= contract.expiry)
-        return df[mask].reset_index(drop=True)
+        # _contract_frame already filters by self.expiry and _window_dates ([trade_date, exit_date]).
+        # A hardcoded 6-day lookback would cut off all trades entered >6 days before a monthly expiry.
+        return indexed.reset_index()
 
 
 CANONICAL_SPOT_PATH = "data/processed/spot/nifty50_1min_CANONICAL.csv"
@@ -294,9 +303,12 @@ class DhanBacktestEngine(BacktestEngine):
         spot_path: str | Path | None = None,
     ) -> None:
         super().__init__(config, liquidity_config)
+        self.spec = get_instrument_spec(self.config.symbol)
+        if spot_path is None and self.spec.spot_csv and self.config.spot_csv == CANONICAL_SPOT_PATH:
+            self.config = replace(self.config, spot_csv=self.spec.spot_csv)
         self.dhan_root = Path(dhan_root or "data/processed/options/dhan")
         self.expiry_type = expiry_type
-        self.spot_path = Path(spot_path or CANONICAL_SPOT_PATH)
+        self.spot_path = Path(spot_path or self.spec.spot_csv or CANONICAL_SPOT_PATH)
 
     def run(
         self,
@@ -307,7 +319,7 @@ class DhanBacktestEngine(BacktestEngine):
     ) -> BacktestResult:
         data = kwargs.get("data")
         if data is None:
-            data = load_dhan_data(self.dhan_root, self.expiry_type)
+            data = load_dhan_data(self.dhan_root, self.expiry_type, self.config.symbol)
 
         if not data.trading_dates:
             return build_result(self.config, [])
@@ -361,8 +373,9 @@ class DhanBacktestEngine(BacktestEngine):
             if can_enter_fn is not None and not can_enter_fn(trade_date, canonical_spot_by_date):
                 continue
 
-            min_dte = 1 if self.config.next_day_exit else 0
-            expiry = nifty_expiry_on_or_after(
+            min_dte = max(self.config.min_dte, 1 if self.config.next_day_exit else 0)
+            expiry = expiry_on_or_after(
+                self.config.symbol,
                 trade_date,
                 expiry_type=self.expiry_type,
                 min_dte=min_dte,
@@ -374,18 +387,35 @@ class DhanBacktestEngine(BacktestEngine):
             # Also update resolver._spot_index with real OHLC so that spot-level
             # stop detection in _find_exit uses actual intraday lows, not the
             # ATM-mid proxy where low == close.
+            # Only override when canonical data is actually available for the window;
+            # when it's missing, keep the ATM-proxy spot_bars already set by the resolver.
             if canonical_spot is not None:
                 frames = [
                     canonical_spot_by_date[d]
                     for d in (trade_date, exit_date)
                     if d in canonical_spot_by_date
                 ]
-                spot_window = pd.concat(frames, ignore_index=True) if frames else canonical_spot.iloc[0:0].copy()
-                resolver.spot_bars = spot_window
-                # Build a timestamp-indexed OHLC frame for _find_exit stop checks
-                if not spot_window.empty and {"low", "close"}.issubset(spot_window.columns):
-                    canonical_index = spot_window.set_index("timestamp").sort_index()[["low", "close"]]
-                    resolver._spot_index = canonical_index
+                if frames:
+                    canonical_window = pd.concat(frames, ignore_index=True)
+                    # _spot_index: canonical-only — real OHLC lows for stop detection
+                    if {"low", "close"}.issubset(canonical_window.columns):
+                        resolver._spot_index = canonical_window.set_index("timestamp").sort_index()[["low", "close"]]
+                    # spot_bars: canonical + ATM-proxy fill for timestamps canonical
+                    # doesn't cover (e.g. partial-day files missing the morning session)
+                    canonical_ts = set(pd.to_datetime(canonical_window["timestamp"]))
+                    atm_proxy = resolver.spot_bars
+                    if not atm_proxy.empty:
+                        atm_extra = atm_proxy[~pd.to_datetime(atm_proxy["timestamp"]).isin(canonical_ts)]
+                        if not atm_extra.empty:
+                            extra_cols = [c for c in ["timestamp", "open", "high", "low", "close"] if c in atm_extra.columns]
+                            resolver.spot_bars = pd.concat(
+                                [canonical_window, atm_extra[extra_cols]],
+                                ignore_index=True,
+                            ).sort_values("timestamp").reset_index(drop=True)
+                        else:
+                            resolver.spot_bars = canonical_window
+                    else:
+                        resolver.spot_bars = canonical_window
 
             trade = self._execute_trade(
                 expiry_dir=Path(trade_date.strftime("%Y%m%d")),

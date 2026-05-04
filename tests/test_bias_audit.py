@@ -29,6 +29,7 @@ from options_backtest.calendar import nearest_timestamp
 from options_backtest.contract_resolver import ContractResolver
 from options_backtest.data_store import load_expiry_options, load_expiry_spot
 from options_backtest.engine import BacktestEngine
+from options_backtest.liquidity import oi_slippage_multiplier
 from options_backtest.schemas import BacktestConfig, OptionType, Side
 from options_backtest.strategy import ShortStraddle
 
@@ -70,7 +71,13 @@ class BiasAuditTests(unittest.TestCase):
             bar_at_entry = bars[bars["timestamp"] == entry_ts]
             self.assertFalse(bar_at_entry.empty, f"No bar at entry_ts for {fill.contract.ticker}")
             expected_close = float(bar_at_entry.iloc[0]["close"])
-            expected_price = FillModel(slippage_points=0.0, include_costs=False).fill_price(expected_close, fill.side)
+            oi = float(bar_at_entry.iloc[0]["oi"]) if "oi" in bar_at_entry.columns else 1000.0
+            expected_price = FillModel(slippage_points=0.0, include_costs=False).fill_price(
+                expected_close,
+                fill.side,
+                dte=(fill.contract.expiry - entry_ts.date()).days,
+                slippage_multiplier=oi_slippage_multiplier(oi),
+            )
             self.assertAlmostEqual(fill.price, expected_price, places=2,
                 msg=f"Entry fill price {fill.price} != fill-model price {expected_price} for entry bar close {expected_close} on {fill.contract.ticker}")
 
