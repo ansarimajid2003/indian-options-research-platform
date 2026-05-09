@@ -43,7 +43,7 @@ MARKET_OPEN = "09:15"
 MARKET_CLOSE = "15:29"
 IV_SPIKE_CAP = 200.0  # % -anything above is flagged as an expiry-day artefact
 
-INDICES = ["nifty", "banknifty", "finnifty", "midcpnifty"]
+INDICES = ["nifty", "banknifty", "finnifty", "midcpnifty", "sensex"]
 EXPIRY_TYPES = ["week", "month"]
 SIDES = ["call", "put"]
 CE_KEY = "ce"

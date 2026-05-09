@@ -23,7 +23,7 @@ RAW_ROOT = ROOT / "data" / "raw" / "spot" / "intraday"
 OUT_ROOT = ROOT / "data" / "processed" / "spot"
 AUDIT_DIR = ROOT / "data" / "audit"
 
-SYMBOLS = ["BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "INDIAVIX"]
+SYMBOLS = ["BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "INDIAVIX", "SENSEX"]
 MARKET_OPEN = "09:15"
 MARKET_CLOSE = "15:29"
 

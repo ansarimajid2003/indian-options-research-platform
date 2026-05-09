@@ -1,10 +1,8 @@
 DHAN SPOT DATA AUDIT SUMMARY
-Files processed: 63
-Files with errors: 5
-Clean rows: 1,280,350
-Bad OHLC rows: 29
+Files processed: 13
+Files with errors: 0
+Clean rows: 289,023
+Bad OHLC rows: 65
 
 Per-symbol rows:
-  BANKNIFTY :    441,167
-  FINNIFTY  :    441,752
-  MIDCPNIFTY:    397,431
+  SENSEX    :    289,023

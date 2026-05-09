@@ -49,6 +49,9 @@ downloads/
 reports/backtests/options/focused/
 reports/backtests/options/legacy/runs/newer/
 reports/backtests/options/*.csv
+reports/backtests/options/research_validation/*.csv
+reports/backtests/options/risk_management/*.csv
+reports/backtests/options/monitoring/*.csv
 
 # Generated analysis and data-quality reports
 reports/analysis/
@@ -59,6 +62,10 @@ reports/research/cross_index_*.md
 data/audit/dhan_options_audit_all.csv
 data/audit/dhan_options_audit_banknifty_finnifty_midcpnifty.csv
 data/audit/dhan_spot_audit.csv
+data/audit/dhan_options_audit_sensex.csv
 
 # Scratch planning files
 kimi_plan.md
+
+# Temporary scratch directories
+tmp*/

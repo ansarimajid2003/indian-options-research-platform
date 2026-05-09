@@ -72,6 +72,9 @@ LEDGER_COLUMNS = [
     "lot_size",
     "spot_entry",
     "spot_exit",
+    "vix_entry",
+    "vix_bucket",
+    "vix_timestamp",
     "entry_legs",
     "exit_legs",
     "gross_pnl",
@@ -108,6 +111,9 @@ def trade_ledger(trades: list[Trade], initial_capital: float = 0.0) -> pd.DataFr
             "lot_size": meta.get("lot_size"),
             "spot_entry": meta.get("spot_entry"),
             "spot_exit": meta.get("spot_exit"),
+            "vix_entry": meta.get("vix_entry"),
+            "vix_bucket": meta.get("vix_bucket"),
+            "vix_timestamp": meta.get("vix_timestamp"),
             "entry_legs": _fills_str(trade.entry_fills),
             "exit_legs": _fills_str(trade.exit_fills),
             "gross_pnl": trade.gross_pnl,
@@ -210,8 +216,11 @@ def summary(
         if n_days >= 30 and initial_capital > 0:
             n_years = n_days / 365.25
             final_equity = float(equity.iloc[-1]) if not equity.empty else initial_capital
-            raw_cagr = (final_equity / initial_capital) ** (1.0 / n_years) - 1.0
-            cagr = round(raw_cagr, 4)
+            ratio = final_equity / initial_capital
+            if ratio <= 0:
+                cagr = -1.0  # total ruin; negative equity is unphysical, cap at -100%
+            else:
+                cagr = round(ratio ** (1.0 / n_years) - 1.0, 4)
 
     # Sharpe, Sortino, and significance — all computed over the same business-day grid
     sharpe: float | None = None

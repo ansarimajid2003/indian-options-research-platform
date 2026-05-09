@@ -26,7 +26,16 @@ def _path(run_stamp: str, symbol: str, name: str) -> Path:
     return Path("reports/backtests/options") / f"{run_stamp}_dhan_{symbol.lower()}_{name}.csv"
 
 
-def _config(*, symbol: str, next_day: bool = False, no_costs: bool = False) -> BacktestConfig:
+def _vix_kwargs(args: argparse.Namespace) -> dict:
+    return {
+        "vix_path": args.vix_path,
+        "vix_min": args.vix_min,
+        "vix_max": args.vix_max,
+        "vix_missing_policy": args.vix_missing_policy,
+    }
+
+
+def _config(*, symbol: str, args: argparse.Namespace, next_day: bool = False, no_costs: bool = False) -> BacktestConfig:
     if next_day:
         return BacktestConfig(
             symbol=symbol,
@@ -34,12 +43,13 @@ def _config(*, symbol: str, next_day: bool = False, no_costs: bool = False) -> B
             entry_time=time(15, 16),
             exit_time=time(9, 16),
             next_day_exit=True,
+            **_vix_kwargs(args),
         )
-    return BacktestConfig(symbol=symbol, include_costs=not no_costs)
+    return BacktestConfig(symbol=symbol, include_costs=not no_costs, **_vix_kwargs(args))
 
 
-def _short_premium_config(*, symbol: str, no_costs: bool = False) -> BacktestConfig:
-    return BacktestConfig(symbol=symbol, include_costs=not no_costs, stop_loss_pct=None)
+def _short_premium_config(*, symbol: str, args: argparse.Namespace, no_costs: bool = False) -> BacktestConfig:
+    return BacktestConfig(symbol=symbol, include_costs=not no_costs, stop_loss_pct=None, **_vix_kwargs(args))
 
 
 def _run_job(
@@ -67,16 +77,20 @@ def main() -> int:
     parser.add_argument("--to-date")
     parser.add_argument("--run-stamp", help="Output prefix, default YYYYMMDD_HHMMSS captured once per run.")
     parser.add_argument("--workers", type=int, help="Parallel strategy workers, default one per strategy.")
+    parser.add_argument("--vix-path", help="India VIX CSV with timestamp/datetime and close columns")
+    parser.add_argument("--vix-min", type=float)
+    parser.add_argument("--vix-max", type=float)
+    parser.add_argument("--vix-missing-policy", choices=["skip", "allow"], default="skip")
     args = parser.parse_args()
 
     run_stamp = args.run_stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     data = load_dhan_data(args.dhan_root, args.expiry_type, args.symbol)
     jobs = [
-        ("short_straddle", ShortStraddle(), _short_premium_config(symbol=args.symbol)),
-        ("short_strangle", ShortStrangle(), _short_premium_config(symbol=args.symbol)),
-        ("three_pm_directional", ThreePMDirectional(), _config(symbol=args.symbol, next_day=True)),
-        ("three_pm_v2_call", ThreePMV2CallLevelStop(), _config(symbol=args.symbol, next_day=True)),
-        ("three_pm_v2_put", ThreePMV2Put(), _config(symbol=args.symbol, next_day=True)),
+        ("short_straddle", ShortStraddle(), _short_premium_config(symbol=args.symbol, args=args)),
+        ("short_strangle", ShortStrangle(), _short_premium_config(symbol=args.symbol, args=args)),
+        ("three_pm_directional", ThreePMDirectional(), _config(symbol=args.symbol, args=args, next_day=True)),
+        ("three_pm_v2_call", ThreePMV2CallLevelStop(), _config(symbol=args.symbol, args=args, next_day=True)),
+        ("three_pm_v2_put", ThreePMV2Put(), _config(symbol=args.symbol, args=args, next_day=True)),
     ]
 
     workers = args.workers or len(jobs)

@@ -2,150 +2,150 @@
 DHAN OPTIONS DATA AUDIT SUMMARY
 ================================================================
   Files processed    : 7686
-  Files with errors  : 1295
-  Coverage           : 2021-08-04 to 2026-04-30
-  Clean bars total   : 46,483,518
+  Files with errors  : 1363
+  Coverage           : 2021-08-04 to 2026-05-04
+  Clean bars total   : 38,494,290
 
 CLEANING ACTIONS:
-  Bars outside mkt hours dropped  : 41,655
+  Bars outside mkt hours dropped  : 20,287
   Duplicate timestamps dropped    : 0
   Bad OHLC rows (flagged)         : 0
   Zero-close bars (kept, flagged) : 0
-  Zero-volume bars (kept, flagged): 9,877,239
-  IV spikes >200% flagged         : 10,117
-  IV=0 bars flagged               : 2,538,630
+  Zero-volume bars (kept, flagged): 12,944,003
+  IV spikes >200% flagged         : 3,175
+  IV=0 bars flagged               : 845,455
   iv_clean same-day forward-filled for IV research; raw iv is preserved
 
 PER-BUCKET CLEAN ROW COUNTS:
-  banknifty/week/call/ATM             :    451,356 bars
-  banknifty/week/call/ATMm1           :    451,356 bars
-  banknifty/week/call/ATMm10          :    450,070 bars
-  banknifty/week/call/ATMm2           :    451,351 bars
-  banknifty/week/call/ATMm3           :    451,345 bars
-  banknifty/week/call/ATMm4           :    451,339 bars
-  banknifty/week/call/ATMm5           :    451,312 bars
-  banknifty/week/call/ATMm6           :    451,274 bars
-  banknifty/week/call/ATMm7           :    451,167 bars
-  banknifty/week/call/ATMm8           :    450,921 bars
-  banknifty/week/call/ATMm9           :    450,480 bars
-  banknifty/week/call/ATMp1           :    451,359 bars
-  banknifty/week/call/ATMp10          :    451,360 bars
-  banknifty/week/call/ATMp2           :    451,358 bars
-  banknifty/week/call/ATMp3           :    451,359 bars
-  banknifty/week/call/ATMp4           :    451,360 bars
-  banknifty/week/call/ATMp5           :    451,359 bars
-  banknifty/week/call/ATMp6           :    451,359 bars
-  banknifty/week/call/ATMp7           :    451,357 bars
-  banknifty/week/call/ATMp8           :    451,359 bars
-  banknifty/week/call/ATMp9           :    451,358 bars
-  banknifty/week/put/ATM              :    451,358 bars
-  banknifty/week/put/ATMm1            :    451,356 bars
-  banknifty/week/put/ATMm10           :    451,336 bars
-  banknifty/week/put/ATMm2            :    451,358 bars
-  banknifty/week/put/ATMm3            :    451,354 bars
-  banknifty/week/put/ATMm4            :    451,355 bars
-  banknifty/week/put/ATMm5            :    451,354 bars
-  banknifty/week/put/ATMm6            :    451,352 bars
-  banknifty/week/put/ATMm7            :    451,351 bars
-  banknifty/week/put/ATMm8            :    451,351 bars
-  banknifty/week/put/ATMm9            :    451,347 bars
-  banknifty/week/put/ATMp1            :    451,354 bars
-  banknifty/week/put/ATMp10           :    450,830 bars
-  banknifty/week/put/ATMp2            :    451,360 bars
-  banknifty/week/put/ATMp3            :    451,357 bars
-  banknifty/week/put/ATMp4            :    451,356 bars
-  banknifty/week/put/ATMp5            :    451,351 bars
-  banknifty/week/put/ATMp6            :    451,324 bars
-  banknifty/week/put/ATMp7            :    451,296 bars
-  banknifty/week/put/ATMp8            :    451,270 bars
-  banknifty/week/put/ATMp9            :    451,222 bars
-  finnifty/week/call/ATM              :    422,906 bars
-  finnifty/week/call/ATMm1            :    400,790 bars
-  finnifty/week/call/ATMm10           :    287,008 bars
-  finnifty/week/call/ATMm2            :    389,218 bars
-  finnifty/week/call/ATMm3            :    374,984 bars
-  finnifty/week/call/ATMm4            :    365,481 bars
-  finnifty/week/call/ATMm5            :    353,000 bars
-  finnifty/week/call/ATMm6            :    342,605 bars
-  finnifty/week/call/ATMm7            :    328,995 bars
-  finnifty/week/call/ATMm8            :    315,156 bars
-  finnifty/week/call/ATMm9            :    296,591 bars
-  finnifty/week/call/ATMp1            :    418,926 bars
-  finnifty/week/call/ATMp10           :    398,865 bars
-  finnifty/week/call/ATMp2            :    421,714 bars
-  finnifty/week/call/ATMp3            :    423,260 bars
-  finnifty/week/call/ATMp4            :    420,623 bars
-  finnifty/week/call/ATMp5            :    418,394 bars
-  finnifty/week/call/ATMp6            :    417,848 bars
-  finnifty/week/call/ATMp7            :    412,358 bars
-  finnifty/week/call/ATMp8            :    408,675 bars
-  finnifty/week/call/ATMp9            :    405,169 bars
-  finnifty/week/put/ATM               :    417,696 bars
-  finnifty/week/put/ATMm1             :    413,010 bars
-  finnifty/week/put/ATMm10            :    411,828 bars
-  finnifty/week/put/ATMm2             :    416,487 bars
-  finnifty/week/put/ATMm3             :    416,212 bars
-  finnifty/week/put/ATMm4             :    418,645 bars
-  finnifty/week/put/ATMm5             :    420,721 bars
-  finnifty/week/put/ATMm6             :    416,656 bars
-  finnifty/week/put/ATMm7             :    417,509 bars
-  finnifty/week/put/ATMm8             :    415,895 bars
-  finnifty/week/put/ATMm9             :    413,401 bars
-  finnifty/week/put/ATMp1             :    400,990 bars
-  finnifty/week/put/ATMp10            :    297,194 bars
-  finnifty/week/put/ATMp2             :    388,526 bars
-  finnifty/week/put/ATMp3             :    374,494 bars
-  finnifty/week/put/ATMp4             :    365,524 bars
-  finnifty/week/put/ATMp5             :    354,517 bars
-  finnifty/week/put/ATMp6             :    344,655 bars
-  finnifty/week/put/ATMp7             :    334,549 bars
-  finnifty/week/put/ATMp8             :    321,418 bars
-  finnifty/week/put/ATMp9             :    310,370 bars
-  midcpnifty/week/call/ATM            :    290,922 bars
-  midcpnifty/week/call/ATMm1          :    279,510 bars
-  midcpnifty/week/call/ATMm10         :    253,710 bars
-  midcpnifty/week/call/ATMm2          :    277,332 bars
-  midcpnifty/week/call/ATMm3          :    277,042 bars
-  midcpnifty/week/call/ATMm4          :    275,095 bars
-  midcpnifty/week/call/ATMm5          :    272,564 bars
-  midcpnifty/week/call/ATMm6          :    267,125 bars
-  midcpnifty/week/call/ATMm7          :    262,161 bars
-  midcpnifty/week/call/ATMm8          :    259,835 bars
-  midcpnifty/week/call/ATMm9          :    257,117 bars
-  midcpnifty/week/call/ATMp1          :    279,935 bars
-  midcpnifty/week/call/ATMp10         :    271,794 bars
-  midcpnifty/week/call/ATMp2          :    279,106 bars
-  midcpnifty/week/call/ATMp3          :    278,653 bars
-  midcpnifty/week/call/ATMp4          :    278,564 bars
-  midcpnifty/week/call/ATMp5          :    277,718 bars
-  midcpnifty/week/call/ATMp6          :    276,046 bars
-  midcpnifty/week/call/ATMp7          :    274,240 bars
-  midcpnifty/week/call/ATMp8          :    273,683 bars
-  midcpnifty/week/call/ATMp9          :    272,740 bars
-  midcpnifty/week/put/ATM             :    284,728 bars
-  midcpnifty/week/put/ATMm1           :    280,051 bars
-  midcpnifty/week/put/ATMm10          :    271,454 bars
-  midcpnifty/week/put/ATMm2           :    278,145 bars
-  midcpnifty/week/put/ATMm3           :    278,601 bars
-  midcpnifty/week/put/ATMm4           :    277,490 bars
-  midcpnifty/week/put/ATMm5           :    276,539 bars
-  midcpnifty/week/put/ATMm6           :    275,358 bars
-  midcpnifty/week/put/ATMm7           :    274,112 bars
-  midcpnifty/week/put/ATMm8           :    272,768 bars
-  midcpnifty/week/put/ATMm9           :    271,403 bars
-  midcpnifty/week/put/ATMp1           :    277,755 bars
-  midcpnifty/week/put/ATMp10          :    252,263 bars
-  midcpnifty/week/put/ATMp2           :    275,097 bars
-  midcpnifty/week/put/ATMp3           :    275,247 bars
-  midcpnifty/week/put/ATMp4           :    272,941 bars
-  midcpnifty/week/put/ATMp5           :    272,810 bars
-  midcpnifty/week/put/ATMp6           :    264,014 bars
-  midcpnifty/week/put/ATMp7           :    260,129 bars
-  midcpnifty/week/put/ATMp8           :    257,028 bars
-  midcpnifty/week/put/ATMp9           :    254,679 bars
+  banknifty/month/call/ATM            :    451,672 bars
+  banknifty/month/call/ATMm1          :    451,657 bars
+  banknifty/month/call/ATMm10         :    444,906 bars
+  banknifty/month/call/ATMm2          :    451,537 bars
+  banknifty/month/call/ATMm3          :    451,427 bars
+  banknifty/month/call/ATMm4          :    451,108 bars
+  banknifty/month/call/ATMm5          :    450,685 bars
+  banknifty/month/call/ATMm6          :    450,376 bars
+  banknifty/month/call/ATMm7          :    449,036 bars
+  banknifty/month/call/ATMm8          :    447,937 bars
+  banknifty/month/call/ATMm9          :    445,955 bars
+  banknifty/month/call/ATMp1          :    451,682 bars
+  banknifty/month/call/ATMp10         :    450,875 bars
+  banknifty/month/call/ATMp2          :    451,651 bars
+  banknifty/month/call/ATMp3          :    451,582 bars
+  banknifty/month/call/ATMp4          :    451,618 bars
+  banknifty/month/call/ATMp5          :    451,473 bars
+  banknifty/month/call/ATMp6          :    451,563 bars
+  banknifty/month/call/ATMp7          :    451,353 bars
+  banknifty/month/call/ATMp8          :    451,337 bars
+  banknifty/month/call/ATMp9          :    451,385 bars
+  banknifty/month/put/ATM             :    451,646 bars
+  banknifty/month/put/ATMm1           :    451,641 bars
+  banknifty/month/put/ATMm10          :    450,997 bars
+  banknifty/month/put/ATMm2           :    451,577 bars
+  banknifty/month/put/ATMm3           :    451,568 bars
+  banknifty/month/put/ATMm4           :    451,464 bars
+  banknifty/month/put/ATMm5           :    451,493 bars
+  banknifty/month/put/ATMm6           :    451,405 bars
+  banknifty/month/put/ATMm7           :    451,324 bars
+  banknifty/month/put/ATMm8           :    451,376 bars
+  banknifty/month/put/ATMm9           :    451,064 bars
+  banknifty/month/put/ATMp1           :    451,641 bars
+  banknifty/month/put/ATMp10          :    443,735 bars
+  banknifty/month/put/ATMp2           :    451,575 bars
+  banknifty/month/put/ATMp3           :    451,322 bars
+  banknifty/month/put/ATMp4           :    450,717 bars
+  banknifty/month/put/ATMp5           :    450,408 bars
+  banknifty/month/put/ATMp6           :    450,112 bars
+  banknifty/month/put/ATMp7           :    448,902 bars
+  banknifty/month/put/ATMp8           :    446,905 bars
+  banknifty/month/put/ATMp9           :    445,523 bars
+  finnifty/month/call/ATM             :    359,709 bars
+  finnifty/month/call/ATMm1           :    302,835 bars
+  finnifty/month/call/ATMm10          :    162,729 bars
+  finnifty/month/call/ATMm2           :    295,386 bars
+  finnifty/month/call/ATMm3           :    269,857 bars
+  finnifty/month/call/ATMm4           :    259,207 bars
+  finnifty/month/call/ATMm5           :    237,007 bars
+  finnifty/month/call/ATMm6           :    218,334 bars
+  finnifty/month/call/ATMm7           :    199,543 bars
+  finnifty/month/call/ATMm8           :    192,384 bars
+  finnifty/month/call/ATMm9           :    169,669 bars
+  finnifty/month/call/ATMp1           :    315,611 bars
+  finnifty/month/call/ATMp10          :    255,265 bars
+  finnifty/month/call/ATMp2           :    320,373 bars
+  finnifty/month/call/ATMp3           :    304,683 bars
+  finnifty/month/call/ATMp4           :    303,927 bars
+  finnifty/month/call/ATMp5           :    286,269 bars
+  finnifty/month/call/ATMp6           :    280,913 bars
+  finnifty/month/call/ATMp7           :    266,069 bars
+  finnifty/month/call/ATMp8           :    261,270 bars
+  finnifty/month/call/ATMp9           :    253,721 bars
+  finnifty/month/put/ATM              :    354,698 bars
+  finnifty/month/put/ATMm1            :    307,007 bars
+  finnifty/month/put/ATMm10           :    260,910 bars
+  finnifty/month/put/ATMm2            :    308,090 bars
+  finnifty/month/put/ATMm3            :    296,940 bars
+  finnifty/month/put/ATMm4            :    296,961 bars
+  finnifty/month/put/ATMm5            :    283,429 bars
+  finnifty/month/put/ATMm6            :    275,577 bars
+  finnifty/month/put/ATMm7            :    262,857 bars
+  finnifty/month/put/ATMm8            :    265,621 bars
+  finnifty/month/put/ATMm9            :    259,958 bars
+  finnifty/month/put/ATMp1            :    301,823 bars
+  finnifty/month/put/ATMp10           :    175,517 bars
+  finnifty/month/put/ATMp2            :    292,376 bars
+  finnifty/month/put/ATMp3            :    262,986 bars
+  finnifty/month/put/ATMp4            :    252,539 bars
+  finnifty/month/put/ATMp5            :    230,180 bars
+  finnifty/month/put/ATMp6            :    216,966 bars
+  finnifty/month/put/ATMp7            :    203,178 bars
+  finnifty/month/put/ATMp8            :    192,442 bars
+  finnifty/month/put/ATMp9            :    182,410 bars
+  midcpnifty/month/call/ATM           :    267,048 bars
+  midcpnifty/month/call/ATMm1         :    222,079 bars
+  midcpnifty/month/call/ATMm10        :    175,490 bars
+  midcpnifty/month/call/ATMm2         :    219,919 bars
+  midcpnifty/month/call/ATMm3         :    213,194 bars
+  midcpnifty/month/call/ATMm4         :    209,479 bars
+  midcpnifty/month/call/ATMm5         :    200,089 bars
+  midcpnifty/month/call/ATMm6         :    196,895 bars
+  midcpnifty/month/call/ATMm7         :    187,828 bars
+  midcpnifty/month/call/ATMm8         :    186,353 bars
+  midcpnifty/month/call/ATMm9         :    178,221 bars
+  midcpnifty/month/call/ATMp1         :    222,511 bars
+  midcpnifty/month/call/ATMp10        :    201,521 bars
+  midcpnifty/month/call/ATMp2         :    219,255 bars
+  midcpnifty/month/call/ATMp3         :    216,317 bars
+  midcpnifty/month/call/ATMp4         :    220,250 bars
+  midcpnifty/month/call/ATMp5         :    212,964 bars
+  midcpnifty/month/call/ATMp6         :    208,801 bars
+  midcpnifty/month/call/ATMp7         :    203,390 bars
+  midcpnifty/month/call/ATMp8         :    207,875 bars
+  midcpnifty/month/call/ATMp9         :    199,812 bars
+  midcpnifty/month/put/ATM            :    244,026 bars
+  midcpnifty/month/put/ATMm1          :    216,358 bars
+  midcpnifty/month/put/ATMm10         :    198,906 bars
+  midcpnifty/month/put/ATMm2          :    212,424 bars
+  midcpnifty/month/put/ATMm3          :    210,079 bars
+  midcpnifty/month/put/ATMm4          :    211,822 bars
+  midcpnifty/month/put/ATMm5          :    203,246 bars
+  midcpnifty/month/put/ATMm6          :    205,350 bars
+  midcpnifty/month/put/ATMm7          :    199,700 bars
+  midcpnifty/month/put/ATMm8          :    204,211 bars
+  midcpnifty/month/put/ATMm9          :    195,860 bars
+  midcpnifty/month/put/ATMp1          :    211,889 bars
+  midcpnifty/month/put/ATMp10         :    172,104 bars
+  midcpnifty/month/put/ATMp2          :    209,341 bars
+  midcpnifty/month/put/ATMp3          :    200,955 bars
+  midcpnifty/month/put/ATMp4          :    201,399 bars
+  midcpnifty/month/put/ATMp5          :    192,314 bars
+  midcpnifty/month/put/ATMp6          :    186,922 bars
+  midcpnifty/month/put/ATMp7          :    180,591 bars
+  midcpnifty/month/put/ATMp8          :    180,090 bars
+  midcpnifty/month/put/ATMp9          :    172,976 bars
 
 QUALITY VERDICT:
   OHLC integrity : PASS -zero bad rows
-  Parse errors   : FAIL -1295 files failed (check audit CSV 'error' column)
-  IV spikes      : WARN -10117 bars had IV>200% (raw iv preserved; use iv_clean only deliberately)
+  Parse errors   : FAIL -1363 files failed (check audit CSV 'error' column)
+  IV spikes      : WARN -3175 bars had IV>200% (raw iv preserved; use iv_clean only deliberately)
 ================================================================

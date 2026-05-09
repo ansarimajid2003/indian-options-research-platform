@@ -32,6 +32,7 @@ INSTRUMENTS = {
     "FINNIFTY":   {"securityId": "27",  "exchangeSegment": "IDX_I", "instrument": "INDEX"},
     "MIDCPNIFTY": {"securityId": "442", "exchangeSegment": "IDX_I", "instrument": "INDEX"},
     "INDIAVIX":   {"securityId": "21",  "exchangeSegment": "IDX_I", "instrument": "INDEX"},
+    "SENSEX":     {"securityId": "51",  "exchangeSegment": "IDX_I", "instrument": "INDEX"},
 }
 
 

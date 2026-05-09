@@ -17,6 +17,7 @@ _THURSDAY = 3
 _TUESDAY = 1
 _WEDNESDAY = 2
 _MONDAY = 0
+_FRIDAY = 4
 
 # ──────────────────────────────────────────────────────────────────────────────
 # NSE lot-size history (NIFTY 50 index derivatives)
@@ -71,6 +72,8 @@ def _normalise_symbol(symbol: str | None) -> str:
         "MIDCPNIFTY": "MIDCPNIFTY",
         "MIDCAPNIFTY": "MIDCPNIFTY",
         "NIFTYMIDCAPSELECT": "MIDCPNIFTY",
+        "SENSEX": "SENSEX",
+        "BSESENSEX": "SENSEX",
     }
     if value not in aliases:
         raise ValueError(f"Unsupported index symbol: {symbol}")
@@ -147,6 +150,18 @@ INSTRUMENT_SPECS: dict[str, InstrumentSpec] = {
         ),
         weekly_discontinued_after=date(2024, 11, 18),
         spot_csv="data/processed/spot/midcpnifty_1min_DHAN.csv",
+    ),
+    "SENSEX": InstrumentSpec(
+        symbol="SENSEX",
+        dhan_folder="sensex",
+        display_name="BSE SENSEX",
+        strike_step=100,
+        default_lot_size=10,
+        lot_size_schedule=(
+            (date(2025, 1, 10), 20),   # BSE circular Nov 28 2024; first weekly w/ new lot
+            (date(2020, 1, 1), 10),    # pre-revision lot size
+        ),
+        spot_csv="data/processed/spot/sensex_1min_DHAN.csv",
     ),
 }
 
@@ -433,6 +448,14 @@ def _weekly_expiry_weekday(symbol: str, anchor: date) -> int:
         return _THURSDAY if anchor < date(2021, 10, 14) else _TUESDAY
     if symbol == "MIDCPNIFTY":
         return _WEDNESDAY if anchor < date(2023, 8, 21) else _MONDAY
+    if symbol == "SENSEX":
+        # BSE weekly options launched May 2023 on Friday;
+        # shifted to Tuesday Jan 2025; shifted to Thursday Sep 2025
+        if anchor <= date(2025, 1, 3):
+            return _FRIDAY
+        if anchor <= date(2025, 8, 31):
+            return _TUESDAY
+        return _THURSDAY
     raise ValueError(f"Unsupported index symbol: {symbol}")
 
 
@@ -458,6 +481,12 @@ def _monthly_expiry_weekday(symbol: str, year: int, month: int) -> int:
         if (year, month) < (2025, 1):
             return _MONDAY
         return _THURSDAY if (year, month) <= (2025, 8) else _TUESDAY
+    if symbol == "SENSEX":
+        if (year, month) <= (2024, 12):
+            return _FRIDAY
+        if (year, month) <= (2025, 8):
+            return _TUESDAY
+        return _THURSDAY
     raise ValueError(f"Unsupported index symbol: {symbol}")
 
 

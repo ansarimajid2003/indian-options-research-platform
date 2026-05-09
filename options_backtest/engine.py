@@ -189,6 +189,7 @@ class BacktestEngine:
         option_bars: pd.DataFrame,
         spot_bars: pd.DataFrame,
         expiry: datetime.date,
+        extra_metadata: dict | None = None,
     ) -> Trade | None:
         trade_date = entry_ts.date()
         lot_size = self._resolve_lot_size(trade_date)
@@ -235,6 +236,7 @@ class BacktestEngine:
                 "entry_credit": self._close_value(entry_fills, legs),
                 "lot_size": lot_size,
                 "spot_entry": _spot_close(entry_ts),
+                **(extra_metadata or {}),
             },
         )
 

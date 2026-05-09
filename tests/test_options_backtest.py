@@ -22,8 +22,9 @@ from options_backtest.data_store import list_expiry_dirs, load_expiry_options, l
 from options_backtest.engine import BacktestEngine
 from options_backtest.liquidity import LiquidityConfig, contract_is_liquid
 from options_backtest.reports import trade_ledger, trade_ledger_with_total, LEDGER_COLUMNS
-from options_backtest.schemas import BacktestConfig, OptionType, Side
+from options_backtest.schemas import BacktestConfig, OptionType, Side, Trade
 from options_backtest.strategy import ShortStraddle
+from options_backtest.volatility_filter import VixFilter
 
 
 RAW_ROOT = Path("data/raw/options/shoonya/nifty")
@@ -149,6 +150,42 @@ class OptionsBacktestTests(unittest.TestCase):
         self.assertRegex(path.name, r"^\d{8}_\d{6}_dhan_three_pm_directional\.csv$")
         no_cost_path = _default_output_path("dhan", "short-straddle", no_costs=True)
         self.assertRegex(no_cost_path.name, r"^\d{8}_\d{6}_dhan_short_straddle_nocosts\.csv$")
+
+
+class VixFilterTests(unittest.TestCase):
+    def test_asof_lookup_never_uses_future_vix(self) -> None:
+        series = pd.Series(
+            [12.5, 15.0],
+            index=pd.to_datetime(["2026-04-10 09:15:00", "2026-04-10 09:20:00"]),
+        )
+        filt = VixFilter.from_series(series, min_vix=13.0, max_vix=22.0)
+        allowed, obs = filt.allows(pd.Timestamp("2026-04-10 09:19:59"))
+        self.assertFalse(allowed)
+        self.assertIsNotNone(obs)
+        self.assertEqual(obs.timestamp, pd.Timestamp("2026-04-10 09:15:00"))
+        self.assertEqual(obs.value, 12.5)
+
+    def test_missing_vix_skip_policy_blocks_trade(self) -> None:
+        series = pd.Series([15.0], index=pd.to_datetime(["2026-04-10 09:20:00"]))
+        filt = VixFilter.from_series(series)
+        allowed, obs = filt.allows(pd.Timestamp("2026-04-10 09:19:00"))
+        self.assertFalse(allowed)
+        self.assertIsNone(obs)
+
+    def test_trade_ledger_includes_vix_metadata(self) -> None:
+        trade = Trade(
+            expiry=date(2026, 4, 28),
+            strategy="Example",
+            entry_time=pd.Timestamp("2026-04-10 09:20:00"),
+            exit_time=pd.Timestamp("2026-04-10 15:20:00"),
+            entry_reason="entry",
+            exit_reason="time_exit",
+            metadata={"vix_entry": 15.25, "vix_bucket": "13-17", "vix_timestamp": pd.Timestamp("2026-04-10 09:20:00")},
+        )
+        ledger = trade_ledger([trade])
+        self.assertEqual(ledger.loc[0, "vix_entry"], 15.25)
+        self.assertEqual(ledger.loc[0, "vix_bucket"], "13-17")
+        self.assertIn("vix_timestamp", ledger.columns)
 
 
 class NiftyLotSizeTests(unittest.TestCase):

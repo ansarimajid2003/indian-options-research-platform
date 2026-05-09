@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--to-date", default=date.today().isoformat())
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--security-id", type=int, default=NIFTY_SECURITY_ID)
+    parser.add_argument("--exchange-segment", default="NSE_FNO", help="Exchange segment: NSE_FNO, BSE_FNO, etc.")
+    parser.add_argument("--instrument", default="OPTIDX", help="Instrument type: OPTIDX, OPTSTK, etc.")
     parser.add_argument("--interval", default="1", help="Dhan interval: 1, 5, 15, 25, or 60.")
     parser.add_argument("--expiry-flag", choices=["WEEK", "MONTH"], default="WEEK")
     parser.add_argument("--expiry-code", type=int, default=1)
@@ -66,6 +68,11 @@ def parse_args() -> argparse.Namespace:
         help="Delay between API calls. Increase if rate-limited.",
     )
     parser.add_argument("--force", action="store_true", help="Redownload existing JSON files.")
+    parser.add_argument(
+        "--continue-on-empty-data",
+        action="store_true",
+        help="Write DH-905 no-data responses and continue instead of aborting the whole backfill.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -123,10 +130,10 @@ def build_payload(
     end: date,
 ) -> dict[str, object]:
     return {
-        "exchangeSegment": "NSE_FNO",
+        "exchangeSegment": args.exchange_segment,
         "interval": args.interval,
         "securityId": args.security_id,
-        "instrument": "OPTIDX",
+        "instrument": args.instrument,
         "expiryFlag": args.expiry_flag,
         "expiryCode": args.expiry_code,
         "strike": strike,
@@ -225,6 +232,17 @@ def main() -> int:
                     print(f"saved {option_type} {strike} {window_start} {window_end}")
                 except HTTPError as exc:
                     body = exc.read().decode("utf-8", errors="replace")
+                    if args.continue_on_empty_data and exc.code == 400 and "DH-905" in body:
+                        try:
+                            response = json.loads(body)
+                        except json.JSONDecodeError:
+                            response = {"error": body}
+                        write_json(path, payload, response)
+                        completed += 1
+                        print(f"saved empty {option_type} {strike} {window_start} {window_end}: DH-905")
+                        if args.sleep > 0:
+                            time.sleep(args.sleep)
+                        continue
                     print(f"HTTP {exc.code} for {option_type} {strike} {window_start}: {body}")
                     return 1
                 except (URLError, TimeoutError) as exc:

@@ -150,6 +150,29 @@ class IronCondor(OptionStrategy):
         ]
 
 
+@dataclass(frozen=True)
+class CreditSpread(OptionStrategy):
+    """
+    Two-leg credit spread: sell short_offset option, buy long_offset option of the same type.
+    For a put spread: short_offset=-2, long_offset=-8 (long must be further OTM, i.e. more negative).
+    For a call spread: short_offset=2, long_offset=8 (long must be further OTM, i.e. more positive).
+    Data covers ATM±10; keep |long_offset| ≤ 8 so the long leg stays inside the range with a
+    2-strike buffer for intraday ATM drift before the exit bar is looked up.
+    """
+
+    option_type: OptionType = OptionType.PUT
+    short_offset: int = -2
+    long_offset: int = -8
+    lots: int = 1
+    name: str = "CreditSpread"
+
+    def entry_legs(self, context: StrategyContext) -> list[Leg]:
+        return [
+            Leg(context.resolver.resolve_atm_offset(context.timestamp, self.short_offset, self.option_type), Side.SELL, self.lots),
+            Leg(context.resolver.resolve_atm_offset(context.timestamp, self.long_offset, self.option_type), Side.BUY, self.lots),
+        ]
+
+
 def _check_three_pm_setup(context: StrategyContext) -> tuple[float, float]:
     """
     Returns (three_pm_close, three_fifteen_close) when the setup conditions hold:

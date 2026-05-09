@@ -1,0 +1,254 @@
+{
+  "base_1_1_1": {
+    "nifty": {
+      "lots": 1,
+      "filter": "vix_ge_13",
+      "expiry": "week",
+      "bucket_skip": null
+    },
+    "finnifty": {
+      "lots": 1,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "10-13"
+    },
+    "midcpnifty": {
+      "lots": 1,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "22-30"
+    },
+    "banknifty": {
+      "lots": 0,
+      "note": "excluded \u2014 structurally negative"
+    }
+  },
+  "best_sharpe": {
+    "nifty": {
+      "lots": 1,
+      "filter": "vix_ge_13",
+      "expiry": "week",
+      "bucket_skip": null
+    },
+    "finnifty": {
+      "lots": 2,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "10-13"
+    },
+    "midcpnifty": {
+      "lots": 2,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "22-30"
+    },
+    "banknifty": {
+      "lots": 0,
+      "note": "excluded \u2014 structurally negative"
+    }
+  },
+  "best_calmar": {
+    "nifty": {
+      "lots": 1,
+      "filter": "vix_ge_13",
+      "expiry": "week",
+      "bucket_skip": null
+    },
+    "finnifty": {
+      "lots": 2,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "10-13"
+    },
+    "midcpnifty": {
+      "lots": 3,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "22-30"
+    },
+    "banknifty": {
+      "lots": 0,
+      "note": "excluded \u2014 structurally negative"
+    }
+  },
+  "sharpe_opt_2x": {
+    "nifty": {
+      "lots": 2,
+      "filter": "vix_ge_13",
+      "expiry": "week",
+      "bucket_skip": null
+    },
+    "finnifty": {
+      "lots": 4,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "10-13"
+    },
+    "midcpnifty": {
+      "lots": 4,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "22-30"
+    },
+    "banknifty": {
+      "lots": 0,
+      "note": "excluded \u2014 structurally negative"
+    },
+    "expected": {
+      "cagr": "8.9%",
+      "sharpe": 2.454,
+      "max_dd_pct": "-2.1%",
+      "net_pnl": 437585.9
+    }
+  },
+  "sharpe_opt_3x": {
+    "nifty": {
+      "lots": 3,
+      "filter": "vix_ge_13",
+      "expiry": "week",
+      "bucket_skip": null
+    },
+    "finnifty": {
+      "lots": 6,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "10-13"
+    },
+    "midcpnifty": {
+      "lots": 6,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "22-30"
+    },
+    "banknifty": {
+      "lots": 0,
+      "note": "excluded \u2014 structurally negative"
+    },
+    "expected": {
+      "cagr": "12.6%",
+      "sharpe": 2.454,
+      "max_dd_pct": "-3.1%",
+      "net_pnl": 656378.85
+    }
+  },
+  "sharpe_opt_4x": {
+    "nifty": {
+      "lots": 4,
+      "filter": "vix_ge_13",
+      "expiry": "week",
+      "bucket_skip": null
+    },
+    "finnifty": {
+      "lots": 8,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "10-13"
+    },
+    "midcpnifty": {
+      "lots": 8,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "22-30"
+    },
+    "banknifty": {
+      "lots": 0,
+      "note": "excluded \u2014 structurally negative"
+    },
+    "expected": {
+      "cagr": "16.0%",
+      "sharpe": 2.454,
+      "max_dd_pct": "-4.1%",
+      "net_pnl": 875171.8
+    }
+  },
+  "calmar_opt_2x": {
+    "nifty": {
+      "lots": 2,
+      "filter": "vix_ge_13",
+      "expiry": "week",
+      "bucket_skip": null
+    },
+    "finnifty": {
+      "lots": 4,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "10-13"
+    },
+    "midcpnifty": {
+      "lots": 6,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "22-30"
+    },
+    "banknifty": {
+      "lots": 0,
+      "note": "excluded \u2014 structurally negative"
+    },
+    "expected": {
+      "cagr": "9.8%",
+      "sharpe": 2.424,
+      "max_dd_pct": "-2.1%",
+      "net_pnl": 488624.18
+    }
+  },
+  "calmar_opt_3x": {
+    "nifty": {
+      "lots": 3,
+      "filter": "vix_ge_13",
+      "expiry": "week",
+      "bucket_skip": null
+    },
+    "finnifty": {
+      "lots": 6,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "10-13"
+    },
+    "midcpnifty": {
+      "lots": 9,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "22-30"
+    },
+    "banknifty": {
+      "lots": 0,
+      "note": "excluded \u2014 structurally negative"
+    },
+    "expected": {
+      "cagr": "13.8%",
+      "sharpe": 2.424,
+      "max_dd_pct": "-3.1%",
+      "net_pnl": 732936.27
+    }
+  },
+  "calmar_opt_4x": {
+    "nifty": {
+      "lots": 4,
+      "filter": "vix_ge_13",
+      "expiry": "week",
+      "bucket_skip": null
+    },
+    "finnifty": {
+      "lots": 8,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "10-13"
+    },
+    "midcpnifty": {
+      "lots": 12,
+      "filter": "dte_le_7",
+      "expiry": "month",
+      "bucket_skip": "22-30"
+    },
+    "banknifty": {
+      "lots": 0,
+      "note": "excluded \u2014 structurally negative"
+    },
+    "expected": {
+      "cagr": "17.4%",
+      "sharpe": 2.424,
+      "max_dd_pct": "-4.2%",
+      "net_pnl": 977248.36
+    }
+  }
+}

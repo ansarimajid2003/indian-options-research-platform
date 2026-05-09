@@ -57,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Primary backtest command — Dhan 5-year data
     dhan = sub.add_parser("run-backtest")
     dhan.add_argument("--dhan-root", default="data/processed/options/dhan")
-    dhan.add_argument("--symbol", default="NIFTY", choices=["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
+    dhan.add_argument("--symbol", default="NIFTY", choices=["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"])
     dhan.add_argument("--expiry-type", choices=["week", "month"], default="week")
     dhan.add_argument("--strategy", choices=["short-straddle", "short-strangle", "iron-condor", "three-pm-directional", "three-pm-v2-put", "three-pm-v2-call-level-stop"], default="short-straddle")
     dhan.add_argument("--from-date", help="Start date YYYY-MM-DD")
@@ -69,6 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
     dhan.add_argument("--next-day-exit", action="store_true")
     dhan.add_argument("--no-costs", action="store_true")
     dhan.add_argument("--spot-path", default="data/processed/spot/nifty50_1min_CANONICAL.csv", help="Canonical NIFTY 50 1-min spot CSV for 3PM signal detection")
+    dhan.add_argument("--vix-path", help="India VIX CSV with timestamp/datetime and close columns")
+    dhan.add_argument("--vix-min", type=float)
+    dhan.add_argument("--vix-max", type=float)
+    dhan.add_argument("--vix-missing-policy", choices=["skip", "allow"], default="skip")
     dhan.add_argument("--output")
 
     return parser
@@ -126,6 +130,10 @@ def main() -> int:
             entry_time=entry_time,
             exit_time=exit_time,
             next_day_exit=next_day_exit,
+            vix_path=args.vix_path,
+            vix_min=args.vix_min,
+            vix_max=args.vix_max,
+            vix_missing_policy=args.vix_missing_policy,
         )
         result = BacktestEngine(config).run(_strategy(args.strategy), args.from_expiry, args.to_expiry, args.limit)
         output = Path(args.output) if args.output else _default_output_path("shoonya", args.strategy, no_costs=args.no_costs)

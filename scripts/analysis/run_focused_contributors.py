@@ -48,7 +48,16 @@ def _fmt_num(value: float | None) -> str:
 
 
 def _run_symbol(args: argparse.Namespace, symbol: str, run_stamp: str) -> tuple[str, dict, Path, pd.DataFrame]:
-    config = BacktestConfig(symbol=symbol, stop_loss_pct=None, target_profit_pct=None, min_dte=1)
+    config = BacktestConfig(
+        symbol=symbol,
+        stop_loss_pct=None,
+        target_profit_pct=None,
+        min_dte=1,
+        vix_path=args.vix_path,
+        vix_min=args.vix_min,
+        vix_max=args.vix_max,
+        vix_missing_policy=args.vix_missing_policy,
+    )
     data = load_dhan_data(args.dhan_root, args.expiry_type, symbol)
     engine = DhanBacktestEngine(config, dhan_root=args.dhan_root, expiry_type=args.expiry_type)
     result = engine.run(ShortStrangle(min_leg_premium=2.0), from_date=args.from_date, to_date=args.to_date, data=data)
@@ -157,6 +166,10 @@ def main() -> int:
     parser.add_argument("--from-date", default="2022-02-01")
     parser.add_argument("--to-date", default="2026-04-30")
     parser.add_argument("--run-stamp", help="Output prefix, default YYYYMMDD_HHMMSS captured once.")
+    parser.add_argument("--vix-path", help="India VIX CSV with timestamp/datetime and close columns")
+    parser.add_argument("--vix-min", type=float)
+    parser.add_argument("--vix-max", type=float)
+    parser.add_argument("--vix-missing-policy", choices=["skip", "allow"], default="skip")
     args = parser.parse_args()
 
     run_stamp = args.run_stamp or datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -19,6 +19,7 @@ from .calendar import (
 from .engine import BacktestEngine
 from .reports import build_result
 from .schemas import BacktestConfig, BacktestResult, Contract, OptionType
+from .volatility_filter import VixFilter
 
 logger = logging.getLogger(__name__)
 
@@ -349,6 +350,14 @@ class DhanBacktestEngine(BacktestEngine):
 
         from .schemas import Trade
         trades: list[Trade] = []
+        vix_filter: VixFilter | None = None
+        if self.config.vix_path:
+            vix_filter = VixFilter(
+                self.config.vix_path,
+                min_vix=self.config.vix_min,
+                max_vix=self.config.vix_max,
+                missing_policy=self.config.vix_missing_policy,
+            )
 
         for trade_date in all_dates:
             entry_target = combine_date_time(trade_date, self.config.entry_time)
@@ -357,6 +366,18 @@ class DhanBacktestEngine(BacktestEngine):
             entry_ts = nearest_timestamp(day_ts_index, entry_target)
             if entry_ts is None or entry_ts.date() != trade_date:
                 continue
+
+            extra_metadata: dict[str, Any] = {}
+            if vix_filter is not None:
+                allowed, vix_obs = vix_filter.allows(entry_ts)
+                if vix_obs is not None:
+                    extra_metadata.update({
+                        "vix_entry": round(vix_obs.value, 4),
+                        "vix_bucket": vix_obs.bucket,
+                        "vix_timestamp": vix_obs.timestamp,
+                    })
+                if not allowed:
+                    continue
 
             if self.config.next_day_exit:
                 # Use next_trading_day() from the calendar — avoids using
@@ -381,6 +402,8 @@ class DhanBacktestEngine(BacktestEngine):
                 min_dte=min_dte,
                 trading_dates=data.trading_dates,
             )
+            if self.config.max_dte is not None and (expiry - trade_date).days > self.config.max_dte:
+                continue
             resolver = DhanContractResolver(data, trade_date, exit_date, expiry)
 
             # Override spot_bars with canonical OHLC for 3 PM signal detection.
@@ -426,6 +449,7 @@ class DhanBacktestEngine(BacktestEngine):
                 option_bars=pd.DataFrame(),
                 spot_bars=resolver.spot_bars,
                 expiry=expiry,
+                extra_metadata=extra_metadata,
             )
             if trade is not None:
                 trades.append(trade)

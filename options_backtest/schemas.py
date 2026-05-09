@@ -108,6 +108,15 @@ class BacktestConfig:
     spot_csv: str = "data/processed/spot/nifty50_1min_CANONICAL.csv"
     # Minimum calendar days to expiry at entry; trades with dte < min_dte are skipped.
     min_dte: int = 0
+    # Maximum calendar days to expiry at entry; trades with dte > max_dte are skipped.
+    # None = no upper limit (default, preserves existing runner behaviour).
+    max_dte: int | None = None
+    # Optional India VIX gate. When vix_path is set, DhanBacktestEngine uses
+    # the latest VIX bar at or before entry_ts; it never forward-peeks.
+    vix_path: str | None = None
+    vix_min: float | None = None
+    vix_max: float | None = None
+    vix_missing_policy: str = "skip"
 
 
 @dataclass
