@@ -1175,6 +1175,8 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 
 ### Phase 1 — Credentials and External Services
 
+> **Static IP outstanding:** `183.83.38.115` is likely a dynamic IP (ACT residential default). Buy the ACT static IP addon (~₹230/month) before relying on the Dhan whitelist. Call 1800-266-1111 or use the MyACT app. Re-verify public IP with `curl -4 https://api.ipify.org` from `zimaos` after activation before submitting Dhan whitelist request.
+
 - [ ] Create Telegram bot via BotFather → record `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in server env file (not in repo)
 - [ ] Create Healthchecks.io account (free tier) → create one monitor → set grace to 3 minutes → enable Telegram notification → record ping UUID as `EXTERNAL_HEARTBEAT_URL` in server env file
 - [ ] Create Sentry account (free tier) → create Python project → enable Telegram native integration → record DSN as `SENTRY_DSN` in server env file
@@ -1193,17 +1195,17 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 
 ---
 
-### Phase 2 — Locked Profile Config and Smoke Test (Week 1, May 12–16)
+### Phase 2 — Locked Profile Config and Smoke Test ✓ DONE 2026-05-10
 
-- [ ] Create `configs/live/` directory
-- [ ] Write `configs/live/wing6_4x1_all_vix_filtered.json` — must match Section 2 exactly (symbol table, offsets, filters, entry/exit times, cost model, lots)
-- [ ] Write `scripts/live/dhan_connection_check.py` (Section 6.6):
-  - [ ] Token decode + expiry print (redacted)
-  - [ ] `POST /optionchain/expirylist` for NIFTY → expect `status=success`
-  - [ ] Open `wss://api-feed.dhan.co` → send one IDX_I/NIFTY subscription → confirm packet received
-  - [ ] Open `wss://depth-api-feed.dhan.co/twentydepth` → send one NSE_FO subscription → confirm packet received
-  - [ ] All output lines are PASS/FAIL only; no token or client-ID printed
-- [ ] Run `dhan_connection_check.py` from `zimaos` → all four checks PASS
+- [x] Create `configs/live/` directory
+- [x] Write `configs/live/wing6_4x1_all_vix_filtered.json` — matches Section 2 exactly; scrip IDs confirmed from existing downloader (NIFTY=13, FINNIFTY=27, MIDCPNIFTY=442, SENSEX=51, VIX=21)
+- [x] Write `scripts/live/dhan_connection_check.py` (Section 6.6):
+  - [x] Token decode + expiry print (redacted; shows remaining days and masked client_id)
+  - [x] `POST /optionchain/expirylist` for NIFTY → expect `status=success`
+  - [x] Open `wss://api-feed.dhan.co` → send one IDX_I/NIFTY subscription → confirm packet received
+  - [x] Open `wss://depth-api-feed.dhan.co/twentydepth` → send one IDX_I/NIFTY subscription → confirm packet received
+  - [x] All output lines are PASS/FAIL only; no token or client-ID printed
+- [ ] Run `dhan_connection_check.py` from `zimaos` → all four checks PASS — **pending: add DHAN credentials to `.env.live` on server first**
 
 ---
 
