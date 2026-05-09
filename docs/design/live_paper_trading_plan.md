@@ -1173,24 +1173,28 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 
 ---
 
-### Phase 1 — Credentials and External Services [~] IN PROGRESS — 1 item remaining
+### Phase 1 — Credentials and External Services ✓ DONE 2026-05-10
 
 > **Static IP outstanding:** `183.83.38.115` is likely a dynamic IP (ACT residential default). Buy the ACT static IP addon (~₹230/month) before relying on the Dhan whitelist. Call 1800-266-1111 or use the MyACT app. Re-verify public IP with `curl -4 https://api.ipify.org` from `zimaos` after activation before submitting Dhan whitelist request.
 
+> **Daily token renewal required:** Dhan access token expires every 24 hours. `DHAN_API_KEY` and `DHAN_API_SECRET` are stored in `.env.live` alongside the token. A `scripts/live/renew_dhan_token.py` script must be written and scheduled (cron or systemd timer) before Phase 9 live sessions begin. The Dhan v2 REST endpoint for token generation is `POST https://api.dhan.co/v2/auth/token`.
+
 - [x] Create Telegram bot via BotFather → bot: `@myzimaserverbot`, `TELEGRAM_CHAT_ID=1425784560`, written to `.env.live`
-- [x] Create Healthchecks.io account (free tier) → create one monitor → set grace to 3 minutes → enable Telegram notification → record ping UUID as `EXTERNAL_HEARTBEAT_URL` in server env file — tested OK
-- [x] Create Sentry account → Python project created → `SENTRY_DSN` written to `.env.live` → test event `8fef914f` captured from `zimaos`
-- [~] Write server-side untracked env file `/DATA/live-paper/indian-markets/.env.live`:
+- [x] Create Healthchecks.io account (free tier) → monitor created, grace 3 min → `EXTERNAL_HEARTBEAT_URL` in `.env.live` → ping from `zimaos` returned `OK`
+- [x] Create Sentry account → Python project created → `SENTRY_DSN` in `.env.live` → test event `8fef914f` captured from `zimaos`
+- [x] Write server-side untracked env file `/DATA/live-paper/indian-markets/.env.live`:
   - [x] `DHAN_CLIENT_ID=1111444766`
+  - [x] `DHAN_ACCESS_TOKEN` set (expires daily — must be renewed)
+  - [x] `DHAN_API_KEY` and `DHAN_API_SECRET` set (for token renewal script)
   - [x] `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` set
   - [x] `SENTRY_DSN` set
   - [x] `EXTERNAL_HEARTBEAT_URL` set
-  - [ ] `DHAN_ACCESS_TOKEN` — **only remaining item**; paste current Dhan token: `nano /DATA/live-paper/indian-markets/.env.live`
 - [x] `.env.live` covered by `.env.*` pattern already in `.gitignore`
 - [x] Confirmed `.env.live` does not appear in `git status`
-- [x] Manual Telegram test alert sent from laptop → `SENT OK` confirmed
+- [x] Manual Telegram test alert → `SENT OK`
 - [x] Healthchecks.io ping from `zimaos` → `OK`
 - [x] Sentry test event from `zimaos` → captured (event `8fef914f`)
+- [x] `dhan_connection_check.py` from `zimaos` → **ALL PASS (4/4)** — token valid 1.0 days, 18 NIFTY expiries, live-feed WS open, 20-depth WS open
 
 ---
 
@@ -1200,11 +1204,11 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 - [x] Write `configs/live/wing6_4x1_all_vix_filtered.json` — matches Section 2 exactly; scrip IDs confirmed from existing downloader (NIFTY=13, FINNIFTY=27, MIDCPNIFTY=442, SENSEX=51, VIX=21)
 - [x] Write `scripts/live/dhan_connection_check.py` (Section 6.6):
   - [x] Token decode + expiry print (redacted; shows remaining days and masked client_id)
-  - [x] `POST /optionchain/expirylist` for NIFTY → expect `status=success`
+  - [x] `POST /v2/optionchain/expirylist` for NIFTY → 18 expiries returned (v2 endpoint; v1 returns HTML)
   - [x] Open `wss://api-feed.dhan.co` → send one IDX_I/NIFTY subscription → confirm packet received
   - [x] Open `wss://depth-api-feed.dhan.co/twentydepth` → send one IDX_I/NIFTY subscription → confirm packet received
   - [x] All output lines are PASS/FAIL only; no token or client-ID printed
-- [ ] Run `dhan_connection_check.py` from `zimaos` → all four checks PASS — **pending: add DHAN credentials to `.env.live` on server first**
+- [x] Run `dhan_connection_check.py` from `zimaos` → **ALL PASS (4/4)** — 2026-05-10
 
 ---
 
