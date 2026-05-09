@@ -1173,22 +1173,24 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 
 ---
 
-### Phase 1 — Credentials and External Services [~] IN PROGRESS
+### Phase 1 — Credentials and External Services [~] IN PROGRESS — 1 item remaining
 
 > **Static IP outstanding:** `183.83.38.115` is likely a dynamic IP (ACT residential default). Buy the ACT static IP addon (~₹230/month) before relying on the Dhan whitelist. Call 1800-266-1111 or use the MyACT app. Re-verify public IP with `curl -4 https://api.ipify.org` from `zimaos` after activation before submitting Dhan whitelist request.
 
 - [x] Create Telegram bot via BotFather → bot: `@myzimaserverbot`, `TELEGRAM_CHAT_ID=1425784560`, written to `.env.live`
-- [ ] Create Healthchecks.io account (free tier) → create one monitor → set grace to 3 minutes → enable Telegram notification → record ping UUID as `EXTERNAL_HEARTBEAT_URL` in server env file
-- [ ] Create Sentry account (free tier) → create Python project → enable Telegram native integration → record DSN as `SENTRY_DSN` in server env file
+- [x] Create Healthchecks.io account (free tier) → create one monitor → set grace to 3 minutes → enable Telegram notification → record ping UUID as `EXTERNAL_HEARTBEAT_URL` in server env file — tested OK
+- [x] Create Sentry account → Python project created → `SENTRY_DSN` written to `.env.live` → test event `8fef914f` captured from `zimaos`
 - [~] Write server-side untracked env file `/DATA/live-paper/indian-markets/.env.live`:
   - [x] `DHAN_CLIENT_ID=1111444766`
   - [x] `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` set
-  - [ ] `DHAN_ACCESS_TOKEN` — paste current Dhan token: `nano /DATA/live-paper/indian-markets/.env.live`
-  - [ ] `SENTRY_DSN` — after Sentry signup
-  - [ ] `EXTERNAL_HEARTBEAT_URL` — after Healthchecks.io signup
+  - [x] `SENTRY_DSN` set
+  - [x] `EXTERNAL_HEARTBEAT_URL` set
+  - [ ] `DHAN_ACCESS_TOKEN` — **only remaining item**; paste current Dhan token: `nano /DATA/live-paper/indian-markets/.env.live`
 - [x] `.env.live` covered by `.env.*` pattern already in `.gitignore`
 - [x] Confirmed `.env.live` does not appear in `git status`
 - [x] Manual Telegram test alert sent from laptop → `SENT OK` confirmed
+- [x] Healthchecks.io ping from `zimaos` → `OK`
+- [x] Sentry test event from `zimaos` → captured (event `8fef914f`)
 
 ---
 
