@@ -1,0 +1,83 @@
+{
+  "profile_name": "wing6_4x1_all_vix_filtered",
+  "report_label": "IronCondorWing6",
+  "strategy": {
+    "type": "IronCondor",
+    "short_call_offset": 2,
+    "long_call_offset": 8,
+    "short_put_offset": -2,
+    "long_put_offset": -8
+  },
+  "global": {
+    "entry_time": "09:20",
+    "exit_time": "15:20",
+    "exit_style": "time_exit",
+    "stop_loss_pct": null,
+    "target_profit_pct": null,
+    "trail_trigger_pct": null,
+    "trail_stop_pct": null,
+    "min_dte": 1,
+    "allow_partial_entry": false,
+    "allow_substitute_expiry_strike": false,
+    "costs": "ChargesConfig.for_date"
+  },
+  "symbols": {
+    "NIFTY": {
+      "trade": true,
+      "expiry_type": "week",
+      "min_dte": 1,
+      "max_dte": null,
+      "vix_filter": {"require_gte": 13.0},
+      "vix_bucket_skip": null,
+      "lots": 1,
+      "depth_source": "dhan_20depth",
+      "dhan_segment": "IDX_I",
+      "dhan_scrip_id": 13
+    },
+    "FINNIFTY": {
+      "trade": true,
+      "expiry_type": "month",
+      "min_dte": 1,
+      "max_dte": 7,
+      "vix_filter": null,
+      "vix_bucket_skip": "10-13",
+      "lots": 1,
+      "depth_source": "dhan_20depth",
+      "dhan_segment": "IDX_I",
+      "dhan_scrip_id": 27
+    },
+    "MIDCPNIFTY": {
+      "trade": true,
+      "expiry_type": "month",
+      "min_dte": 1,
+      "max_dte": 7,
+      "vix_filter": null,
+      "vix_bucket_skip": "22-30",
+      "lots": 1,
+      "depth_source": "dhan_20depth",
+      "dhan_segment": "IDX_I",
+      "dhan_scrip_id": 442
+    },
+    "SENSEX": {
+      "trade": true,
+      "expiry_type": "week",
+      "min_dte": 1,
+      "max_dte": 2,
+      "vix_filter": null,
+      "vix_bucket_skip": null,
+      "lots": 1,
+      "depth_source": "top_of_book",
+      "dhan_segment": "IDX_I",
+      "dhan_scrip_id": 51
+    },
+    "BANKNIFTY": {
+      "trade": false,
+      "lots": 0
+    }
+  },
+  "vix": {
+    "dhan_segment": "IDX_I",
+    "dhan_scrip_id": 21,
+    "max_staleness_seconds": 60
+  }
+}
