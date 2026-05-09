@@ -25,7 +25,7 @@ import time as _time
 import requests
 import websockets
 
-_OPTION_CHAIN_URL = "https://api.dhan.co/optionchain/expirylist"
+_OPTION_CHAIN_URL = "https://api.dhan.co/v2/optionchain/expirylist"
 _LIVE_FEED_URL_TMPL = (
     "wss://api-feed.dhan.co"
     "?version=2&token={token}&clientId={client_id}&authType=2"
@@ -76,16 +76,15 @@ def check_rest(token: str, client_id: str) -> bool:
             timeout=10,
         )
         body = resp.json()
-        if body.get("status") == "success":
-            expiries = body.get("data", [])
-            first = expiries[0] if expiries else "n/a"
+        # v2 API returns {"data": [...]} directly; no top-level status field
+        expiries = body.get("data", [])
+        if resp.status_code == 200 and isinstance(expiries, list) and expiries:
+            first = expiries[0]
             print(
-                f"PASS  rest_optchain : status=success  "
-                f"{len(expiries)} expiries  first={first}"
+                f"PASS  rest_optchain : {len(expiries)} expiries  first={first}"
             )
             return True
-        remarks = body.get("remarks", body.get("message", ""))
-        print(f"FAIL  rest_optchain : status={body.get('status')!r}  remarks={remarks!r}")
+        print(f"FAIL  rest_optchain : http={resp.status_code}  body={str(body)[:120]!r}")
         return False
     except Exception as exc:
         print(f"FAIL  rest_optchain : {exc}")
