@@ -1153,23 +1153,23 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 
 ---
 
-### Phase 0 — Server Preparation
+### Phase 0 — Server Preparation ✓ DONE 2026-05-10
 
-- [ ] SSH into `zimaos` and confirm Python 3.12, git, rsync, docker, tmux, systemctl are present
-- [ ] Confirm `/media/WD-Storage` is mounted (`df -h`) and has >= 100 GB free
-- [ ] Confirm `/DATA` has >= 10 GB free for repo + venv
-- [ ] `curl -4 https://api.ipify.org` from `zimaos` → record public outbound IPv4; confirm it matches Dhan whitelist or request whitelist update
-- [ ] Confirm ISP assigns a static IP to `zimaos` (or plan VPS/static egress alternative)
-- [ ] Create directory `/DATA/live-paper/` on `zimaos` (not under `/root`)
-- [ ] `git clone` repo into `/DATA/live-paper/indian-markets/`
-- [ ] `python3 -m venv /DATA/live-paper/indian-markets/.venv`
-- [ ] Install runtime stack: `pandas`, `numpy`, `pyarrow`, `websockets`, `requests`, `sentry-sdk`, `streamlit`, `plotly`
-- [ ] Create WD storage layout:
+- [x] SSH into `zimaos` and confirm Python 3.12, git, rsync, docker, tmux, systemctl are present
+- [x] Confirm `/media/WD-Storage` is mounted (`df -h`) and has >= 100 GB free — **216 GB free**
+- [x] Confirm `/DATA` has >= 10 GB free for repo + venv — **173 GB free**
+- [x] `curl -4 https://api.ipify.org` from `zimaos` → **183.83.38.115** — confirm matches Dhan whitelist or request update
+- [ ] Confirm ISP assigns a static IP to `zimaos` (or plan VPS/static egress alternative) — **pending manual ISP check**
+- [x] Create directory `/DATA/live-paper/` on `zimaos` (not under `/root`)
+- [x] `git clone` repo into `/DATA/live-paper/indian-markets/` — bare remote + working checkout via `git push zimaos main`
+- [x] `python3 -m venv /DATA/live-paper/indian-markets/.venv`
+- [x] Install runtime stack: `pandas` 3.0.2, `numpy` 2.4.4, `pyarrow` 24.0.0, `websockets` 16.0, `requests` 2.33.1, `sentry-sdk` 2.59.0, `streamlit` 1.57.0, `plotly` 6.7.0
+- [x] Create WD storage layout:
   ```
   /media/WD-Storage/indian-markets-live/{raw_depth_packets,order_book,order_book_1min,paper_trades,reports,logs,snapshots,alerts}/
   ```
-- [ ] Create repo-level symlink: `data/live` → `/media/WD-Storage/indian-markets-live`
-- [ ] Verify symlink resolves correctly: `readlink -f data/live` must print `/media/WD-Storage/indian-markets-live`
+- [x] Create repo-level symlink: `data/live` → `/media/WD-Storage/indian-markets-live`
+- [x] Verify symlink resolves correctly: `readlink -f data/live` → `/media/WD-Storage/indian-markets-live` ✓
 
 ---
 
