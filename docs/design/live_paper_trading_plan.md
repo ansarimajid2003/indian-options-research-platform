@@ -827,8 +827,9 @@ Self-hosted alternatives:
 Heartbeat behavior:
 
 - `zimaos` sends `GET $EXTERNAL_HEARTBEAT_URL` every 60 seconds from 08:55 to 15:35 IST on
-  trading days; every 5 minutes at all other times, 7 days a week. The off-hours ping catches
-  weekend crashes before Monday preflight fails.
+  trading days. The current Healthchecks.io monitor is configured with a 1-minute period and
+  3-minute grace, so off-hours pings also run every 60 seconds to avoid UP/DOWN flapping. If the
+  hosted monitor period is changed to 5 minutes later, the off-hours cadence can be relaxed.
 - Use Healthchecks.io start/fail URL suffixes: send `$EXTERNAL_HEARTBEAT_URL/start` at 08:55
   when the monitoring window opens; send `$EXTERNAL_HEARTBEAT_URL/fail` before any intentional
   shutdown (e.g., preflight abort). The plain `GET $EXTERNAL_HEARTBEAT_URL` is the per-minute
@@ -1052,6 +1053,8 @@ Do not approve live scale-up from one-month Sharpe.
 | Phase 2 | May 19-23 | `live_resolver.py`, `collect_order_book.py`, packet parsing, raw/normalized writes | ✓ Done May 2026 |
 | Phase 3 | May 26-30 | `paper_engine.py`, `run_paper_trading.py`, `health_monitor.py`, `paper_json_to_ledger.py`, `renew_token.py` | ✓ Done May 2026 |
 | Phase 4 | Jun 2-6 | First full live paper sessions; monitor gaps and fill anomalies | In progress |
+| Phase 5 | May 11 | Health monitor external heartbeat, alerting, and restart drills | Done May 2026 |
+| Phase 6 | May 11 | `systemd` services for health monitor and paper engine | Done May 2026 |
 | Post-run | Jun 9+ | Fill validation report and deployment readiness verdict | Pending |
 
 ---
@@ -1070,6 +1073,10 @@ Do not approve live scale-up from one-month Sharpe.
 | `scripts/live/health_monitor.py` | Independent uptime/data-integrity monitor with Telegram alerts | ✓ Done |
 | `scripts/live/paper_json_to_ledger.py` | Adapter from paper JSON to reports-compatible ledger | ✓ Done |
 | `scripts/live/renew_token.py` | Headless daily token renewal via PIN + TOTP | ✓ Done |
+| `scripts/live/systemd/health-monitor.service` | `systemd` unit for independent health monitoring | Done |
+| `scripts/live/systemd/live-paper.service` | `systemd` unit for paper engine restart recovery | Done |
+| `scripts/live/systemd/install_services.sh` | Server-side installer for units, cron, enablement, and monitor start | Done |
+| `scripts/live/systemd/dhan-token-renewal` | Cron entry for 08:30 IST token renewal | Done |
 
 Files with zero intended behavior changes:
 
@@ -1535,30 +1542,32 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 
 ---
 
-### Phase 5 — Health Monitor and External Heartbeat
+### Phase 5 — Health Monitor and External Heartbeat ✓ DONE 2026-05-11
 
-- [ ] Write `scripts/live/health_monitor.py` (Section 6.7):
-  - [ ] All 13 checks from Section 6.7 implemented
-  - [ ] 15-second poll for critical checks; 60-second poll for slow checks
-  - [ ] Telegram alert delivery with throttling by `(severity, component, reason)`
-  - [ ] 2-minute throttle during entry/exit windows (09:10–09:30, 15:15–15:30); 10-minute otherwise
-  - [ ] "Monitor online" startup message
-  - [ ] "Backend healthy at market open" message after all feeds connected
-  - [ ] Recovery messages when previously unhealthy component recovers
-  - [ ] EOD uptime summary with uptime %, alert counts, data-gap minutes, WD free space, artifact paths
-  - [ ] Sends Healthchecks.io `$EXTERNAL_HEARTBEAT_URL/start` at 08:55, plain ping every 60 s during market hours, every 5 min off-hours, `$EXTERNAL_HEARTBEAT_URL/fail` on preflight abort
-  - [ ] Sentry `sentry_sdk.init()` at process startup with `send_default_pii=False`
-  - [ ] Outputs: `data/live/alerts/{YYYYMMDD}_alerts.jsonl`, `data/live/snapshots/latest_alert_state.json`, `data/live/reports/{YYYYMMDD}_uptime_summary.md`
-  - [ ] Snapshot files written atomically (`.tmp` → rename)
-- [ ] Test: kill the health monitor mid-run → confirm it restarts cleanly
-- [ ] Test: block outbound Healthchecks.io ping for 3 minutes → confirm Telegram "heartbeat missed" alert arrives
-- [ ] Test: send a `sentry_sdk.capture_exception()` from `zimaos` → confirm Sentry captures it and Telegram alert fires
+- [x] Write `scripts/live/health_monitor.py` (Section 6.7):
+  - [x] All 13 checks from Section 6.7 implemented
+  - [x] 15-second poll for critical checks; 60-second poll for slow checks
+  - [x] Telegram alert delivery with throttling by `(severity, component, reason)`
+  - [x] 2-minute throttle during entry/exit windows (09:10–09:30, 15:15–15:30); 10-minute otherwise
+  - [x] "Monitor online" startup message
+  - [x] "Backend healthy at market open" message after all feeds connected
+  - [x] Recovery messages when previously unhealthy component recovers
+  - [x] EOD uptime summary with uptime %, alert counts, data-gap minutes, WD free space, artifact paths
+  - [x] Sends Healthchecks.io `$EXTERNAL_HEARTBEAT_URL/start` at 08:55, plain ping every 60 s during market hours and off-hours, `$EXTERNAL_HEARTBEAT_URL/fail` on preflight abort
+  - [x] Sentry `sentry_sdk.init()` at process startup with `send_default_pii=False`
+  - [x] Outputs: `data/live/alerts/{YYYYMMDD}_alerts.jsonl`, `data/live/snapshots/latest_alert_state.json`, `data/live/reports/{YYYYMMDD}_uptime_summary.md`
+  - [x] Snapshot files written atomically (`.tmp` → rename)
+- [x] Test: kill the health monitor mid-run → confirmed systemd restart (`PID 1047503 -> 1048154`, restart counter `1`)
+- [x] Test: block outbound Healthchecks.io ping for 3 minutes → confirmed blocked pings, external heartbeat failure, and recovery ping
+- [x] Test: send a `sentry_sdk.capture_exception()` from `zimaos` → Sentry accepted event `26ea3315`
+
+Validation artifact: `reports/backtests/options/monitoring/20260511_phase5_health_monitor_validation.md`.
 
 ---
 
 ### Phase 6 — systemd Services
 
-- [ ] Create `/etc/systemd/system/live-paper.service`:
+- [x] Create `/etc/systemd/system/live-paper.service`:
   ```ini
   [Unit]
   Description=Wing-6 Iron Condor Paper Trading Engine
@@ -1578,7 +1587,7 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
   [Install]
   WantedBy=multi-user.target
   ```
-- [ ] Create `/etc/systemd/system/health-monitor.service`:
+- [x] Create `/etc/systemd/system/health-monitor.service`:
   ```ini
   [Unit]
   Description=Live Paper Health Monitor
@@ -1598,11 +1607,13 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
   [Install]
   WantedBy=multi-user.target
   ```
-- [ ] `systemctl daemon-reload`
-- [ ] `systemctl enable health-monitor.service live-paper.service`
-- [ ] `systemctl start health-monitor.service` → confirm `systemctl status` shows active
-- [ ] Test: `systemctl kill health-monitor.service` → verify it restarts within 10 s
-- [ ] Test: `systemctl kill live-paper.service` → verify it restarts within 45 s
+- [x] `systemctl daemon-reload`
+- [x] `systemctl enable health-monitor.service live-paper.service`
+- [x] `systemctl start health-monitor.service` → confirm `systemctl status` shows active
+- [x] Test: `systemctl kill health-monitor.service` → verify it restarts within 10 s
+- [x] Test: `systemctl kill live-paper.service` → verify it restarts within 45 s
+
+Validation artifact: `reports/backtests/options/monitoring/20260511_phase6_systemd_validation.md`.
 
 ---
 
@@ -1736,7 +1747,7 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 - [ ] Telegram test alert succeeds before 09:00 and does not expose secrets.
 - [ ] Alert throttling and recovery messages work in a dry-run monitor test.
 - [ ] External heartbeat monitor is hosted outside `zimaos`.
-- [ ] `zimaos` sends external heartbeat every 60 seconds during market hours; every 5 minutes off-hours, 7 days a week.
+- [ ] `zimaos` sends external heartbeat every 60 seconds while the Healthchecks.io monitor period is configured at 1 minute.
 - [ ] Healthchecks.io `/start` suffix sent at 08:55; `/fail` sent on preflight abort.
 - [ ] Missed external heartbeat triggers Telegram alert within 3 minutes.
 - [ ] External heartbeat recovery message arrives after heartbeat resumes.
@@ -1746,7 +1757,7 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 - [ ] Engine restarted mid-session in a dry-run test correctly loads position checkpoint and skips entry phase.
 - [ ] Data gap sentinel appears in JSONL when `collect_order_book.py` is restarted mid-session.
 - [ ] EOD summary includes `resumed_after_crash: true` and gap window when resume mode was used.
-- [ ] systemd `Restart=on-failure` confirmed for both `live-paper.service` and `health-monitor.service`.
+- [x] systemd `Restart=on-failure` confirmed for both `live-paper.service` and `health-monitor.service`.
 - [ ] Dashboard is accessed from the laptop via SSH tunnel and Streamlit binds to `127.0.0.1`.
 - [ ] No access token appears in git diff, logs, markdown, JSON, or parquet metadata.
 - [ ] Locked profile config matches Section 2 exactly.

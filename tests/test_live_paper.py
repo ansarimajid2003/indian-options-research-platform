@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import base64
 import struct
-import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from options_backtest.depth_cache import DepthCache, DepthLevel
 from options_backtest.live_resolver import LiveDhanContractResolver
 from options_backtest.paper_engine import _FEED_URL
-from options_backtest.schemas import OptionType
-from scripts.live.collect_order_book import _depth_collection_settings, _iter_packets, _parse_packet
+from scripts.live.collect_order_book import _depth_collection_settings, _iter_packets, _parse_packet, _write_depth_cache_snapshot
+from scripts.live.health_monitor import HealthMonitor, _jwt_expiry, _parse_timesync_offset
 from scripts.live.paper_json_to_ledger import paper_trades_to_ledger, write_paper_reports
 
 
@@ -142,6 +144,53 @@ class LivePaperTests(unittest.TestCase):
         self.assertTrue(md_path.exists())
         self.assertTrue(json_path.exists())
         self.assertTrue(ledger_path.exists())
+
+    def test_health_monitor_parses_clock_offset_and_jwt_expiry(self) -> None:
+        self.assertAlmostEqual(_parse_timesync_offset("+1500ms"), 1.5)
+        self.assertAlmostEqual(_parse_timesync_offset("-250us"), -0.00025)
+        self.assertIsNone(_parse_timesync_offset("not-an-offset"))
+
+        payload = {"exp": 1778497200}
+        body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        token = f"header.{body}.sig"
+        exp = _jwt_expiry(token)
+        self.assertIsNotNone(exp)
+        self.assertEqual(exp, datetime.fromtimestamp(1778497200, tz=ZoneInfo("Asia/Kolkata")))
+
+    def test_depth_cache_snapshot_writer_exports_readiness(self) -> None:
+        root = Path("tmp_live_tests") / "depth_snapshot_case"
+        root.mkdir(parents=True, exist_ok=True)
+        cache = DepthCache()
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        cache.update_bid_packet("1", now, [DepthLevel(price=10.0, quantity=100, orders=1)])
+        cache.update_ask_packet("1", now, [DepthLevel(price=10.5, quantity=100, orders=1)])
+
+        _write_depth_cache_snapshot(root, "20260512", cache, ["1"])
+        payload = json.loads((root / "snapshots" / "latest_depth_cache.json").read_text())
+        self.assertEqual(payload["ready"], 1)
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["ready_pct"], 100.0)
+
+    def test_health_monitor_alerts_after_two_bad_freshness_checks(self) -> None:
+        async def run_case() -> dict:
+            root = Path("tmp_live_tests") / "health_monitor_case"
+            (root / "snapshots").mkdir(parents=True, exist_ok=True)
+            now = datetime.now(tz=ZoneInfo("Asia/Kolkata")).isoformat()
+            (root / "snapshots" / "latest_feed_state.json").write_text(json.dumps({
+                "written_at": now,
+                "connected": True,
+                "quote_freshness_pct": 90.0,
+            }))
+            monitor = HealthMonitor(profile={}, live_root=root)
+            with patch("scripts.live.health_monitor._is_feed_active", return_value=True):
+                await monitor._check_quote_freshness()
+                await monitor._check_quote_freshness()
+            alert_path = root / "alerts" / f"{monitor._date_str}_alerts.jsonl"
+            return json.loads(alert_path.read_text().splitlines()[-1])
+
+        alert = asyncio.run(run_case())
+        self.assertEqual(alert["component"], "quote_freshness")
+        self.assertEqual(alert["reason"], "quote_freshness_low")
 
 
 if __name__ == "__main__":

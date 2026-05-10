@@ -310,6 +310,48 @@ def _write_gap_sentinel(live_root: Path, date_str: str, symbol: str, gap_start: 
         f.write(json.dumps(sentinel) + "\n")
 
 
+def _write_atomic_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2, default=str))
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+
+
+def _write_depth_cache_snapshot(
+    live_root: Path,
+    date_str: str,
+    depth_cache: DepthCache,
+    security_ids: list[str],
+) -> None:
+    summary = depth_cache.readiness_summary(security_ids, max_age_seconds=5)
+    payload = {
+        "written_at": _now_ist().isoformat(),
+        "session_date": date_str,
+        "pid": os.getpid(),
+        "configured_security_ids": len(security_ids),
+        "tracked_security_ids": len(depth_cache.tracked_ids()),
+        "ready": int(summary["ready"]),
+        "total": int(summary["total"]),
+        "ready_pct": round(float(summary["ready_pct"]), 2),
+    }
+    _write_atomic_json(live_root / "snapshots" / "latest_depth_cache.json", payload)
+
+
+async def _depth_snapshot_loop(
+    live_root: Path,
+    date_str: str,
+    depth_cache: DepthCache,
+    security_ids: list[str],
+    interval_seconds: float = 10.0,
+) -> None:
+    while True:
+        _write_depth_cache_snapshot(live_root, date_str, depth_cache, security_ids)
+        await asyncio.sleep(interval_seconds)
+
+
 class DepthCollector:
     """
     Manages three 20-depth websocket connections and writes order book data.
@@ -684,15 +726,25 @@ async def collect_order_book(
         live_root=live_root,
         date_str=date_str,
     )
-    tasks = [asyncio.create_task(collector.run())]
+    _write_depth_cache_snapshot(live_root, date_str, depth_cache, all_sids)
+    tasks = [
+        asyncio.create_task(collector.run()),
+        asyncio.create_task(_depth_snapshot_loop(live_root, date_str, depth_cache, all_sids)),
+    ]
     try:
-        await asyncio.gather(*tasks)
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            await task
     except asyncio.CancelledError:
         collector.stop()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     finally:
         collector.stop()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":

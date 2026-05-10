@@ -1,17 +1,19 @@
 """
 Independent uptime and integrity monitor for Wing-6 paper trading.
 
-Runs as its own process. Does NOT open Dhan websockets.
+Runs as its own process. Does not open Dhan websockets or place orders.
 
 Usage:
     python scripts/live/health_monitor.py --profile wing6_4x1_all_vix_filtered
+    python scripts/live/health_monitor.py --profile wing6_4x1_all_vix_filtered --once
+    python scripts/live/health_monitor.py --test-alerts
 
 Env vars:
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — Telegram alerts
-    EXTERNAL_HEARTBEAT_URL              — Healthchecks.io dead-man-switch
-    SENTRY_DSN                          — Optional Sentry integration
-    EXPECTED_PUBLIC_IP                  — Optional public IP validation (Linux)
-    DHAN_ACCESS_TOKEN                   — For JWT token expiry check
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID - Telegram alerts
+    EXTERNAL_HEARTBEAT_URL              - Healthchecks.io dead-man-switch
+    SENTRY_DSN                          - optional Sentry integration
+    EXPECTED_PUBLIC_IP                  - optional public IP validation on Linux
+    DHAN_ACCESS_TOKEN or DHAN_TOKEN      - JWT token expiry check
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ import sys
 import time as _time
 from datetime import date, datetime, time
 from pathlib import Path
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -42,28 +45,37 @@ from options_backtest.calendar import is_trading_day as _is_trading_day
 _IST = ZoneInfo("Asia/Kolkata")
 _log = logging.getLogger(__name__)
 
-# Check intervals
-_CRITICAL_INTERVAL = 15.0   # seconds
-_SLOW_INTERVAL = 60.0       # seconds
+_CRITICAL_INTERVAL = 15.0
+_SLOW_INTERVAL = 60.0
 _HEARTBEAT_INTERVAL_MARKET = 60.0
-_HEARTBEAT_INTERVAL_OFF = 90.0  # must be < HC grace period (3 min); was 300s which caused false down/up alerts
+# Healthchecks.io currently has this check configured with a 1-minute period.
+# Keep off-hours pings comfortably inside that window to avoid UP/DOWN flapping.
+_HEARTBEAT_INTERVAL_OFF = 60.0
 
-# Alert throttle: (severity, component, reason) -> last_sent_epoch
-_ALERT_THROTTLE: dict[tuple, float] = {}
-
-# Market hours
 _MARKET_OPEN = time(9, 0)
 _MARKET_CLOSE = time(15, 35)
 _FEED_ACTIVE_START = time(9, 10)
 _FEED_ACTIVE_END = time(15, 31)
 _HEARTBEAT_START = time(8, 55)
+_EOD_BUFFER_END = time(16, 5)
 
 _WD_MIN_GB_INTRADAY = 20.0
 _WD_MIN_GB_PRE_RUN = 100.0
+_QUOTE_FRESHNESS_MIN_PCT = 95.0
+_DEPTH_READY_MIN_PCT = 95.0
+_RAW_FLUSH_MAX_AGE_SECONDS = 90.0
+_PARQUET_FLUSH_MAX_AGE_SECONDS = 180.0
+_CLOCK_BOOT_GRACE_SECONDS = 300.0
+
+_ALERT_THROTTLE: dict[tuple[str, str, str], float] = {}
 
 
 def _now_ist() -> datetime:
     return datetime.now(tz=_IST)
+
+
+def _today_ist() -> date:
+    return _now_ist().date()
 
 
 def _ist_time() -> time:
@@ -71,74 +83,93 @@ def _ist_time() -> time:
 
 
 def _is_market_hours() -> bool:
-    if not _is_trading_day(date.today()):
+    if not _is_trading_day(_today_ist()):
         return False
     t = _ist_time()
     return _MARKET_OPEN <= t <= _MARKET_CLOSE
 
 
-def _is_heartbeat_hours() -> bool:
-    t = _ist_time()
-    return t >= _HEARTBEAT_START and t <= _MARKET_CLOSE
-
-
 def _is_feed_active() -> bool:
-    if not _is_trading_day(date.today()):
+    if not _is_trading_day(_today_ist()):
         return False
     t = _ist_time()
     return _FEED_ACTIVE_START <= t <= _FEED_ACTIVE_END
 
 
+def _is_heartbeat_hours() -> bool:
+    if not _is_trading_day(_today_ist()):
+        return False
+    t = _ist_time()
+    return _HEARTBEAT_START <= t <= _MARKET_CLOSE
+
+
+def _is_preflight_window() -> bool:
+    if not _is_trading_day(_today_ist()):
+        return False
+    t = _ist_time()
+    return _HEARTBEAT_START <= t < _MARKET_OPEN
+
+
 def _throttle_ok(severity: str, component: str, reason: str) -> bool:
-    """Returns True if this alert should be sent (not throttled)."""
     key = (severity, component, reason)
     now = _time.monotonic()
     last = _ALERT_THROTTLE.get(key, 0.0)
     t = _ist_time()
-    # Shorter throttle during critical windows
-    if (time(9, 10) <= t <= time(9, 30)) or (time(15, 15) <= t <= time(15, 30)):
-        window = 120.0
-    else:
-        window = 600.0
+    window = 120.0 if (time(9, 10) <= t <= time(9, 30)) or (time(15, 15) <= t <= time(15, 30)) else 600.0
     if now - last >= window:
         _ALERT_THROTTLE[key] = now
         return True
     return False
 
 
-def _redact_token(token: str) -> str:
-    if len(token) > 8:
-        return token[:4] + "[REDACTED]"
-    return "[REDACTED]"
+def _scrub_message(text: str) -> str:
+    text = re.sub(r"https?://\S+", "[REDACTED_URL]", text)
+    text = re.sub(r"(?i)(token|clientId|client_id|access-token)=\S+", r"\1=[REDACTED]", text)
+    text = re.sub(r"[A-Za-z0-9_\-]{80,}", "[REDACTED_TOKEN]", text)
+    return text
 
 
 def _parse_timesync_offset(val: str) -> float | None:
-    """Parse 'timedatectl timesync-status' Offset value to seconds.
-
-    Examples: '+1.283901s', '-234.5ms', '+12us'
-    Returns None if the string cannot be parsed.
-    """
-    m = re.match(r'^([+-]?\d+\.?\d*)(s|ms|us|ns)$', val.strip())
-    if not m:
+    match = re.match(r"^([+-]?\d+\.?\d*)(s|ms|us|ns)$", val.strip())
+    if not match:
         return None
-    num, unit = float(m.group(1)), m.group(2)
-    return num * {'s': 1.0, 'ms': 1e-3, 'us': 1e-6, 'ns': 1e-9}[unit]
+    num, unit = float(match.group(1)), match.group(2)
+    return num * {"s": 1.0, "ms": 1e-3, "us": 1e-6, "ns": 1e-9}[unit]
 
 
 def _jwt_expiry(token: str) -> datetime | None:
-    """Decode JWT expiry without verifying signature."""
     try:
         parts = token.split(".")
         if len(parts) < 2:
             return None
-        payload_b64 = parts[1] + "=="  # pad
-        payload = json.loads(base64.b64decode(payload_b64))
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))
         exp = payload.get("exp")
         if exp is None:
             return None
         return datetime.fromtimestamp(int(exp), tz=_IST)
     except Exception:
         return None
+
+
+def _write_atomic_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+
+
+def _write_atomic_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
 
 
 def _resolve_live_root() -> Path:
@@ -151,488 +182,766 @@ def _resolve_live_root() -> Path:
     return live_path
 
 
+def _parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_IST)
+        return parsed.astimezone(_IST)
+    except Exception:
+        return None
+
+
+def _newest_file(root: Path, patterns: tuple[str, ...]) -> Path | None:
+    newest: Path | None = None
+    newest_mtime = -1.0
+    if not root.exists():
+        return None
+    for pattern in patterns:
+        for path in root.rglob(pattern):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest = path
+                newest_mtime = mtime
+    return newest
+
+
+def _boot_uptime_seconds() -> float | None:
+    try:
+        return float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+    except Exception:
+        return None
+
+
 class HealthMonitor:
-    """
-    Runs critical (15s) and slow (60s) checks, sends Telegram alerts,
-    pings Healthchecks.io dead-man-switch, and writes alert state snapshots.
-    """
+    """Runs health checks, alerting, heartbeat pings, and daily uptime summaries."""
 
     def __init__(self, profile: dict, live_root: Path) -> None:
         self._profile = profile
         self._live_root = live_root
-        self._date_str = date.today().strftime("%Y%m%d")
+        self._session_date = _today_ist()
+        self._date_str = self._session_date.strftime("%Y%m%d")
         self._alerts_path = live_root / "alerts" / f"{self._date_str}_alerts.jsonl"
+        self._external_heartbeat_path = live_root / "alerts" / f"{self._date_str}_external_heartbeat.jsonl"
         self._alert_state_path = live_root / "snapshots" / "latest_alert_state.json"
+        self._uptime_summary_path = live_root / "reports" / f"{self._date_str}_uptime_summary.md"
 
         self._tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self._tg_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
-        self._tg_thread = os.environ.get("TELEGRAM_THREAD_ID", "")  # topic ID for forum supergroups
+        self._tg_thread = os.environ.get("TELEGRAM_THREAD_ID", "")
         self._hc_url = os.environ.get("EXTERNAL_HEARTBEAT_URL", "")
         self._expected_ip = os.environ.get("EXPECTED_PUBLIC_IP", "")
-        self._access_token = os.environ.get("DHAN_ACCESS_TOKEN", "")
+        self._access_token = os.environ.get("DHAN_ACCESS_TOKEN", "") or os.environ.get("DHAN_TOKEN", "")
 
-        # Cumulative alert counters
-        self._alert_counts: dict[str, int] = {"critical": 0, "warning": 0, "info": 0}
+        self._session: aiohttp.ClientSession | None = None
         self._stop_event = asyncio.Event()
         self._phase = "startup"
-        self._wd_free_gb: float = 0.0
-        self._active_alerts: dict[str, str] = {}  # component -> message
-        self._log_scan_offset: int = 0  # last byte offset scanned in log file
+        self._started_monotonic = _time.monotonic()
+        self._good_ticks = 0
+        self._total_ticks = 0
+        self._wd_free_gb = 0.0
+        self._alert_counts: dict[str, int] = {"critical": 0, "warning": 0, "info": 0}
+        self._active_alerts: dict[str, dict] = {}
+        self._consecutive_bad: dict[str, int] = {"quote_freshness": 0, "depth_readiness": 0}
+        self._log_scan_offset = 0
+        self._backend_open_sent_for: date | None = None
+        self._eod_sent_for: date | None = None
+        self._heartbeat_started_for: date | None = None
+        self._heartbeat_failed_for: date | None = None
+        self._last_external_heartbeat_at: str | None = None
+        self._last_external_heartbeat_status: str = "not_sent"
 
     async def run(self) -> None:
-        (self._live_root / "alerts").mkdir(parents=True, exist_ok=True)
-        (self._live_root / "snapshots").mkdir(parents=True, exist_ok=True)
-
-        _log.info("health_monitor: starting for %s", date.today())
-
-        # Optional Sentry init
-        if dsn := os.environ.get("SENTRY_DSN"):
-            try:
-                import sentry_sdk
-                sentry_sdk.init(
-                    dsn=dsn,
-                    environment="production",
-                    server_name="zimaos",
-                    shutdown_timeout=5,
-                    traces_sample_rate=0.0,
-                    send_default_pii=False,
-                )
-                _log.info("health_monitor: Sentry initialised")
-            except ImportError:
-                _log.warning("health_monitor: sentry_sdk not installed — skipping")
-
+        self._ensure_dirs()
+        self._init_sentry()
         async with aiohttp.ClientSession() as session:
             self._session = session
-
-            await self._send_telegram(f"Health monitor online for {date.today()}", severity="info")
-
-            # Send /start to Healthchecks.io
-            if self._hc_url:
-                await self._ping_hc(f"{self._hc_url}/start?session_date={self._date_str}&phase=startup")
-
+            await self._send_telegram(f"Health monitor online for {self._session_date}", severity="info")
+            await self._run_start_heartbeat_if_due()
             tasks = [
                 asyncio.create_task(self._critical_loop()),
                 asyncio.create_task(self._slow_loop()),
                 asyncio.create_task(self._heartbeat_loop()),
+                asyncio.create_task(self._summary_loop()),
             ]
             await self._stop_event.wait()
-            for t in tasks:
-                t.cancel()
+            for task in tasks:
+                task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        await self._eod_summary()
+    async def run_once(self) -> None:
+        self._ensure_dirs()
+        async with aiohttp.ClientSession() as session:
+            self._session = session
+            await self._run_critical_checks()
+            await self._run_slow_checks()
+            self._write_alert_state()
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Critical checks (every 15s)
-    # ──────────────────────────────────────────────────────────────────────────
+    def _ensure_dirs(self) -> None:
+        for subdir in ("alerts", "snapshots", "reports", "logs"):
+            (self._live_root / subdir).mkdir(parents=True, exist_ok=True)
+
+    def _init_sentry(self) -> None:
+        dsn = os.environ.get("SENTRY_DSN")
+        if not dsn:
+            return
+        try:
+            import sentry_sdk
+
+            sentry_sdk.init(
+                dsn=dsn,
+                environment="production",
+                server_name="zimaos",
+                shutdown_timeout=5,
+                traces_sample_rate=0.0,
+                send_default_pii=False,
+            )
+            _log.info("health_monitor: Sentry initialised")
+        except ImportError:
+            _log.warning("health_monitor: sentry_sdk not installed - skipping")
+
+    def _roll_date_if_needed(self) -> None:
+        today = _today_ist()
+        if today == self._session_date:
+            return
+        self._session_date = today
+        self._date_str = today.strftime("%Y%m%d")
+        self._alerts_path = self._live_root / "alerts" / f"{self._date_str}_alerts.jsonl"
+        self._external_heartbeat_path = self._live_root / "alerts" / f"{self._date_str}_external_heartbeat.jsonl"
+        self._uptime_summary_path = self._live_root / "reports" / f"{self._date_str}_uptime_summary.md"
+        self._alert_counts = {"critical": 0, "warning": 0, "info": 0}
+        self._active_alerts = {}
+        self._consecutive_bad = {"quote_freshness": 0, "depth_readiness": 0}
+        self._good_ticks = 0
+        self._total_ticks = 0
+        self._started_monotonic = _time.monotonic()
+        self._log_scan_offset = 0
 
     async def _critical_loop(self) -> None:
         while not self._stop_event.is_set():
-            try:
-                await self._check_process_alive()
-                await self._check_collector_heartbeat()
-                await self._check_feed_state()
-                await self._check_depth_snapshot()
-                await self._check_wd_mount()
-                if sys.platform != "win32":
-                    await self._check_clock_sync()
-                self._write_alert_state()
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                _log.error("critical_loop: unexpected error — %r", exc)
+            self._roll_date_if_needed()
+            await self._run_critical_checks()
             await asyncio.sleep(_CRITICAL_INTERVAL)
-
-    async def _check_process_alive(self) -> None:
-        if not _is_market_hours():
-            return
-        health_path = self._live_root / "snapshots" / "latest_process_health.json"
-        if not health_path.exists():
-            await self._alert("critical", "process", "process_health_missing",
-                              "latest_process_health.json does not exist during market hours")
-            return
-
-        try:
-            data = json.loads(health_path.read_text())
-            written_at = datetime.fromisoformat(data["written_at"])
-            age = (_now_ist() - written_at).total_seconds()
-            if age > 30:
-                await self._alert("critical", "process", "process_stale",
-                                  f"process health stale: {age:.0f}s old")
-            else:
-                self._clear_alert("process")
-        except Exception as exc:
-            await self._alert("warning", "process", "process_health_parse_error", str(exc))
-
-    async def _check_collector_heartbeat(self) -> None:
-        health_path = self._live_root / "snapshots" / "latest_process_health.json"
-        if not health_path.exists():
-            return
-        try:
-            data = json.loads(health_path.read_text())
-            written_at = datetime.fromisoformat(data["written_at"])
-            age = (_now_ist() - written_at).total_seconds()
-            if age > 30:
-                await self._alert("critical", "collector", "collector_heartbeat_stale",
-                                  f"collector heartbeat stale: {age:.0f}s old")
-            else:
-                self._clear_alert("collector")
-        except Exception:
-            pass
-
-    async def _check_feed_state(self) -> None:
-        if not _is_feed_active():
-            return
-        feed_path = self._live_root / "snapshots" / "latest_feed_state.json"
-        if not feed_path.exists():
-            await self._alert("critical", "feed", "feed_state_missing",
-                              "latest_feed_state.json does not exist during feed-active window")
-            return
-        try:
-            data = json.loads(feed_path.read_text())
-            written_at = datetime.fromisoformat(data["written_at"])
-            age = (_now_ist() - written_at).total_seconds()
-            if age > 15:
-                await self._alert("critical", "feed", "feed_state_stale",
-                                  f"feed state stale: {age:.0f}s old")
-            elif not data.get("connected", False):
-                await self._alert("critical", "feed", "feed_disconnected", "live feed disconnected")
-            else:
-                self._clear_alert("feed")
-        except Exception as exc:
-            await self._alert("warning", "feed", "feed_state_parse_error", str(exc))
-
-    async def _check_depth_snapshot(self) -> None:
-        if not _is_market_hours():
-            return
-        depth_path = self._live_root / "snapshots" / "latest_depth_cache.json"
-        if not depth_path.exists():
-            # Only alert if we're well into the session
-            t = _ist_time()
-            if t >= time(9, 30):
-                await self._alert("warning", "depth", "depth_snapshot_missing",
-                                  "latest_depth_cache.json not found during market hours")
-            return
-        try:
-            data = json.loads(depth_path.read_text())
-            written_at = datetime.fromisoformat(data.get("written_at", "2000-01-01"))
-            age = (_now_ist() - written_at).total_seconds()
-            if age > 15:
-                await self._alert("critical", "depth", "depth_snapshot_stale",
-                                  f"depth cache snapshot stale: {age:.0f}s old")
-            else:
-                self._clear_alert("depth")
-        except Exception as exc:
-            await self._alert("warning", "depth", "depth_snapshot_parse_error", str(exc))
-
-    async def _check_wd_mount(self) -> None:
-        try:
-            stat = shutil.disk_usage(str(self._live_root))
-            self._wd_free_gb = stat.free / (1024 ** 3)
-            if self._wd_free_gb < _WD_MIN_GB_INTRADAY:
-                await self._alert("critical", "storage", "wd_low_space_critical",
-                                  f"WD free: {self._wd_free_gb:.1f} GB (< {_WD_MIN_GB_INTRADAY} GB)")
-            elif self._wd_free_gb < _WD_MIN_GB_PRE_RUN:
-                await self._alert("warning", "storage", "wd_low_space_warn",
-                                  f"WD free: {self._wd_free_gb:.1f} GB (< {_WD_MIN_GB_PRE_RUN} GB)")
-            else:
-                self._clear_alert("storage")
-        except Exception as exc:
-            await self._alert("critical", "storage", "wd_mount_error", str(exc))
-
-    async def _check_clock_sync(self) -> None:
-        # Check actual drift from timesync-status rather than the NTPSynchronized
-        # flag. The flag goes 'no' whenever timesyncd restarts (ZimaOS does this
-        # periodically), even if the clock offset is within acceptable bounds.
-        try:
-            result = subprocess.run(
-                ["timedatectl", "timesync-status"], capture_output=True, text=True, timeout=5
-            )
-            offset_sec: float | None = None
-            for line in result.stdout.splitlines():
-                if line.strip().startswith("Offset:"):
-                    raw = line.split(":", 1)[1].strip()
-                    offset_sec = _parse_timesync_offset(raw)
-                    break
-
-            if offset_sec is not None:
-                if abs(offset_sec) > 2.0:
-                    await self._alert(
-                        "critical", "clock", "clock_drift_high",
-                        f"Clock drift {offset_sec:+.3f}s exceeds 2s threshold",
-                    )
-                else:
-                    self._clear_alert("clock")
-                return
-
-            # timesync-status gave no offset (daemon not yet synced after restart).
-            # Fall back to the boolean flag — only warn once, not every 15s.
-            result2 = subprocess.run(
-                ["timedatectl", "show"], capture_output=True, text=True, timeout=5
-            )
-            synced = any(
-                line.startswith("NTPSynchronized=yes")
-                for line in result2.stdout.splitlines()
-            )
-            if not synced:
-                await self._alert("warning", "clock", "clock_not_synced",
-                                  "NTPSynchronized=no and no offset available (daemon may be starting)")
-            else:
-                self._clear_alert("clock")
-        except Exception as exc:
-            _log.debug("clock_sync check failed: %r", exc)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Slow checks (every 60s)
-    # ──────────────────────────────────────────────────────────────────────────
 
     async def _slow_loop(self) -> None:
         while not self._stop_event.is_set():
-            try:
-                await self._check_wd_free_space_slow()
-                if sys.platform != "win32" and self._expected_ip:
-                    await self._check_public_ip()
-                await self._check_error_log()
-                await self._check_token_expiry()
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                _log.error("slow_loop: unexpected error — %r", exc)
+            self._roll_date_if_needed()
+            await self._run_slow_checks()
             await asyncio.sleep(_SLOW_INTERVAL)
 
-    async def _check_wd_free_space_slow(self) -> None:
-        # Critical threshold already checked in _check_wd_mount every 15s
-        # Pre-run threshold is only relevant for slow checks
-        if self._wd_free_gb < _WD_MIN_GB_PRE_RUN and not _is_market_hours():
-            await self._alert("critical", "storage_slow", "wd_pre_run_insufficient",
-                              f"Pre-run: only {self._wd_free_gb:.1f} GB free (need >= {_WD_MIN_GB_PRE_RUN} GB)")
+    async def _summary_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._roll_date_if_needed()
+            await self._maybe_send_backend_healthy()
+            await self._maybe_send_eod_summary()
+            self._write_alert_state()
+            await asyncio.sleep(30)
 
-    async def _check_public_ip(self) -> None:
+    async def _run_critical_checks(self) -> None:
+        try:
+            results = [
+                await self._check_runner_process(),
+                await self._check_collector_heartbeat(),
+                await self._check_feed_state(),
+                await self._check_depth_snapshot(),
+                await self._check_quote_freshness(),
+                await self._check_depth_readiness(),
+                await self._check_wd_mount(),
+            ]
+            if sys.platform != "win32":
+                results.append(await self._check_clock_sync())
+            self._total_ticks += 1
+            if all(result for result in results if result is not None):
+                self._good_ticks += 1
+            self._write_alert_state()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.error("critical checks failed unexpectedly: %r", exc)
+
+    async def _run_slow_checks(self) -> None:
+        try:
+            await self._check_raw_packet_flush()
+            await self._check_parquet_flush()
+            await self._check_wd_free_space_slow()
+            if sys.platform != "win32" and self._expected_ip:
+                await self._check_public_ip()
+            await self._check_token_expiry()
+            await self._check_error_log()
+            self._write_alert_state()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.error("slow checks failed unexpectedly: %r", exc)
+
+    async def _check_runner_process(self) -> bool | None:
+        if not _is_market_hours():
+            await self._clear_alert("process", "runner_not_active")
+            await self._clear_alert("process", "process_health_missing")
+            await self._clear_alert("process", "process_stale")
+            return None
+
+        systemd_active = False
+        if sys.platform != "win32" and shutil.which("systemctl"):
+            result = subprocess.run(
+                ["systemctl", "is-active", "--quiet", "live-paper.service"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            systemd_active = result.returncode == 0
+
+        snapshot_active = False
+        health_path = self._live_root / "snapshots" / "latest_process_health.json"
+        if health_path.exists():
+            try:
+                data = json.loads(health_path.read_text(encoding="utf-8"))
+                written_at = _parse_ts(data.get("written_at"))
+                if written_at and (_now_ist() - written_at).total_seconds() <= 30:
+                    snapshot_active = True
+            except Exception as exc:
+                await self._alert("warning", "process", "process_health_parse_error", str(exc))
+
+        if systemd_active or snapshot_active:
+            await self._clear_alert("process", "runner_not_active")
+            await self._clear_alert("process", "process_health_missing")
+            await self._clear_alert("process", "process_stale")
+            return True
+
+        if not health_path.exists():
+            await self._alert(
+                "critical",
+                "process",
+                "process_health_missing",
+                "latest_process_health.json missing and live-paper service is not active",
+            )
+        else:
+            await self._alert("critical", "process", "process_stale", "runner process health is stale or inactive")
+        return False
+
+    async def _check_collector_heartbeat(self) -> bool | None:
+        if not _is_feed_active():
+            await self._clear_alert("collector", "collector_heartbeat_missing")
+            await self._clear_alert("collector", "collector_heartbeat_stale")
+            return None
+        path = self._live_root / "snapshots" / "latest_depth_cache.json"
+        if not path.exists():
+            await self._alert(
+                "critical",
+                "collector",
+                "collector_heartbeat_missing",
+                "latest_depth_cache.json missing during feed-active window",
+            )
+            return False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            written_at = _parse_ts(data.get("written_at"))
+            age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
+            if age > 30:
+                await self._alert("critical", "collector", "collector_heartbeat_stale", f"collector heartbeat stale: {age:.0f}s old")
+                return False
+            await self._clear_alert("collector", "collector_heartbeat_missing")
+            await self._clear_alert("collector", "collector_heartbeat_stale")
+            return True
+        except Exception as exc:
+            await self._alert("warning", "collector", "collector_heartbeat_parse_error", str(exc))
+            return False
+
+    async def _check_feed_state(self) -> bool | None:
+        if not _is_feed_active():
+            await self._clear_alert("feed", "feed_state_missing")
+            await self._clear_alert("feed", "feed_state_stale")
+            await self._clear_alert("feed", "feed_disconnected")
+            return None
+        data = self._load_json_snapshot("latest_feed_state.json")
+        if data is None:
+            await self._alert("critical", "feed", "feed_state_missing", "latest_feed_state.json missing during feed-active window")
+            return False
+        written_at = _parse_ts(data.get("written_at"))
+        age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
+        if age > 15:
+            await self._alert("critical", "feed", "feed_state_stale", f"feed state stale: {age:.0f}s old")
+            return False
+        if not data.get("connected", False):
+            await self._alert("critical", "feed", "feed_disconnected", "live feed disconnected")
+            return False
+        await self._clear_alert("feed", "feed_state_missing")
+        await self._clear_alert("feed", "feed_state_stale")
+        await self._clear_alert("feed", "feed_disconnected")
+        return True
+
+    async def _check_depth_snapshot(self) -> bool | None:
+        if not _is_feed_active():
+            await self._clear_alert("depth", "depth_snapshot_missing")
+            await self._clear_alert("depth", "depth_snapshot_stale")
+            return None
+        data = self._load_json_snapshot("latest_depth_cache.json")
+        if data is None:
+            await self._alert("critical", "depth", "depth_snapshot_missing", "latest_depth_cache.json missing during feed-active window")
+            return False
+        written_at = _parse_ts(data.get("written_at"))
+        age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
+        if age > 15:
+            await self._alert("critical", "depth", "depth_snapshot_stale", f"depth cache snapshot stale: {age:.0f}s old")
+            return False
+        await self._clear_alert("depth", "depth_snapshot_missing")
+        await self._clear_alert("depth", "depth_snapshot_stale")
+        return True
+
+    async def _check_quote_freshness(self) -> bool | None:
+        if not _is_feed_active():
+            self._consecutive_bad["quote_freshness"] = 0
+            await self._clear_alert("quote_freshness", "quote_freshness_low")
+            return None
+        data = self._load_json_snapshot("latest_feed_state.json")
+        if data is None:
+            return False
+        pct = float(data.get("quote_freshness_pct", 0.0))
+        if pct < _QUOTE_FRESHNESS_MIN_PCT:
+            self._consecutive_bad["quote_freshness"] += 1
+            if self._consecutive_bad["quote_freshness"] >= 2:
+                await self._alert("critical", "quote_freshness", "quote_freshness_low", f"fresh quotes {pct:.1f}% (< 95%) for 2 consecutive checks")
+            return False
+        self._consecutive_bad["quote_freshness"] = 0
+        await self._clear_alert("quote_freshness", "quote_freshness_low")
+        return True
+
+    async def _check_depth_readiness(self) -> bool | None:
+        if not _is_feed_active():
+            self._consecutive_bad["depth_readiness"] = 0
+            await self._clear_alert("depth_readiness", "depth_ready_low")
+            return None
+        data = self._load_json_snapshot("latest_depth_cache.json")
+        if data is None:
+            return False
+        pct = float(data.get("ready_pct", data.get("depth_ready_pct", 0.0)))
+        if pct < _DEPTH_READY_MIN_PCT:
+            self._consecutive_bad["depth_readiness"] += 1
+            if self._consecutive_bad["depth_readiness"] >= 2:
+                await self._alert("critical", "depth_readiness", "depth_ready_low", f"depth ready {pct:.1f}% (< 95%) for 2 consecutive checks")
+            return False
+        self._consecutive_bad["depth_readiness"] = 0
+        await self._clear_alert("depth_readiness", "depth_ready_low")
+        return True
+
+    async def _check_wd_mount(self) -> bool:
+        try:
+            if sys.platform != "win32":
+                resolved = self._live_root.resolve()
+                if not str(resolved).startswith("/media/WD-Storage"):
+                    await self._alert("critical", "storage", "wd_mount_invalid", f"data/live resolves to {resolved}")
+                    return False
+            probe = self._live_root / "snapshots" / ".health_write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            stat = shutil.disk_usage(str(self._live_root))
+            self._wd_free_gb = stat.free / (1024 ** 3)
+            if self._wd_free_gb < _WD_MIN_GB_INTRADAY:
+                await self._alert("critical", "storage", "wd_low_space_critical", f"WD free {self._wd_free_gb:.1f} GB (< 20 GB)")
+                return False
+            await self._clear_alert("storage", "wd_mount_invalid")
+            await self._clear_alert("storage", "wd_low_space_critical")
+            return True
+        except Exception as exc:
+            await self._alert("critical", "storage", "wd_mount_error", str(exc))
+            return False
+
+    async def _check_clock_sync(self) -> bool | None:
+        try:
+            result = subprocess.run(["timedatectl", "timesync-status"], capture_output=True, text=True, timeout=5)
+            offset_sec: float | None = None
+            for line in result.stdout.splitlines():
+                if line.strip().startswith("Offset:"):
+                    offset_sec = _parse_timesync_offset(line.split(":", 1)[1].strip())
+                    break
+            if offset_sec is not None:
+                if abs(offset_sec) > 2.0:
+                    await self._alert("critical", "clock", "clock_drift_high", f"clock drift {offset_sec:+.3f}s exceeds 2s")
+                    return False
+                await self._clear_alert("clock", "clock_drift_high")
+                await self._clear_alert("clock", "clock_not_synced")
+                return True
+
+            result = subprocess.run(["timedatectl", "show"], capture_output=True, text=True, timeout=5)
+            synced = any(line.startswith("NTPSynchronized=yes") for line in result.stdout.splitlines())
+            if not synced:
+                uptime = _boot_uptime_seconds()
+                if uptime is not None and uptime < _CLOCK_BOOT_GRACE_SECONDS:
+                    _log.info("clock sync still settling after boot: uptime=%.0fs", uptime)
+                    return None
+                await self._alert("critical", "clock", "clock_not_synced", "timedatectl reports NTPSynchronized=no")
+                return False
+            await self._clear_alert("clock", "clock_not_synced")
+            return True
+        except FileNotFoundError:
+            return None
+        except Exception as exc:
+            _log.debug("clock sync check failed: %r", exc)
+            return None
+
+    async def _check_raw_packet_flush(self) -> bool | None:
+        if not _is_feed_active():
+            await self._clear_alert("raw_packets", "raw_packet_flush_stale")
+            await self._clear_alert("raw_packets", "raw_packet_missing")
+            return None
+        newest = _newest_file(self._live_root / "raw_depth_packets" / self._date_str, ("*.bin",))
+        if newest is None:
+            await self._alert("warning", "raw_packets", "raw_packet_missing", "no raw depth packet file found for today")
+            return False
+        age = _time.time() - newest.stat().st_mtime
+        if age > _RAW_FLUSH_MAX_AGE_SECONDS:
+            await self._alert("warning", "raw_packets", "raw_packet_flush_stale", f"newest raw packet flush is {age:.0f}s old")
+            return False
+        await self._clear_alert("raw_packets", "raw_packet_missing")
+        await self._clear_alert("raw_packets", "raw_packet_flush_stale")
+        return True
+
+    async def _check_parquet_flush(self) -> bool | None:
+        if not _is_feed_active():
+            await self._clear_alert("parquet", "parquet_flush_stale")
+            await self._clear_alert("parquet", "parquet_missing")
+            return None
+        newest = _newest_file(self._live_root / "order_book" / self._date_str, ("*.parquet",))
+        if newest is None:
+            await self._alert("warning", "parquet", "parquet_missing", "no normalized order-book parquet file found for today")
+            return False
+        age = _time.time() - newest.stat().st_mtime
+        if age > _PARQUET_FLUSH_MAX_AGE_SECONDS:
+            await self._alert("warning", "parquet", "parquet_flush_stale", f"newest parquet flush is {age:.0f}s old")
+            return False
+        await self._clear_alert("parquet", "parquet_missing")
+        await self._clear_alert("parquet", "parquet_flush_stale")
+        return True
+
+    async def _check_wd_free_space_slow(self) -> bool:
+        if self._wd_free_gb < _WD_MIN_GB_PRE_RUN and not _is_market_hours():
+            await self._alert("warning", "storage", "wd_low_space_warn", f"pre-run WD free {self._wd_free_gb:.1f} GB (< 100 GB)")
+            return False
+        await self._clear_alert("storage", "wd_low_space_warn")
+        return True
+
+    async def _check_public_ip(self) -> bool:
+        assert self._session is not None
         try:
             async with self._session.get("https://api.ipify.org", timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 ip = (await resp.text()).strip()
             if ip != self._expected_ip:
-                await self._alert("warning", "network", "public_ip_mismatch",
-                                  f"Public IP {ip!r} != expected {self._expected_ip!r}")
-            else:
-                self._clear_alert("network")
+                severity = "critical" if _is_preflight_window() else "warning"
+                await self._alert(severity, "network", "public_ip_mismatch", f"public IP {ip!r} does not match expected whitelist")
+                return False
+            await self._clear_alert("network", "public_ip_mismatch")
+            return True
         except Exception as exc:
-            _log.debug("public_ip check failed: %r", exc)
+            await self._alert("warning", "network", "public_ip_check_failed", str(exc))
+            return False
 
-    async def _check_error_log(self) -> None:
+    async def _check_token_expiry(self) -> bool | None:
+        if not self._access_token:
+            return None
+        exp = _jwt_expiry(self._access_token)
+        if exp is None:
+            return None
+        eod_buffer = datetime.combine(self._session_date, _EOD_BUFFER_END, tzinfo=_IST)
+        remaining = (exp - _now_ist()).total_seconds()
+        if exp < eod_buffer:
+            await self._alert("critical", "token", "token_expires_before_eod", "Dhan token expires before planned EOD buffer")
+            await self._send_preflight_fail_if_needed()
+            return False
+        if remaining < 7200 and time(7, 30) <= _ist_time() <= time(9, 30):
+            await self._alert("warning", "token", "token_expiring_soon", f"Dhan token expires in {remaining / 60:.0f} minutes")
+            return False
+        await self._clear_alert("token", "token_expires_before_eod")
+        await self._clear_alert("token", "token_expiring_soon")
+        return True
+
+    async def _check_error_log(self) -> bool | None:
         log_path = self._live_root / "logs" / f"{self._date_str}.log"
         if not log_path.exists():
-            return
+            return None
         try:
-            with open(log_path, "r", errors="replace") as f:
+            with log_path.open("r", errors="replace", encoding="utf-8") as f:
                 f.seek(self._log_scan_offset)
                 new_content = f.read()
                 self._log_scan_offset = f.tell()
-
-            error_lines = [
-                line for line in new_content.splitlines()
-                if any(kw in line for kw in ("ERROR", "CRITICAL", "Traceback"))
-            ]
+            error_lines = [line for line in new_content.splitlines() if any(word in line for word in ("ERROR", "CRITICAL", "Traceback"))]
             if error_lines:
-                sample = error_lines[0][:200]
-                await self._alert("warning", "log_errors", "new_error_in_log",
-                                  f"{len(error_lines)} new error/traceback lines. First: {sample}")
+                sample = _scrub_message(error_lines[0][:200])
+                await self._alert("warning", "log_errors", "new_error_in_log", f"{len(error_lines)} new error lines. First: {sample}")
+                return False
+            return True
         except Exception as exc:
-            _log.debug("error_log check failed: %r", exc)
+            _log.debug("error log scan failed: %r", exc)
+            return None
 
-    async def _check_token_expiry(self) -> None:
-        if not self._access_token:
-            return
-        exp = _jwt_expiry(self._access_token)
-        if exp is None:
-            return
-        remaining = (exp - _now_ist()).total_seconds()
-        if remaining < 0:
-            await self._alert("critical", "token", "token_expired",
-                              "DHAN_ACCESS_TOKEN has expired")
-        elif remaining < 7200:  # < 2 hours
-            # Only warn in the pre-market window (07:30–09:30 IST). At other times
-            # the 08:30 cron will renew the token before market open, so overnight
-            # warnings are noise.
-            t = _ist_time()
-            if time(7, 30) <= t <= time(9, 30):
-                await self._alert("warning", "token", "token_expiring_soon",
-                                  f"DHAN_ACCESS_TOKEN expires in {remaining / 60:.0f} minutes")
-        else:
-            self._clear_alert("token")
+    def _load_json_snapshot(self, name: str) -> dict | None:
+        path = self._live_root / "snapshots" / name
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Healthchecks.io dead-man-switch
-    # ──────────────────────────────────────────────────────────────────────────
+    async def _maybe_send_backend_healthy(self) -> None:
+        if self._backend_open_sent_for == self._session_date:
+            return
+        if not _is_feed_active():
+            return
+        if self._active_alerts:
+            return
+        feed = self._load_json_snapshot("latest_feed_state.json") or {}
+        depth = self._load_json_snapshot("latest_depth_cache.json") or {}
+        if feed.get("connected") and float(feed.get("quote_freshness_pct", 0.0)) >= 95.0 and float(depth.get("ready_pct", 0.0)) >= 95.0:
+            await self._send_telegram("Backend healthy at market open", severity="info")
+            self._backend_open_sent_for = self._session_date
+
+    async def _maybe_send_eod_summary(self) -> None:
+        if self._eod_sent_for == self._session_date:
+            return
+        if not _is_trading_day(self._session_date) or _ist_time() < _MARKET_CLOSE:
+            return
+        await self._eod_summary()
+        self._eod_sent_for = self._session_date
 
     async def _heartbeat_loop(self) -> None:
         while not self._stop_event.is_set():
-            in_hours = _is_heartbeat_hours()
-            interval = _HEARTBEAT_INTERVAL_MARKET if in_hours else _HEARTBEAT_INTERVAL_OFF
+            self._roll_date_if_needed()
+            await self._run_start_heartbeat_if_due()
+            interval = _HEARTBEAT_INTERVAL_MARKET if _is_heartbeat_hours() else _HEARTBEAT_INTERVAL_OFF
             if self._hc_url:
-                phase = self._phase
-                url = f"{self._hc_url}?session_date={self._date_str}&phase={phase}"
-                await self._ping_hc(url)
+                await self._ping_hc("success", {"session_date": self._date_str, "phase": self._phase})
             await asyncio.sleep(interval)
 
-    async def _ping_hc(self, url: str) -> None:
+    async def _run_start_heartbeat_if_due(self) -> None:
+        if not self._hc_url or self._heartbeat_started_for == self._session_date:
+            return
+        if _is_heartbeat_hours() or _is_preflight_window():
+            await self._ping_hc("start", {"session_date": self._date_str, "phase": "startup"})
+            self._heartbeat_started_for = self._session_date
+
+    async def _send_preflight_fail_if_needed(self) -> None:
+        if not self._hc_url or not _is_preflight_window() or self._heartbeat_failed_for == self._session_date:
+            return
+        await self._ping_hc("fail", {"session_date": self._date_str, "phase": "preflight"})
+        self._heartbeat_failed_for = self._session_date
+
+    async def _ping_hc(self, kind: str, params: dict[str, str] | None = None) -> None:
+        if not self._hc_url or self._session is None:
+            return
+        suffix = "" if kind == "success" else f"/{kind}"
+        query = f"?{urlencode(params or {})}" if params else ""
+        url = f"{self._hc_url.rstrip('/')}{suffix}{query}"
+        status = "failed"
+        http_status: int | None = None
         try:
             async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                _log.debug("healthchecks.io ping: %d %s", resp.status, url)
+                http_status = resp.status
+                status = "ok" if 200 <= resp.status < 300 else f"http_{resp.status}"
+            if status == "ok":
+                self._last_external_heartbeat_at = _now_ist().isoformat()
+            self._last_external_heartbeat_status = status
         except Exception as exc:
-            _log.warning("healthchecks.io ping failed: %r", exc)
+            self._last_external_heartbeat_status = f"failed:{type(exc).__name__}"
+            _log.warning("healthchecks.io %s ping failed: %r", kind, exc)
+        finally:
+            self._write_external_heartbeat_record(kind, status, http_status)
 
-    async def _ping_hc_fail(self) -> None:
-        if self._hc_url:
-            url = f"{self._hc_url}/fail?session_date={self._date_str}&phase={self._phase}"
-            await self._ping_hc(url)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Alert dispatch
-    # ──────────────────────────────────────────────────────────────────────────
+    def _write_external_heartbeat_record(self, kind: str, status: str, http_status: int | None) -> None:
+        record = {
+            "ts": _now_ist().isoformat(),
+            "kind": kind,
+            "status": status,
+            "http_status": http_status,
+            "session_date": self._date_str,
+            "phase": self._phase,
+        }
+        self._external_heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._external_heartbeat_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
 
     async def _alert(self, severity: str, component: str, reason: str, message: str) -> None:
+        message = _scrub_message(message)
+        key = f"{severity}:{component}:{reason}"
         self._alert_counts[severity] = self._alert_counts.get(severity, 0) + 1
-        self._active_alerts[component] = message
-
+        self._active_alerts[key] = {
+            "severity": severity,
+            "component": component,
+            "reason": reason,
+            "message": message,
+            "last_seen": _now_ist().isoformat(),
+        }
         record = {
-            "ts": datetime.now(tz=_IST).isoformat(),
+            "ts": _now_ist().isoformat(),
             "severity": severity,
             "component": component,
             "reason": reason,
             "message": message,
         }
         self._alerts_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._alerts_path, "a") as f:
+        with self._alerts_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
 
-        _log.log(
-            logging.CRITICAL if severity == "critical" else logging.WARNING,
-            "alert: [%s] %s — %s", severity.upper(), component, message,
-        )
+        level = logging.CRITICAL if severity == "critical" else logging.WARNING if severity == "warning" else logging.INFO
+        _log.log(level, "alert: [%s] %s %s - %s", severity.upper(), component, reason, message)
+
+        if severity == "critical" and _is_preflight_window():
+            await self._send_preflight_fail_if_needed()
 
         if _throttle_ok(severity, component, reason):
-            emoji_map = {"critical": "[CRITICAL]", "warning": "[WARNING]", "info": "[INFO]"}
-            tag = emoji_map.get(severity, "[ALERT]")
-            text = f"{tag} {component}: {message}"
-            await self._send_telegram(text, severity=severity)
+            await self._send_telegram(f"[{severity.upper()}] {component}/{reason}: {message}", severity=severity)
 
-    def _clear_alert(self, component: str) -> None:
-        if component in self._active_alerts:
-            prev_msg = self._active_alerts.pop(component)
-            _log.info("alert_cleared: %s — was: %s", component, prev_msg)
-            asyncio.ensure_future(self._send_telegram(f"[RECOVERED] {component}: {prev_msg}", severity="info"))
+    async def _clear_alert(self, component: str, reason: str) -> None:
+        matching = [key for key, record in self._active_alerts.items() if record["component"] == component and record["reason"] == reason]
+        for key in matching:
+            record = self._active_alerts.pop(key)
+            await self._send_telegram(f"[RECOVERED] {component}/{reason}: {record['message']}", severity="info")
 
     async def _send_telegram(self, text: str, severity: str = "info") -> None:
-        if not self._tg_token or not self._tg_chat:
+        if not self._tg_token or not self._tg_chat or self._session is None:
             return
         url = f"https://api.telegram.org/bot{self._tg_token}/sendMessage"
-        payload: dict = {"chat_id": self._tg_chat, "text": text, "parse_mode": "HTML"}
-        # Optional: post to a specific topic in a Telegram forum-group
+        payload: dict[str, str | int] = {
+            "chat_id": self._tg_chat,
+            "text": _scrub_message(text),
+            "parse_mode": "HTML",
+        }
         if self._tg_thread:
-            payload["message_thread_id"] = self._tg_thread
+            payload["message_thread_id"] = int(self._tg_thread)
         try:
             async with self._session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
-                    _log.warning("telegram: HTTP %d", resp.status)
+                    _log.warning("telegram send failed: HTTP %d", resp.status)
         except Exception as exc:
-            _log.warning("telegram: send failed — %r", exc)
+            _log.warning("telegram send failed: %r", exc)
 
     def _write_alert_state(self) -> None:
+        uptime_pct = round(self._good_ticks / self._total_ticks * 100, 2) if self._total_ticks else 0.0
         state = {
-            "written_at": datetime.now(tz=_IST).isoformat(),
+            "written_at": _now_ist().isoformat(),
+            "session_date": self._session_date.isoformat(),
             "phase": self._phase,
-            "active_alerts": dict(self._active_alerts),
+            "uptime_pct": uptime_pct,
+            "active_alerts": list(self._active_alerts.values()),
             "alert_counts": dict(self._alert_counts),
             "wd_free_gb": round(self._wd_free_gb, 2),
+            "latest_external_heartbeat_at": self._last_external_heartbeat_at,
+            "latest_external_heartbeat_status": self._last_external_heartbeat_status,
+            "artifacts": {
+                "alerts": str(self._alerts_path),
+                "external_heartbeat": str(self._external_heartbeat_path),
+                "uptime_summary": str(self._uptime_summary_path),
+            },
         }
-        try:
-            tmp = self._alert_state_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(state, indent=2))
-            tmp.replace(self._alert_state_path)
-        except Exception as exc:
-            _log.debug("write_alert_state failed: %r", exc)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # EOD summary
-    # ──────────────────────────────────────────────────────────────────────────
+        _write_atomic_json(self._alert_state_path, state)
 
     async def _eod_summary(self) -> None:
-        trades_path = self._live_root / "paper_trades" / f"{self._date_str}.json"
-        report_path = self._live_root / "reports" / f"{self._date_str}_paper_summary.md"
-
-        total_alerts = sum(self._alert_counts.values())
+        uptime_pct = round(self._good_ticks / self._total_ticks * 100, 2) if self._total_ticks else 0.0
+        data_gap_minutes = self._data_gap_minutes()
+        paper_trades = self._live_root / "paper_trades" / f"{self._date_str}.json"
+        paper_summary = self._live_root / "reports" / f"{self._date_str}_paper_summary.md"
+        lines = [
+            f"# Health Monitor Uptime Summary - {self._session_date}",
+            "",
+            f"- Uptime: {uptime_pct:.2f}%",
+            f"- Alert counts: critical={self._alert_counts.get('critical', 0)}, warning={self._alert_counts.get('warning', 0)}, info={self._alert_counts.get('info', 0)}",
+            f"- Data-gap minutes: {data_gap_minutes:.1f}",
+            f"- WD free space: {self._wd_free_gb:.1f} GB",
+            f"- Latest external heartbeat: {self._last_external_heartbeat_at or 'not sent'} ({self._last_external_heartbeat_status})",
+            "",
+            "## Artifacts",
+            "",
+            f"- Alerts: {self._alerts_path}",
+            f"- Alert state: {self._alert_state_path}",
+            f"- External heartbeat log: {self._external_heartbeat_path}",
+            f"- Paper trades: {paper_trades}",
+            f"- Paper summary: {paper_summary}",
+        ]
+        _write_atomic_text(self._uptime_summary_path, "\n".join(lines) + "\n")
         msg = (
-            f"[EOD] Health monitor summary {date.today()}\n"
-            f"Alerts: critical={self._alert_counts.get('critical', 0)} "
-            f"warning={self._alert_counts.get('warning', 0)}\n"
+            f"[EOD] Health monitor summary {self._session_date}\n"
+            f"Uptime: {uptime_pct:.2f}%\n"
+            f"Alerts: critical={self._alert_counts.get('critical', 0)} warning={self._alert_counts.get('warning', 0)}\n"
+            f"Data gaps: {data_gap_minutes:.1f} min\n"
             f"WD free: {self._wd_free_gb:.1f} GB\n"
-            f"Artifacts: {trades_path.name}, {report_path.name}"
+            f"Artifacts: {self._uptime_summary_path.name}, {paper_summary.name}"
         )
         await self._send_telegram(msg, severity="info")
-        _log.info("eod_summary: %s", msg.replace("\n", " | "))
+        _log.info("eod summary written: %s", self._uptime_summary_path)
+
+    def _data_gap_minutes(self) -> float:
+        gap_path = self._live_root / "alerts" / f"{self._date_str}_gaps.jsonl"
+        if not gap_path.exists():
+            return 0.0
+        total = 0.0
+        try:
+            for line in gap_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                total += float(json.loads(line).get("gap_minutes", 0.0))
+        except Exception:
+            return total
+        return total
 
 
 async def _alarm_drill() -> bool:
-    """
-    Test all notification channels and return True if all configured channels pass.
-
-    Run before starting a live session to verify the alert chain:
-        python scripts/live/health_monitor.py --test-alerts
-    """
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     tg_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
     tg_thread = os.environ.get("TELEGRAM_THREAD_ID", "")
     hc_url = os.environ.get("EXTERNAL_HEARTBEAT_URL", "")
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
-
     results: dict[str, str] = {}
 
     async with aiohttp.ClientSession() as session:
-        # ── Telegram ──────────────────────────────────────────────────────────
         if tg_token and tg_chat:
             try:
-                url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-                payload: dict = {
+                payload: dict[str, str | int] = {
                     "chat_id": tg_chat,
-                    "text": "[TEST] Health monitor alarm drill — Telegram alerts working.",
+                    "text": "[TEST] Health monitor alarm drill - Telegram alerts working.",
                     "parse_mode": "HTML",
                 }
                 if tg_thread:
-                    payload["message_thread_id"] = tg_thread
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    payload["message_thread_id"] = int(tg_thread)
+                async with session.post(
+                    f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
                     results["telegram"] = "PASS" if resp.status == 200 else f"FAIL HTTP {resp.status}"
             except Exception as exc:
-                results["telegram"] = f"FAIL {exc}"
+                results["telegram"] = f"FAIL {type(exc).__name__}"
         else:
             results["telegram"] = "SKIP (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set)"
 
-        # ── Healthchecks.io ───────────────────────────────────────────────────
         if hc_url:
             try:
-                async with session.get(f"{hc_url}/start", timeout=aiohttp.ClientTimeout(total=10)) as r1:
-                    start_ok = r1.status == 200
+                base = hc_url.rstrip("/")
+                async with session.get(f"{base}/start", timeout=aiohttp.ClientTimeout(total=10)) as r1:
+                    start_ok = 200 <= r1.status < 300
                 await asyncio.sleep(2)
-                async with session.get(f"{hc_url}/fail", timeout=aiohttp.ClientTimeout(total=10)) as r2:
-                    fail_ok = r2.status == 200
-                # Recover immediately so the check goes green again
+                async with session.get(f"{base}/fail", timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                    fail_ok = 200 <= r2.status < 300
                 await asyncio.sleep(2)
-                async with session.get(hc_url, timeout=aiohttp.ClientTimeout(total=10)) as r3:
-                    recover_ok = r3.status == 200
+                async with session.get(base, timeout=aiohttp.ClientTimeout(total=10)) as r3:
+                    recover_ok = 200 <= r3.status < 300
                 results["healthchecks"] = (
                     f"PASS (start={start_ok} fail={fail_ok} recover={recover_ok})"
                     if start_ok and fail_ok and recover_ok
                     else f"PARTIAL start={start_ok} fail={fail_ok} recover={recover_ok}"
                 )
             except Exception as exc:
-                results["healthchecks"] = f"FAIL {exc}"
+                results["healthchecks"] = f"FAIL {type(exc).__name__}"
         else:
             results["healthchecks"] = "SKIP (EXTERNAL_HEARTBEAT_URL not set)"
 
-        # ── Sentry ────────────────────────────────────────────────────────────
         if sentry_dsn:
             try:
                 import sentry_sdk
+
                 sentry_sdk.init(
                     dsn=sentry_dsn,
                     environment="test",
@@ -641,34 +950,37 @@ async def _alarm_drill() -> bool:
                     traces_sample_rate=0.0,
                     send_default_pii=False,
                 )
-                sentry_sdk.capture_message("Alarm drill: Sentry connectivity test", level="info")
+                sentry_sdk.capture_exception(RuntimeError("Alarm drill: Sentry connectivity test"))
                 sentry_sdk.flush(timeout=5)
                 results["sentry"] = "PASS (event sent)"
             except ImportError:
                 results["sentry"] = "SKIP (sentry_sdk not installed)"
             except Exception as exc:
-                results["sentry"] = f"FAIL {exc}"
+                results["sentry"] = f"FAIL {type(exc).__name__}"
         else:
             results["sentry"] = "SKIP (SENTRY_DSN not set)"
 
     all_ok = True
     for channel, status in results.items():
-        prefix = "✓" if status.startswith("PASS") else ("~" if status.startswith("SKIP") else "✗")
-        print(f"  {prefix} {channel:15s}: {status}")
+        prefix = "OK" if status.startswith("PASS") else "SKIP" if status.startswith("SKIP") else "FAIL"
+        print(f"  {prefix:4s} {channel:15s}: {status}")
         if status.startswith("FAIL"):
             all_ok = False
-
     return all_ok
+
+
+def _load_profile(profile_name: str) -> dict:
+    cfg_path = _repo_root / "configs" / "live" / f"{profile_name}.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"profile not found: {cfg_path}")
+    return json.loads(cfg_path.read_text(encoding="utf-8"))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Wing-6 health monitor")
     parser.add_argument("--profile", default="wing6_4x1_all_vix_filtered")
-    parser.add_argument(
-        "--test-alerts",
-        action="store_true",
-        help="Run alarm drill: test Telegram, Healthchecks.io, and Sentry; then exit",
-    )
+    parser.add_argument("--once", action="store_true", help="Run one critical+slow check cycle, write state, then exit")
+    parser.add_argument("--test-alerts", action="store_true", help="Test Telegram, Healthchecks.io, and Sentry, then exit")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -678,24 +990,22 @@ def main() -> None:
     )
 
     if args.test_alerts:
-        print("Alarm drill — testing all notification channels:")
+        print("Alarm drill - testing notification channels:")
         ok = asyncio.run(_alarm_drill())
         sys.exit(0 if ok else 1)
 
-    cfg_path = _repo_root / "configs" / "live" / f"{args.profile}.json"
-    if not cfg_path.exists():
-        _log.error("profile not found: %s", cfg_path)
-        sys.exit(1)
-    profile = json.loads(cfg_path.read_text())
-
     try:
+        profile = _load_profile(args.profile)
         live_root = _resolve_live_root()
-    except RuntimeError as exc:
-        _log.error("live_root validation failed: %s", exc)
+    except Exception as exc:
+        _log.error("%s", exc)
         sys.exit(1)
 
     monitor = HealthMonitor(profile=profile, live_root=live_root)
-    asyncio.run(monitor.run())
+    if args.once:
+        asyncio.run(monitor.run_once())
+    else:
+        asyncio.run(monitor.run())
 
 
 if __name__ == "__main__":
