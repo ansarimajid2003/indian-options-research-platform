@@ -3,6 +3,8 @@ Description=Wing-6 Health Monitor
 Documentation=file:///DATA/live-paper/indian-markets/docs/design/live_paper_trading_plan.md
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -14,8 +16,6 @@ ExecStart=/DATA/live-paper/indian-markets/.venv/bin/python \
     --profile wing6_4x1_all_vix_filtered
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
 StandardOutput=append:/DATA/live-paper/logs/health-monitor.log
 StandardError=append:/DATA/live-paper/logs/health-monitor.log
 # Prevent log accumulation from filling /DATA (trim to 50 MB)
