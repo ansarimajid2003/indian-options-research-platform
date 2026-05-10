@@ -22,6 +22,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -109,6 +110,19 @@ def _redact_token(token: str) -> str:
     if len(token) > 8:
         return token[:4] + "[REDACTED]"
     return "[REDACTED]"
+
+
+def _parse_timesync_offset(val: str) -> float | None:
+    """Parse 'timedatectl timesync-status' Offset value to seconds.
+
+    Examples: '+1.283901s', '-234.5ms', '+12us'
+    Returns None if the string cannot be parsed.
+    """
+    m = re.match(r'^([+-]?\d+\.?\d*)(s|ms|us|ns)$', val.strip())
+    if not m:
+        return None
+    num, unit = float(m.group(1)), m.group(2)
+    return num * {'s': 1.0, 'ms': 1e-3, 'us': 1e-6, 'ns': 1e-9}[unit]
 
 
 def _jwt_expiry(token: str) -> datetime | None:
@@ -327,18 +341,42 @@ class HealthMonitor:
             await self._alert("critical", "storage", "wd_mount_error", str(exc))
 
     async def _check_clock_sync(self) -> None:
+        # Check actual drift from timesync-status rather than the NTPSynchronized
+        # flag. The flag goes 'no' whenever timesyncd restarts (ZimaOS does this
+        # periodically), even if the clock offset is within acceptable bounds.
         try:
             result = subprocess.run(
+                ["timedatectl", "timesync-status"], capture_output=True, text=True, timeout=5
+            )
+            offset_sec: float | None = None
+            for line in result.stdout.splitlines():
+                if line.strip().startswith("Offset:"):
+                    raw = line.split(":", 1)[1].strip()
+                    offset_sec = _parse_timesync_offset(raw)
+                    break
+
+            if offset_sec is not None:
+                if abs(offset_sec) > 2.0:
+                    await self._alert(
+                        "critical", "clock", "clock_drift_high",
+                        f"Clock drift {offset_sec:+.3f}s exceeds 2s threshold",
+                    )
+                else:
+                    self._clear_alert("clock")
+                return
+
+            # timesync-status gave no offset (daemon not yet synced after restart).
+            # Fall back to the boolean flag — only warn once, not every 15s.
+            result2 = subprocess.run(
                 ["timedatectl", "show"], capture_output=True, text=True, timeout=5
             )
-            synced = False
-            for line in result.stdout.splitlines():
-                if line.startswith("NTPSynchronized="):
-                    synced = line.split("=", 1)[1].strip().lower() == "yes"
-                    break
+            synced = any(
+                line.startswith("NTPSynchronized=yes")
+                for line in result2.stdout.splitlines()
+            )
             if not synced:
                 await self._alert("warning", "clock", "clock_not_synced",
-                                  "timedatectl NTPSynchronized=no")
+                                  "NTPSynchronized=no and no offset available (daemon may be starting)")
             else:
                 self._clear_alert("clock")
         except Exception as exc:
