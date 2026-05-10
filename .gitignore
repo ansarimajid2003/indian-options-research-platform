@@ -69,3 +69,6 @@ kimi_plan.md
 
 # Temporary scratch directories
 tmp*/
+
+# Live session data (symlink target on server; local test artefacts on laptop)
+data/live/

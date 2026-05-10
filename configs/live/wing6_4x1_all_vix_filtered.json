@@ -8,6 +8,11 @@
     "short_put_offset": -2,
     "long_put_offset": -8
   },
+  "depth_collection": {
+    "symbols": ["NIFTY", "FINNIFTY", "MIDCPNIFTY"],
+    "atm_offset_range": 20,
+    "max_depth_connections": 5
+  },
   "global": {
     "entry_time": "09:20",
     "exit_time": "15:20",

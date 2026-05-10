@@ -5,7 +5,7 @@ Checks:
   1. Token decode: read expiry from JWT payload without printing the token.
   2. REST /optionchain/expirylist: confirm status=success for NIFTY.
   3. Live-feed websocket: connect and send one IDX_I/NIFTY subscription.
-  4. 20-depth websocket: connect and send one IDX_I/NIFTY subscription.
+  4. 20-depth websocket: connect and send one valid NSE_FNO option subscription.
 
 Prints PASS/FAIL lines only. Never prints the token or client-id.
 
@@ -25,7 +25,8 @@ import time as _time
 import requests
 import websockets
 
-_OPTION_CHAIN_URL = "https://api.dhan.co/v2/optionchain/expirylist"
+_EXPIRY_LIST_URL = "https://api.dhan.co/v2/optionchain/expirylist"
+_OPTION_CHAIN_URL = "https://api.dhan.co/v2/optionchain"
 _LIVE_FEED_URL_TMPL = (
     "wss://api-feed.dhan.co"
     "?version=2&token={token}&clientId={client_id}&authType=2"
@@ -70,7 +71,7 @@ def check_token(token: str, client_id: str) -> bool:
 def check_rest(token: str, client_id: str) -> bool:
     try:
         resp = requests.post(
-            _OPTION_CHAIN_URL,
+            _EXPIRY_LIST_URL,
             json={"UnderlyingScrip": _NIFTY_SCRIP, "UnderlyingSeg": _NIFTY_SEGMENT},
             headers={"access-token": token, "client-id": client_id},
             timeout=10,
@@ -89,6 +90,62 @@ def check_rest(token: str, client_id: str) -> bool:
     except Exception as exc:
         print(f"FAIL  rest_optchain : {exc}")
         return False
+
+
+def _find_nifty_option_security_id(token: str, client_id: str) -> str:
+    headers = {
+        "access-token": token,
+        "client-id": client_id,
+        "Content-Type": "application/json",
+    }
+    exp_resp = requests.post(
+        _EXPIRY_LIST_URL,
+        json={"UnderlyingScrip": _NIFTY_SCRIP, "UnderlyingSeg": _NIFTY_SEGMENT},
+        headers=headers,
+        timeout=10,
+    )
+    exp_resp.raise_for_status()
+    expiries = exp_resp.json().get("data", [])
+    if not expiries:
+        raise RuntimeError("no NIFTY expiries returned")
+    _time.sleep(3.1)
+    chain_resp = requests.post(
+        _OPTION_CHAIN_URL,
+        json={
+            "UnderlyingScrip": _NIFTY_SCRIP,
+            "UnderlyingSeg": _NIFTY_SEGMENT,
+            "Expiry": expiries[0],
+        },
+        headers=headers,
+        timeout=10,
+    )
+    chain_resp.raise_for_status()
+    raw = chain_resp.json().get("data", {})
+    if isinstance(raw, dict):
+        oc = raw.get("oc", {})
+        spot = float(raw.get("last_price", 0) or 0)
+        if isinstance(oc, dict) and oc:
+            pairs = sorted(
+                oc.items(),
+                key=lambda kv: abs(float(kv[0]) - spot) if spot else float(kv[0]),
+            )
+            for _strike, pair in pairs:
+                ce = (pair or {}).get("ce", {})
+                sid = ce.get("security_id")
+                if sid:
+                    return str(sid)
+                pe = (pair or {}).get("pe", {})
+                sid = pe.get("security_id")
+                if sid:
+                    return str(sid)
+    if isinstance(raw, list):
+        for row in raw:
+            for side_key in ("CallOption", "PutOption"):
+                opt = row.get(side_key, {}) if isinstance(row, dict) else {}
+                sid = opt.get("SecurityId")
+                if sid:
+                    return str(sid)
+    raise RuntimeError("could not find option security_id in option chain")
 
 
 async def check_live_feed(token: str, client_id: str) -> bool:
@@ -117,14 +174,15 @@ async def check_live_feed(token: str, client_id: str) -> bool:
 
 async def check_depth(token: str, client_id: str) -> bool:
     url = _DEPTH_URL_TMPL.format(token=token, client_id=client_id)
-    sub = {
-        "RequestCode": 23,
-        "InstrumentCount": 1,
-        "InstrumentList": [
-            {"ExchangeSegment": _NIFTY_SEGMENT, "SecurityId": str(_NIFTY_SCRIP)}
-        ],
-    }
     try:
+        option_sid = await asyncio.to_thread(_find_nifty_option_security_id, token, client_id)
+        sub = {
+            "RequestCode": 23,
+            "InstrumentCount": 1,
+            "InstrumentList": [
+                {"ExchangeSegment": "NSE_FNO", "SecurityId": option_sid}
+            ],
+        }
         async with websockets.connect(url, open_timeout=10, close_timeout=5) as ws:
             await ws.send(json.dumps(sub))
             try:

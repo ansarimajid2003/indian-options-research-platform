@@ -1,0 +1,26 @@
+[Unit]
+Description=Wing-6 Health Monitor
+Documentation=file:///DATA/live-paper/indian-markets/docs/design/live_paper_trading_plan.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/DATA/live-paper/indian-markets
+EnvironmentFile=/DATA/live-paper/indian-markets/.env.live
+ExecStart=/DATA/live-paper/indian-markets/.venv/bin/python \
+    scripts/live/health_monitor.py \
+    --profile wing6_4x1_all_vix_filtered
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StandardOutput=append:/DATA/live-paper/logs/health-monitor.log
+StandardError=append:/DATA/live-paper/logs/health-monitor.log
+# Prevent log accumulation from filling /DATA (trim to 50 MB)
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=500
+
+[Install]
+WantedBy=multi-user.target

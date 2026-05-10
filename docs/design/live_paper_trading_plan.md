@@ -184,20 +184,60 @@ Official behavior used by this plan:
 
 | Endpoint | Purpose | Required headers | Rate limit |
 |---|---|---|---|
-| `POST /optionchain/expirylist` | Fetch active expiries for an underlying | `access-token`, `client-id` | one unique request every 3 seconds |
-| `POST /optionchain` | Fetch full chain for an underlying + expiry | `access-token`, `client-id` | one unique request every 3 seconds |
+| `POST /v2/optionchain/expirylist` | Fetch active expiries for an underlying | `access-token`, `client-id` | one unique request every 3 seconds |
+| `POST /v2/optionchain` | Fetch full chain for an underlying + expiry | `access-token`, `client-id` | one unique request every 3 seconds |
 
-Request body shape:
+> **v1 vs v2:** Use the `/v2/` prefix. `/v1/optionchain/expirylist` returns HTML, not JSON. Confirmed in Phase 1 connectivity test.
+
+Request body shape (expirylist):
+
+```json
+{ "UnderlyingScrip": 13, "UnderlyingSeg": "IDX_I" }
+```
+
+Response (`expirylist`): `{"data": ["2026-05-12", "2026-05-19", ...]}` — flat list of `YYYY-MM-DD` strings.
+
+Request body shape (chain):
+
+```json
+{ "UnderlyingScrip": 13, "UnderlyingSeg": "IDX_I", "Expiry": "2026-05-12" }
+```
+
+Response (`optionchain`) — current live v2 shape verified on `zimaos` 2026-05-10:
 
 ```json
 {
-  "UnderlyingScrip": 13,
-  "UnderlyingSeg": "IDX_I"
+  "data": {
+    "last_price": 24176.15,
+    "oc": {
+      "24200.000000": {
+        "ce": {
+          "security_id": 49081,
+          "last_price": 146.60,
+          "top_bid_price": 146.65,
+          "top_ask_price": 147.20,
+          "top_bid_quantity": 1820,
+          "top_ask_quantity": 910,
+          "volume": 52000,
+          "oi": 7455955,
+          "implied_volatility": 16.36,
+          "greeks": { "delta": 0.52, "gamma": 0.002, "theta": -8.5, "vega": 18.2 }
+        },
+        "pe": { "security_id": 49082, "last_price": 136.00 }
+      }
+    }
+  },
+  "status": "success"
 }
 ```
 
-Option chain provides top bid/ask, OI, volume, LTP, IV, Greeks, and option `security_id`.
-It is the required security-id discovery layer for live collection.
+`security_id` is an integer in the response; convert to `str` before using as websocket subscription key.
+The live resolver accepts this documented lower-case `data.oc.{strike}.ce/pe` shape and also keeps a
+defensive parser for older flat `CallOption` / `PutOption` responses.
+
+Option chain provides top bid/ask, OI, volume, LTP, IV, Greeks, and option `SecurityId`.
+It is the required security-id discovery layer for live collection. Greeks (Delta, Gamma, Theta, Vega)
+are stored alongside entry fills for post-month spread and risk analysis.
 
 ### 3.2 Live Market Feed
 
@@ -216,10 +256,63 @@ Rules:
 | Subscribe batch size | 100 instruments per JSON message |
 | Server ping | every 10 seconds |
 | Disconnect if silent | about 40 seconds |
-| Response format | binary packets |
+| Response format | binary packets (little-endian) |
+
+**Subscription request codes (v2):**
+
+| Code | Mode | Use in this project |
+|---:|---|---|
+| 15 | Ticker | LTP only — not used (too sparse) |
+| 17 | Quote | OHLC + volume — not used (no OI, no depth) |
+| 21 | Full | OHLC + volume + OI + 5-level depth — **use this** |
+
+Always subscribe with `RequestCode: 21` (Full) for all instruments. This gives OHLC, volume, OI,
+and the top 5 bid/ask levels in one binary packet — enough for SENSEX top-of-book fills.
+
+**Exchange segment strings for subscriptions:**
+
+| String | Numeric | Instruments |
+|---|---:|---|
+| `IDX_I` | 0 | Index spot (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX, VIX) |
+| `NSE_FNO` | 2 | NSE futures and options |
+| `BSE_FNO` | 8 | BSE futures and options (SENSEX options) |
+
+SENSEX spot uses `IDX_I` (scrip_id=51). SENSEX options use `BSE_FNO`. This distinction matters
+for the live-feed subscription: subscribe the SENSEX index via `IDX_I` for LTP and the SENSEX
+options via `BSE_FNO` for top-of-book fills.
+
+**Binary response packet types (all little-endian):**
+
+All packets start with a 1-byte packet type, 2-byte message length, 1-byte exchange segment, then 4-byte security_id.
+
+| Type (byte 0) | Name | Size | Key fields |
+|---:|---|---:|---|
+| 2 | Ticker | 16 B | LTP (float32), LTT epoch-s (uint32) |
+| 3 | MarketDepth (5-level) | 112 B | LTP + 5 levels: `<IIHHff>` each (bid_qty, ask_qty, bid_ord, ask_ord, bid_price, ask_price) |
+| 4 | Quote | 50 B | LTP, LTQ, LTT, avg_price, volume, sell_qty, buy_qty, open, close, high, low (all float32/uint32) |
+| 5 | OI | 12 B | open_interest (uint32) |
+| 6 | PrevClose | 16 B | prev_close (float32), prev_oi (uint32) |
+| 8 | Full | 162 B | Quote (50 B) + OI fields + MarketDepth (100 B) — **parse this for OHLC+OI+depth** |
+| 50 | Disconnect | 10 B | disconnect_code (uint16) — see hard failure rules |
+
+All timestamps in live feed packets are EPOCH seconds (`uint32`). Convert with
+`datetime.fromtimestamp(ltt, tz=IST)`. Do NOT treat them as milliseconds.
+
+**Disconnect codes (both live feed and 20-depth):**
+
+| Code | Meaning | Action |
+|---:|---|---|
+| 805 | Active websocket connections exceeded | Fatal — abort day; reduce connection count |
+| 806 | Not subscribed to Data APIs | Fatal — check Dhan plan subscription |
+| 807 | Access token expired | Fatal — abort day; renew token before next session |
+| 808 | Invalid client ID | Fatal — check `DHAN_CLIENT_ID` env var |
+| 809 | Authentication failed | Fatal — abort day; re-check token and client ID |
+
+Codes 805, 807, 808, 809 must not trigger a reconnect. Log the code and abort the day.
+Code 806 is also fatal. Any other disconnect (network drop, server restart) is retryable.
 
 Use this feed for spot index LTP, VIX, SENSEX top-of-book support, and fallback quote
-information. If top-of-book is needed from this feed, use `Full` mode where available.
+information.
 
 ### 3.3 20-Level Full Market Depth
 
@@ -233,29 +326,58 @@ Hard constraints:
 
 | Rule | Value |
 |---|---|
-| Scope | NSE Equity and NSE Derivatives only |
-| Instruments per connection | 50 |
+| Scope | NSE Equity (`NSE_EQ`) and NSE Derivatives (`NSE_FNO`) only — BSE instruments excluded |
+| Instruments per connection | 50 (subscribe in batches of 50) |
 | Subscribe request code | 23 |
-| Response format | binary packets |
-| Header size | 12 bytes |
-| Level size | 16 bytes |
-| Bid packet code | 41 |
-| Ask packet code | 51 |
-| Levels | 20 bid levels and 20 ask levels, sent separately |
+| Response format | binary packets (little-endian) |
+| Packet size | 332 bytes (12 header + 20 × 16 levels) |
+| Bid packet feed code | 41 |
+| Ask packet feed code | 51 |
+| Disconnect packet feed code | 50 (same disconnect codes 805–809 as live feed) |
+| Levels | 20 bid levels and 20 ask levels, sent as separate packets |
 
-SENSEX/BSE options are not eligible for Dhan 20-depth. SENSEX paper fills must use
-top-of-book from option-chain/live-feed until a separate BSE depth source is proven.
+**Exact binary format (verified against DhanHQ-py SDK source):**
+
+Header (12 bytes, struct `<hBBiI`):
+
+| Offset | Type | Field |
+|---:|---|---|
+| 0 | int16 | `msg_len` — message length |
+| 2 | uint8 | `feed_code` — 41=bid, 51=ask, 50=disconnect |
+| 3 | uint8 | `exch_seg` — exchange segment numeric code |
+| 4 | int32 | `security_id` — Dhan security ID (same as from option chain `SecurityId`) |
+| 8 | uint32 | `reserved` (NoofRows field; 20 for 20-depth) |
+
+Each level (16 bytes, struct `<dII`):
+
+| Offset | Type | Field |
+|---:|---|---|
+| 0 | **float64** | `price` — **double, not float32** |
+| 8 | uint32 | `quantity` |
+| 12 | uint32 | `orders` |
+
+Prices in the 20-depth feed are float64 (8 bytes). Prices in the live feed are float32 (4 bytes).
+Do not interchange the two struct formats.
+
+Subscription ExchangeSegment for NSE options must be `"NSE_FNO"`, not `"IDX_I"`.
+
+SENSEX/BSE options are not eligible for Dhan 20-depth (BSE instruments excluded).
+SENSEX paper fills must use top-of-book from the live-feed Full packet (type 8, 5-level depth)
+until a separate BSE depth source is proven.
 
 ### 3.4 Connection Budget
 
 | Feed | Endpoint | Instruments | Connections |
 |---|---|---:|---:|
 | Quote/full feed | `wss://api-feed.dhan.co` | spot indices, VIX, active options, SENSEX top-of-book support | 1 |
-| 20-depth NSE options | `wss://depth-api-feed.dhan.co/twentydepth` | 102 NSE option contracts | 3 |
-| Reserved diagnostic socket | either | emergency only | 1 |
-| Total budget | | | 5 |
+| 20-depth NSE options | `wss://depth-api-feed.dhan.co/twentydepth` | 246 configured major-index NSE option contracts | 5 |
+| Reserved diagnostic socket | either | disabled during full ATM +/- 20 capture | 0 |
+| Depth endpoint budget | | | 5 |
 
-The runner must refuse to start if another process already consumes the Dhan websocket budget.
+The runner must refuse to start if another process already consumes the Dhan websocket budget. During
+full ATM +/- 20 capture, do not open a diagnostic socket. If live-feed and 20-depth sockets prove to
+share one global account-level cap in production, reduce `depth_collection.symbols` to two indices or
+lower `depth_collection.atm_offset_range` for that session.
 
 ---
 
@@ -285,7 +407,7 @@ Fill JSON must include:
 {
   "timestamp": "2026-05-12T09:20:03.412+05:30",
   "symbol": "NIFTY",
-  "security_id": "12345",
+  "security_id": "49081",
   "side": "BUY",
   "quantity": 65,
   "price": 125.40,
@@ -296,9 +418,15 @@ Fill JSON must include:
   "fill_basis": "top_ask",
   "spread_pct": 0.72,
   "quote_age_ms": 742,
-  "depth_available_qty": 1800
+  "depth_available_qty": 1800,
+  "greeks": { "delta": 0.52, "gamma": 0.002, "theta": -8.5, "vega": 18.2 },
+  "iv": 12.5
 }
 ```
+
+`greeks` and `iv` are populated from the option chain snapshot fetched at 09:15 (pre-entry discovery).
+They are diagnostics only — they do not affect fill pricing or paper PnL calculations.
+`security_id` matches the integer `SecurityId` from the Dhan option chain response, stored as a string.
 
 ---
 
@@ -311,7 +439,7 @@ scripts/live/run_paper_trading.py
   |
   +-- scripts/live/collect_order_book.py
   |     |
-  |     +-- Dhan 20-depth WS x 3
+  |     +-- Dhan 20-depth WS x 5
   |     +-- writes raw depth packets + normalized parquet
   |     +-- updates DepthCache
   |
@@ -355,15 +483,56 @@ class LiveDhanContractResolver:
     def resolve_atm_offset(self, timestamp, offset_steps: int, option_type: OptionType) -> Contract: ...
     def bar_at(self, contract: Contract, timestamp: pd.Timestamp) -> pd.Series | None: ...
     def bars_for(self, contract: Contract) -> pd.DataFrame: ...
+    def update_quote(self, security_id: str, ltp: float, open_: float, high: float,
+                     low: float, volume: int, oi: int, received_at: pd.Timestamp) -> None: ...
 ```
 
 Rules:
 
 - `atm_strike()` uses fresh spot LTP, rounded by `get_instrument_spec(symbol).strike_step`.
-- `resolve_atm_offset()` must resolve through option-chain `security_id`.
+- `resolve_atm_offset()` must resolve through option-chain `security_id` / `SecurityId` (integer in REST response; stored as str internally).
 - `bar_at()` returns latest quote state with `open`, `high`, `low`, `close`, `volume`, and `oi`.
 - `close` means live LTP for compatibility with existing engine code.
 - `bars_for()` returns the rolling intraday quote deque for liquidity diagnostics.
+
+**Live feed binary packet parsing (required for `update_quote` population):**
+
+The paper engine's live feed listener receives binary packets from `wss://api-feed.dhan.co` and
+must call `update_quote()` for each received instrument. Subscribe with `RequestCode: 21` (Full)
+to receive type-8 packets (162 bytes) containing OHLC, volume, OI, and 5-level depth in one frame.
+
+Type-8 Full packet key fields (struct `<BHBIfHIfIIIIIIffff100s`, little-endian):
+
+| Offset | Type | Field |
+|---:|---|---|
+| 0 | uint8 | packet_type = 8 |
+| 1 | uint16 | msg_len |
+| 3 | uint8 | exch_seg |
+| 4 | uint32 | security_id |
+| 8 | float32 | **LTP** |
+| 12 | uint16 | LTQ (last traded qty) |
+| 14 | uint32 | LTT (last traded time — **EPOCH seconds**, not ms) |
+| 18 | float32 | avg_price |
+| 22 | uint32 | **volume** |
+| 26 | uint32 | sell_qty |
+| 30 | uint32 | buy_qty |
+| 34 | uint32 | **OI** |
+| 38 | uint32 | oi_day_high |
+| 42 | uint32 | oi_day_low |
+| 46 | float32 | **open** |
+| 50 | float32 | **close** (previous day close) |
+| 54 | float32 | **high** |
+| 58 | float32 | **low** |
+| 62 | 100 bytes | 5-level depth: 5 × `<IIHHff>` (bid_qty, ask_qty, bid_ord, ask_ord, bid_price, ask_price) |
+
+Timestamps: `ltt` is EPOCH seconds (`uint32`). Convert with `datetime.fromtimestamp(ltt, tz=IST)`.
+Do not treat as milliseconds.
+
+Type-50 (disconnect) packet from the live feed carries a `uint16` disconnect code (bytes 8–9).
+On codes 805, 807, 808, 809 — do not reconnect; abort and log `fatal_ws_disconnect:{code}`.
+
+For SENSEX top-of-book: subscribe the SENSEX index (`scrip_id=51`, `IDX_I`) with Full mode.
+The 5-level depth inside the type-8 packet provides best bid/ask for SENSEX option fill pricing.
 
 Freshness limits:
 
@@ -439,12 +608,12 @@ Purpose: record 20-level bid/ask depth for eligible NSE option contracts and upd
 
 20-depth universe:
 
-| Symbol | Strike step | ATM +/- 8 strikes | CE+PE | Contracts |
+| Symbol | Strike step | ATM +/- 20 strikes | CE+PE | Contracts |
 |---|---:|---:|---:|---:|
-| NIFTY | 50 | 17 | 2 | 34 |
-| FINNIFTY | 50 | 17 | 2 | 34 |
-| MIDCPNIFTY | 25 | 17 | 2 | 34 |
-| Total | | | | 102 |
+| NIFTY | 50 | 41 | 2 | 82 |
+| FINNIFTY | 50 | 41 | 2 | 82 |
+| MIDCPNIFTY | 25 | 41 | 2 | 82 |
+| Total | | | | 246 |
 
 SENSEX is not in this collector.
 
@@ -838,6 +1007,12 @@ state and fires a critical Telegram alert.
 | Engine restarts mid-session without a same-day position checkpoint | Abort restart; do not enter fresh positions; wait for manual intervention |
 | Same-day position checkpoint found on startup | Load checkpoint; enter resume mode; skip entry phase; log `resumed_after_crash=true` |
 | Collector restart creates a data gap > 30 minutes | Write gap sentinel; mark day `data_quality: partial`; exclude from spread/liquidity stats |
+| Disconnect code 805 received on any websocket | Fatal — too many active connections; abort day; do not reconnect |
+| Disconnect code 807 received on any websocket | Fatal — access token expired; abort day; renew token before next session |
+| Disconnect code 808 received on any websocket | Fatal — invalid client ID; abort day; check `DHAN_CLIENT_ID` env var |
+| Disconnect code 809 received on any websocket | Fatal — authentication failed; abort day; re-check token and credentials |
+| Disconnect code 806 received on any websocket | Fatal — API plan not subscribed; abort day; check Dhan account |
+| Any other websocket disconnection (no code, or code not in 805–809) | Retryable — reconnect with `RestartSec=45` back-off; log `ws_reconnect` |
 
 Every skip must have one of these explicit reason codes. No unclassified skips.
 
@@ -871,29 +1046,30 @@ Do not approve live scale-up from one-month Sharpe.
 
 ## 9. Implementation Schedule
 
-| Week | Dates | Work |
-|---|---|---|
-| Week 1 | May 12-16 | `dhan_connection_check.py`, locked profile config, `DepthCache`, live security-id discovery |
-| Week 2 | May 19-23 | `live_resolver.py`, `collect_order_book.py`, packet parsing, raw/normalized writes |
-| Week 3 | May 26-30 | `paper_engine.py`, JSON-to-ledger adapter, replay/dry-run verification |
-| Week 4 | Jun 2-6 | First full live paper sessions; monitor gaps and fill anomalies |
-| Post-run | Jun 9+ | Fill validation report and deployment readiness verdict |
+| Phase | Dates | Work | Status |
+|---|---|---|---|
+| Phase 1 | May 12-16 | `dhan_connection_check.py`, locked profile config, `DepthCache`, live security-id discovery | ✓ Done May 2026 |
+| Phase 2 | May 19-23 | `live_resolver.py`, `collect_order_book.py`, packet parsing, raw/normalized writes | ✓ Done May 2026 |
+| Phase 3 | May 26-30 | `paper_engine.py`, `run_paper_trading.py`, `health_monitor.py`, `paper_json_to_ledger.py`, `renew_token.py` | ✓ Done May 2026 |
+| Phase 4 | Jun 2-6 | First full live paper sessions; monitor gaps and fill anomalies | In progress |
+| Post-run | Jun 9+ | Fill validation report and deployment readiness verdict | Pending |
 
 ---
 
 ## 10. Files To Create
 
-| File | Purpose |
-|---|---|
-| `configs/live/wing6_4x1_all_vix_filtered.json` | Locked profile config |
-| `scripts/live/dhan_connection_check.py` | Redacted REST + websocket smoke test |
-| `options_backtest/live_resolver.py` | Live quote/contract resolver |
-| `options_backtest/depth_cache.py` | Shared bid/ask/depth cache and executable VWAP logic |
-| `options_backtest/paper_engine.py` | Live paper trading engine |
-| `scripts/live/collect_order_book.py` | NSE 20-depth recorder |
-| `scripts/live/run_paper_trading.py` | Daily runner |
-| `scripts/live/health_monitor.py` | Independent uptime/data-integrity monitor with Telegram alerts |
-| `scripts/live/paper_json_to_ledger.py` | Adapter from paper JSON to reports-compatible ledger |
+| File | Purpose | Status |
+|---|---|---|
+| `configs/live/wing6_4x1_all_vix_filtered.json` | Locked profile config | ✓ Done |
+| `scripts/live/dhan_connection_check.py` | Redacted REST + websocket smoke test | ✓ Done |
+| `options_backtest/live_resolver.py` | Live quote/contract resolver | ✓ Done |
+| `options_backtest/depth_cache.py` | Shared bid/ask/depth cache and executable VWAP logic | ✓ Done |
+| `options_backtest/paper_engine.py` | Live paper trading engine | ✓ Done |
+| `scripts/live/collect_order_book.py` | NSE 20-depth recorder | ✓ Done |
+| `scripts/live/run_paper_trading.py` | Daily runner with auto token renewal | ✓ Done |
+| `scripts/live/health_monitor.py` | Independent uptime/data-integrity monitor with Telegram alerts | ✓ Done |
+| `scripts/live/paper_json_to_ledger.py` | Adapter from paper JSON to reports-compatible ledger | ✓ Done |
+| `scripts/live/renew_token.py` | Headless daily token renewal via PIN + TOTP | ✓ Done |
 
 Files with zero intended behavior changes:
 
@@ -908,7 +1084,82 @@ If one of those files must change, implementation pauses for a focused review.
 
 ---
 
-## 11. Server Deployment Layout
+## 11. Daily Token Renewal
+
+Dhan access tokens expire daily. The live paper stack must not require manual token renewal
+before each market session.
+
+### 11.1 Mechanism
+
+Token renewal is fully headless — no browser, no OAuth redirect. The flow:
+
+```
+POST https://auth.dhan.co/app/generateAccessToken
+  ?dhanClientId=<client_id>
+  &pin=<6-digit login PIN>
+  &totp=<current 6-digit TOTP from authenticator secret>
+→ {"accessToken": "eyJ...", "expiryTime": "..."}
+```
+
+TOTP is generated from `DHAN_TOTP_SECRET` using `pyotp.TOTP(secret).now()`.
+Three TOTP window offsets (0s, +30s, −30s) are tried to survive clock drift and
+window-boundary errors, which are a known intermittent Dhan API issue.
+
+### 11.2 `scripts/live/renew_token.py`
+
+```bash
+# Renew and write to .env.live
+python scripts/live/renew_token.py
+
+# Check current token expiry (no HTTP call)
+python scripts/live/renew_token.py --check
+
+# Print current TOTP code only (no HTTP call)
+python scripts/live/renew_token.py --dry-run
+```
+
+Required env vars for renewal:
+
+| Var | Value |
+|---|---|
+| `DHAN_CLIENT_ID` | `1111444766` |
+| `DHAN_PIN` | 6-digit Dhan login PIN |
+| `DHAN_TOTP_SECRET` | base32 TOTP secret from Dhan 2FA enrollment |
+
+`DHAN_API_KEY` and `DHAN_API_SECRET` (present in `.env.live`) are used only by the
+consent-based OAuth flow and are NOT needed for headless PIN+TOTP renewal.
+
+### 11.3 Auto-renewal in `run_paper_trading.py`
+
+On every startup, `run_paper_trading.py` calls `_ensure_fresh_token()` which:
+
+1. Decodes the JWT expiry of the current `DHAN_ACCESS_TOKEN`.
+2. If remaining validity < 2 hours (or token is expired), renews via PIN+TOTP.
+3. Writes the new token to `.env.live` (merge-safe — only replaces the
+   `DHAN_ACCESS_TOKEN=` line, preserving all other vars).
+4. Uses the fresh token for the day's session.
+
+If `DHAN_PIN` or `DHAN_TOTP_SECRET` are absent, a warning is logged and the
+existing token is used as-is.
+
+### 11.4 Recommended Daily Cron (zimaos)
+
+Run renewal once at 08:30 IST — before the 08:55 heartbeat start — so the token
+is always fresh for the health monitor and paper engine:
+
+```bash
+# /etc/cron.d/dhan-token-renewal  (on zimaos)
+30 8 * * 1-5  root  cd /DATA/live-paper/indian-markets && \
+  source .env.live && \
+  .venv/bin/python scripts/live/renew_token.py >> /DATA/live-paper/renewal.log 2>&1
+```
+
+The auto-renewal in `run_paper_trading.py` is a fallback for days when the cron
+did not run. Running both is redundant but harmless.
+
+---
+
+## 12. Server Deployment Layout
 
 The deployment target is `zimaos`. The laptop is not part of the market-hours critical path.
 
@@ -963,14 +1214,14 @@ Server preflight must verify:
 
 ---
 
-## 12. Web Dashboard
+## 13. Web Dashboard
 
 A single-page Streamlit dashboard provides real-time visibility into the server-side live paper run.
 It is read-only: no orders are placed, no Dhan websocket is opened, and no engine state is
 modified. The dashboard is useful for monitoring, but the collector and paper engine must continue
 normally if the dashboard is closed or the laptop disconnects.
 
-### 12.1 Technology Choice
+### 13.1 Technology Choice
 
 | Layer | Choice | Rationale |
 |---|---|---|
@@ -983,7 +1234,7 @@ normally if the dashboard is closed or the laptop disconnects.
 
 No new JavaScript build step, no npm, no React/Vue. The dashboard is launched as a standard Python script.
 
-### 12.2 Dashboard Layout
+### 13.2 Dashboard Layout
 
 Version 1 is a live-ops dashboard only. Historical exploration and broad backtest comparison are
 deferred until the server runner has survived full market sessions.
@@ -1006,7 +1257,7 @@ Purpose: monitor the current session as it runs.
 - WD free space and last successful flush time
 - Open P&L (gross and net, today)
 - Quote freshness (% of watched instruments with age < 5 s)
-- Depth readiness (% of 102 NSE depth channels ready)
+- Depth readiness (% of 246 configured major-index NSE depth channels ready)
 
 **Main panels:**
 - **Open Positions table**: symbol, expiry, strikes (CE/PE short/long), entry time, entry premium, current mark, current spread, unrealised gross/net PnL, quote age per leg.
@@ -1081,7 +1332,7 @@ Data sources:
 - `data/live/reports/{YYYYMMDD}_paper_summary.json` (canonical machine-readable summary)
 - `data/live/paper_trades/*.json` (converted to ledger format on the fly)
 
-### 12.3 Dashboard Bridge (`options_backtest/dashboard_bridge.py`)
+### 13.3 Dashboard Bridge (`options_backtest/dashboard_bridge.py`)
 
 The bridge enforces a strict read-only boundary between the dashboard and live engine state.
 
@@ -1107,14 +1358,14 @@ Rules:
 - Snapshot writers must write `*.tmp`, flush, then atomically rename to `latest_*.json`.
 - All timestamps are rendered in IST (`Asia/Kolkata`).
 
-### 12.4 Files To Create
+### 13.4 Files To Create
 
 | File | Purpose |
 |---|---|
 | `scripts/live/dashboard.py` | Streamlit entry point; page layout, widgets, and chart rendering |
 | `options_backtest/dashboard_bridge.py` | Read-only data accessors; isolates Streamlit from engine internals |
 
-### 12.5 Launch Commands
+### 13.5 Launch Commands
 
 ```bash
 # On zimaos: live paper trading + order book collector
@@ -1135,7 +1386,7 @@ On `zimaos`, the collector/paper engine and dashboard should be separate managed
 Stopping the dashboard must never affect the collector or paper engine. Laptop disconnection must
 only close the tunnel/browser view.
 
-### 12.6 Security & Safety
+### 13.6 Security & Safety
 
 - Dashboard is read-only. No broker API calls, no token storage, no order placement.
 - Bind Streamlit to `127.0.0.1` by default and access it through SSH tunneling.
@@ -1145,7 +1396,7 @@ only close the tunnel/browser view.
 
 ---
 
-## 13. Implementation Checklist
+## 14. Implementation Checklist
 
 Step-by-step build and deployment tracker. Work left of the dashed line in each phase before starting the next.
 
@@ -1212,65 +1463,75 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 
 ---
 
-### Phase 3 — Depth Cache and Live Resolver (Week 2, May 19–23)
+### Phase 3 — Depth Cache and Live Resolver (Week 2, May 19–23) ✓ DONE 2026-05-10
 
-- [ ] Write `options_backtest/depth_cache.py` (Section 6.2):
-  - [ ] `DepthLevel` dataclass
-  - [ ] `DepthSnapshot` dataclass (bid levels, ask levels, timestamps, `best_bid`, `best_ask`, `spread_pct`)
-  - [ ] `DepthCache` class — thread-safe; separate bid/ask timestamping
-  - [ ] `update_bid_packet()` and `update_ask_packet()` methods
-  - [ ] `snapshot()` returns `None` if either side is missing
-  - [ ] `is_ready()` checks both sides present and within `max_age_seconds`
-  - [ ] `executable_price()` — VWAP walk through ask levels for BUY, bid levels for SELL; returns `None` if cumulative quantity insufficient
-  - [ ] Unit tests: freshness expiry, VWAP calculation, partial-depth skip
-- [ ] Write `options_backtest/live_resolver.py` (Section 6.1):
-  - [ ] `LiveDhanContractResolver` class
-  - [ ] `atm_strike()` — uses fresh spot LTP; rounds by instrument strike step
-  - [ ] `resolve_atm_offset()` — resolves through option-chain `security_id`; raises if stale
-  - [ ] `bar_at()` — returns latest quote as `pd.Series` with `open`, `high`, `low`, `close`, `volume`, `oi`; `close` = live LTP
-  - [ ] `bars_for()` — returns rolling intraday quote deque
-  - [ ] Freshness limits enforced (spot 5 s, option 5 s, VIX 60 s, depth 5 s)
-  - [ ] Returns `None` / raises `StaleQuoteError` when stale; no fallback to old prices
-- [ ] Write `scripts/live/collect_order_book.py` (Section 6.4):
-  - [ ] Manages 3× `wss://depth-api-feed.dhan.co/twentydepth` connections (≤50 instruments each)
-  - [ ] Subscribes to 102 NSE option contracts (NIFTY 34 + FINNIFTY 34 + MIDCPNIFTY 34)
-  - [ ] Binary packet parser: 12-byte header, 16-byte levels, bid code 41, ask code 51
-  - [ ] Calls `depth_cache.update_bid_packet()` and `update_ask_packet()` on every packet
-  - [ ] Writes raw packets to `data/live/raw_depth_packets/{YYYYMMDD}/`
-  - [ ] Writes normalized parquet (all 67 columns per Section 6.4) to `data/live/order_book/{YYYYMMDD}/`
-  - [ ] Writes 1-min OHLCV aggregates to `data/live/order_book_1min/{YYYYMMDD}/`
-  - [ ] Flushes every 60 seconds
-  - [ ] Writes gap sentinel to JSONL on restart (Section 6.9)
-  - [ ] Logs `collector_backpressure` and marks instruments unusable on write lag
-  - [ ] Aborts startup if `data/live` does not resolve to `/media/WD-Storage/indian-markets-live`
-  - [ ] Aborts startup if WD free space < 100 GB at start of month-long run
+> **Protocol verified against official DhanHQ-py SDK** (github.com/dhan-oss/DhanHQ-py):
+> Header `<hBBiI` (12 bytes): msg_len, feed_code, exch_seg, security_id, reserved.
+> Level `<dII` (16 bytes): price as float64, qty uint32, orders uint32.
+> Option chain response verified live as `data.oc.{strike}.ce/pe` with lower-case keys; parser also accepts legacy flat `CallOption` / `PutOption`.
+> Subscription ExchangeSegment for NSE options: `"NSE_FNO"`.
+
+- [x] Write `options_backtest/depth_cache.py` (Section 6.2):
+  - [x] `DepthLevel` dataclass
+  - [x] `DepthSnapshot` dataclass (bid levels, ask levels, timestamps, `best_bid`, `best_ask`, `spread_pct`)
+  - [x] `DepthCache` class — thread-safe; separate bid/ask timestamping
+  - [x] `update_bid_packet()` and `update_ask_packet()` methods
+  - [x] `snapshot()` returns `None` if either side is missing
+  - [x] `is_ready()` checks both sides present and within `max_age_seconds`
+  - [x] `executable_price()` — VWAP walk through ask levels for BUY, bid levels for SELL; returns `None` if cumulative quantity insufficient
+  - [x] Inline tests: VWAP, freshness, insufficient-depth → None — all PASS
+- [x] Write `options_backtest/live_resolver.py` (Section 6.1):
+  - [x] `LiveDhanContractResolver` class
+  - [x] `atm_strike()` — uses fresh spot LTP; rounds by instrument strike step
+  - [x] `resolve_atm_offset()` — resolves through option-chain `security_id`; raises if stale
+  - [x] `bar_at()` — returns latest quote as `pd.Series` with `open`, `high`, `low`, `close`, `volume`, `oi`; `close` = live LTP
+  - [x] `bars_for()` — returns rolling intraday quote deque
+  - [x] Freshness limits enforced (spot 5 s, option 5 s, VIX 60 s, depth 5 s)
+  - [x] Returns `None` / raises `StaleQuoteError` when stale; no fallback to old prices
+  - [x] Option chain parser corrected for current `data.oc.{strike}.ce/pe` shape and legacy `CallOption`/`PutOption`
+  - [x] Expiry list parser handles flat list (v2) and `{Expirylist:[...]}` (legacy) defensively
+- [x] Write `scripts/live/collect_order_book.py` (Section 6.4):
+  - [x] Manages up to 5× `wss://depth-api-feed.dhan.co/twentydepth` connections (≤50 instruments each)
+  - [x] Subscribes to NSE option contracts (NIFTY + FINNIFTY + MIDCPNIFTY) with `ExchangeSegment="NSE_FNO"`
+  - [x] Binary packet parser: exact `<hBBiI` header + `<dII` levels; bid=41, ask=51 — verified against SDK
+  - [x] Calls `depth_cache.update_bid_packet()` and `update_ask_packet()` on every packet
+  - [x] Writes raw packets to `data/live/raw_depth_packets/{YYYYMMDD}/`
+  - [x] Writes normalized parquet (all 67 columns per Section 6.4) to `data/live/order_book/{YYYYMMDD}/`
+  - [x] Writes 1-min OHLCV aggregates to `data/live/order_book_1min/{YYYYMMDD}/`
+  - [x] Flushes every 60 seconds
+  - [x] Writes gap sentinel to JSONL on restart (Section 6.9)
+  - [x] Logs `collector_backpressure` on write lag
+  - [x] Aborts startup if `data/live` does not resolve to `/media/WD-Storage/indian-markets-live`
+  - [x] Aborts startup if WD free space < 100 GB at start of month-long run
+- [x] Write `scripts/live/sample_option_chain.py` — one-shot REST snapshot for all 4 symbols; run from zimaos to verify live data and exact JSON field names
 
 ---
 
-### Phase 4 — Paper Engine and Runner (Week 3, May 26–30)
+### Phase 4 — Paper Engine and Runner (Week 3, May 26–30) ✓ CODE COMPLETE 2026-05-10
 
-- [ ] Write `options_backtest/paper_engine.py` — `PaperTradingEngine` (Section 6.3):
-  - [ ] Daily flow: connect → preflight → security-id discovery → VIX/DTE/bucket filter → entry at 09:20 → monitoring → time exit at 15:20 → stale deadline 15:25 → EOD flush
-  - [ ] Entry: evaluates all four symbols; logs skip with explicit reason code for each filter miss
-  - [ ] Fill: uses `depth_cache.executable_price()` for VWAP fill; falls back to `top_executable_price`; stores both `mark_mid` and executable fields
-  - [ ] Position checkpoint: writes `latest_open_positions.tmp` → flush → `os.rename()` to `latest_open_positions.json` after every fill
-  - [ ] Resume detection: loads same-day checkpoint on startup; skips entry phase if open positions found
-  - [ ] Forced stale exit: if quote still stale at 15:25, marks `forced_stale_exit=true`
-  - [ ] No stop-loss, no target, no DTE=0 exits allowed for this profile
-  - [ ] Fill JSON has all fields from Section 4 schema
-  - [ ] Outputs: `data/live/paper_trades/{YYYYMMDD}.json`, `data/live/logs/{YYYYMMDD}.log`
-- [ ] Write `scripts/live/paper_json_to_ledger.py` (Section 10):
-  - [ ] Reads `{YYYYMMDD}.json` → converts to `reports`-compatible ledger format
-  - [ ] Passes through `reports.summary()` and `reports.daily_pnl()` without modifying engine internals
-  - [ ] Outputs: `data/live/reports/{YYYYMMDD}_paper_summary.md` and `_paper_summary.json`
-- [ ] Write `scripts/live/run_paper_trading.py` — single entry point (Section 6.5):
-  - [ ] Holiday check via `calendar.is_trading_day(today)`
-  - [ ] Loads locked profile from `configs/live/wing6_4x1_all_vix_filtered.json`
-  - [ ] Initialises `DepthCache`, starts `collect_order_book` and `paper_trading_engine` via `asyncio.gather`
-  - [ ] Calls `generate_eod_report()` after market close
-  - [ ] Hard failure rules from Section 7 all enforced
-  - [ ] Preflight: WD mount check, `data/live` symlink check, clock sync check, public IP check, websocket budget check, Telegram test alert, external heartbeat test, health monitor running check
-- [ ] Dry-run test on `zimaos` (no market hours): run the full startup sequence and verify each preflight gate fires correctly on a simulated failure
+- [x] Write `options_backtest/paper_engine.py` — `PaperTradingEngine` (Section 6.3):
+  - [x] Daily flow: connect → preflight → security-id discovery → VIX/DTE/bucket filter → entry at 09:20 → monitoring → time exit at 15:20 → stale deadline 15:25 → EOD flush
+  - [x] Entry: evaluates all four symbols; logs skip with explicit reason code for each filter miss
+  - [x] Fill: uses `depth_cache.executable_price()` for VWAP fill; falls back to `top_executable_price`; stores both `mark_mid` and executable fields
+  - [x] Position checkpoint: writes `latest_open_positions.tmp` → flush/fsync → atomic rename to `latest_open_positions.json` after every fill
+  - [x] Resume detection: loads same-day checkpoint on startup; skips entry phase if open positions found
+  - [x] Forced stale exit: if quote still stale at 15:25, marks `forced_stale_exit=true`
+  - [x] No stop-loss, no target, no DTE=0 exits allowed for this profile
+  - [x] Fill JSON has all fields from Section 4 schema
+  - [x] Outputs: `data/live/paper_trades/{YYYYMMDD}.json`, `data/live/logs/{YYYYMMDD}.log`
+- [x] Write `scripts/live/paper_json_to_ledger.py` (Section 10):
+  - [x] Reads `{YYYYMMDD}.json` → converts to `reports`-compatible ledger format
+  - [x] Passes through `reports.summary()` and `reports.daily_pnl()` without modifying engine internals
+  - [x] Outputs: `data/live/reports/{YYYYMMDD}_paper_summary.md`, `_paper_summary.json`, and `_paper_ledger.csv`
+- [x] Write `scripts/live/run_paper_trading.py` — single entry point (Section 6.5):
+  - [x] Holiday check via `calendar.is_trading_day(today)`; `--dry-run` allowed on non-trading days
+  - [x] Loads locked profile from `configs/live/wing6_4x1_all_vix_filtered.json`
+  - [x] Initialises `DepthCache`, starts collector and paper engine as coordinated tasks, and cancels collector cleanly after EOD
+  - [x] Calls the paper JSON → ledger/report adapter after market close
+  - [x] Fixes live-feed URL formatting and prevents collector hang after engine completion
+  - [ ] Remaining preflight hardening: public IP whitelist comparison, websocket-budget probe, Telegram test alert, external heartbeat test, and strict health-monitor gating
+- [x] Dry-run test on `zimaos` (no market hours): `run_paper_trading.py --dry-run` completed on 2026-05-10
+- [ ] Simulated preflight failure tests remain before first live session
 
 ---
 
@@ -1401,7 +1662,7 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 - [ ] **Session 1 market open** (09:00–09:20):
   - [ ] `live-paper.service` starts; "backend healthy at market open" Telegram message received
   - [ ] `dashboard.py` reachable from laptop via SSH tunnel
-  - [ ] Depth health tile shows >= 95% of 102 NSE channels ready by 09:15
+  - [ ] Depth health tile shows >= 95% of 246 configured NSE channels ready by 09:15
   - [ ] Option-chain security-id discovery completes for all active symbols by 09:17
   - [ ] VIX quote is fresh and passes/fails NIFTY filter correctly
 - [ ] **Session 1 entry** (09:20):
@@ -1463,7 +1724,7 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 
 ---
 
-## 14. Verification Checklist
+## 15. Verification Checklist
 
 - [ ] `dhan_connection_check.py` passes REST `optionchain/expirylist`.
 - [ ] `dhan_connection_check.py` opens live-feed websocket and survives a small subscription.

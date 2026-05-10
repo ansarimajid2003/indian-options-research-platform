@@ -1,0 +1,7 @@
+# /etc/cron.d/dhan-token-renewal
+# Renew Dhan access token at 08:30 IST Mon-Fri, before the 08:55 heartbeat start.
+# Reads DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET from .env.live.
+# Logs to /DATA/live-paper/renewal.log (on the SSD, not WD drive).
+SHELL=/bin/bash
+MAILTO=""
+30 8 * * 1-5 root bash -c 'cd /DATA/live-paper/indian-markets && set -a && . .env.live && set +a && .venv/bin/python scripts/live/renew_token.py >> /DATA/live-paper/renewal.log 2>&1'
