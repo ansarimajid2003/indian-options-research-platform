@@ -45,7 +45,7 @@ _log = logging.getLogger(__name__)
 _CRITICAL_INTERVAL = 15.0   # seconds
 _SLOW_INTERVAL = 60.0       # seconds
 _HEARTBEAT_INTERVAL_MARKET = 60.0
-_HEARTBEAT_INTERVAL_OFF = 300.0
+_HEARTBEAT_INTERVAL_OFF = 90.0  # must be < HC grace period (3 min); was 300s which caused false down/up alerts
 
 # Alert throttle: (severity, component, reason) -> last_sent_epoch
 _ALERT_THROTTLE: dict[tuple, float] = {}
@@ -413,8 +413,13 @@ class HealthMonitor:
             await self._alert("critical", "token", "token_expired",
                               "DHAN_ACCESS_TOKEN has expired")
         elif remaining < 7200:  # < 2 hours
-            await self._alert("warning", "token", "token_expiring_soon",
-                              f"DHAN_ACCESS_TOKEN expires in {remaining / 60:.0f} minutes")
+            # Only warn in the pre-market window (07:30–09:30 IST). At other times
+            # the 08:30 cron will renew the token before market open, so overnight
+            # warnings are noise.
+            t = _ist_time()
+            if time(7, 30) <= t <= time(9, 30):
+                await self._alert("warning", "token", "token_expiring_soon",
+                                  f"DHAN_ACCESS_TOKEN expires in {remaining / 60:.0f} minutes")
         else:
             self._clear_alert("token")
 
