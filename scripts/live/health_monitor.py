@@ -36,6 +36,8 @@ _repo_root = Path(__file__).parents[2]
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
+from options_backtest.calendar import is_trading_day as _is_trading_day
+
 _IST = ZoneInfo("Asia/Kolkata")
 _log = logging.getLogger(__name__)
 
@@ -68,6 +70,8 @@ def _ist_time() -> time:
 
 
 def _is_market_hours() -> bool:
+    if not _is_trading_day(date.today()):
+        return False
     t = _ist_time()
     return _MARKET_OPEN <= t <= _MARKET_CLOSE
 
@@ -78,6 +82,8 @@ def _is_heartbeat_hours() -> bool:
 
 
 def _is_feed_active() -> bool:
+    if not _is_trading_day(date.today()):
+        return False
     t = _ist_time()
     return _FEED_ACTIVE_START <= t <= _FEED_ACTIVE_END
 
@@ -181,10 +187,10 @@ class HealthMonitor:
             except ImportError:
                 _log.warning("health_monitor: sentry_sdk not installed — skipping")
 
-        await self._send_telegram(f"Health monitor online for {date.today()}", severity="info")
-
         async with aiohttp.ClientSession() as session:
             self._session = session
+
+            await self._send_telegram(f"Health monitor online for {date.today()}", severity="info")
 
             # Send /start to Healthchecks.io
             if self._hc_url:
