@@ -12,6 +12,40 @@ Phase: defined-risk short-vol deployment → live monitoring / scaling.
 - Data: Shoonya 1-min OHLCV (primary), Dhan rolling ATM JSON (2021–2026, cross-check + IV), NSE Bhavcopy EOD (2008–2026)
 - Tests: `tests/`, `unittest` only — no pytest
 
+## Web Dashboard
+
+Live read-only monitoring dashboard — deployed and running on zimaos.
+
+**Access (from laptop):**
+```
+ssh -L 9000:127.0.0.1:8000 zimaos   # keep this terminal open
+# then open http://localhost:9000/ in browser
+```
+Port 8000 is occupied locally, so forward to local 9000.
+
+**Services on zimaos (auto-start on boot):**
+- `dashboard-api.service` — FastAPI/uvicorn on `127.0.0.1:8000`, `LIVE_ROOT=/media/WD-Storage/indian-markets-live`
+- `health-monitor.service` — writes alert/storage snapshots every ~60 s off-hours, every ~30 s during market hours
+
+**Restart if needed:**
+```
+ssh zimaos "systemctl restart dashboard-api health-monitor"
+```
+
+**Architecture (brief):**
+| Layer | Detail |
+|---|---|
+| Backend | `scripts/live/api/main.py` — FastAPI; routes in `scripts/live/api/routes/live.py` |
+| Data bridge | `options_backtest/dashboard_bridge.py` — TTL-cached file reader (3 s live, 5 s trades, 60 s hist); never opens Dhan sockets |
+| Frontend | `dashboard/` — CDN React 18 + Babel (no build step); files load in order: tweaks-panel → components → data → panels → app |
+| Transport | REST on mount + `WS /ws/live` push every 1 s (market hours) / 5 s (off-hours) |
+| Spot charts | `GET /api/live/spot/{NIFTY\|FINNIFTY\|MIDCPNIFTY\|SENSEX}` — last N sessions from `data/processed/spot/*.csv` |
+| Alerts | Full day history from `$LIVE_ROOT/alerts/YYYYMMDD_alerts.jsonl`; Telegram alerts written there by health monitor |
+
+When market is closed: spot charts show last session data ("LAST SESSION" badge), option chain shows "MARKET CLOSED" overlay, storage/alert panels show live real values from WD drive.
+
+**Full design spec:** `docs/design/live_paper_trading_plan.md` § 13 (Web Dashboard).
+
 ## Engine Reference
 
 **Before touching any engine code or writing strategies, read `ENGINE_ARCHITECTURE.md` first.**
@@ -75,7 +109,8 @@ Break-even move: ~₹1/unit. All pre-2026 backtests are **invalid** until re-run
 3. ~~**Short-vol contributor validation**~~ ✓ Done May 2026.
 4. ~~**Structure upgrade**~~ ✓ Done May 2026 — Wing-6 IC validated: defined-risk iron condor across NIFTY/FINNIFTY/MIDCPNIFTY. Primary 1:2:2 lots, Sharpe 2.454, MaxDD -1.0%, t-stat 4.798.
 5. ~~**SENSEX integration**~~ ✓ Done May 2026 — SENSEX added to engine (calendar.py, cli.py), Dhan data backfilled (May 2023–May 2026, 84 parquet files, 19M bars). Wing-6 IC DTE<=2 filter: Sharpe 3.69, t-stat 5.62, 141 trades. Expanded portfolio (N:F:M:S 1:1:1:1): Sharpe 2.746, t-stat 5.30.
-6. **Live deployment prep** — broker integration, order sizing, daily signal generation.
+6. ~~**Web dashboard**~~ ✓ Done May 2026 — FastAPI backend + CDN React frontend deployed on zimaos; real spot charts (4 indices), alert timeline, storage health, equity curve, positions panel. Access via SSH tunnel to `127.0.0.1:8000`. See § Web Dashboard above.
+7. **Live deployment prep** — broker integration, order sizing, daily signal generation.
 6. **OOS monitoring** — track top performers monthly; pause variant if OOS Sharpe < 1.5 for two consecutive months.
 7. **Data validation** — cross-check Shoonya vs Dhan, confirm MIDCPNIFTY/BANKNIFTY/FINNIFTY spot CSV coverage post-2024.
 8. **ML layer** — only after 3+ years clean OOS; turnover-regularized model with DTE/moneyness/IV/volume/OI.

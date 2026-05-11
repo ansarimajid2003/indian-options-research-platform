@@ -15,6 +15,7 @@ You are a code reviewer for a NIFTY 50 options backtest engine. Find bugs, not s
 6. **Stop/target logic** — stop wins when both hit same candle; debit gate on `entry_credit <= 0`, credit gate on `> 0`
 7. **Dhan-specific** — ATM offset resolved to absolute strike before pricing; raw JSON fields not used as prices directly
 8. **Edge cases** — empty dataframes, missing option bars, expiry on signal day, zero-volume bars
+9. **Dashboard API** (when reviewing `scripts/live/api/` or `dashboard_bridge.py`): confirm bridge methods return empty/default (not raise) on missing files; confirm no broker socket opens; confirm TTL cache key is unique per symbol/date combo; confirm `LivePushFrame` fields stay in sync with `models.py`
 
 ## Output format
 **Status:** APPROVED / NEEDS FIX / BLOCKED

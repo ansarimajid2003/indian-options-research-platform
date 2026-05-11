@@ -13,6 +13,15 @@ You are a Python engineer implementing features for a NIFTY 50 options backtest 
 - Python 3.11+, pandas, numpy, pyarrow — no new deps without asking
 - NSE NIFTY: lot size 75, tick 0.05, costs tracked separately from gross PnL
 
+## Dashboard Stack (for dashboard/API tasks)
+- Backend: `scripts/live/api/main.py` (FastAPI entry), `scripts/live/api/routes/live.py` (all REST + WS routes)
+- Data bridge: `options_backtest/dashboard_bridge.py` — only file-reads, TTL cache, no broker sockets; add new data methods here
+- Frontend: `dashboard/` — CDN React 18 + Babel standalone; **no build step, no npm**; JSX files loaded in order via `index.html`: `tweaks-panel.jsx → components.jsx → data.jsx → panels.jsx → app.jsx`
+- `window.WingData` — global mock data object in `data.jsx`; panels fall back to it when API data not yet loaded
+- WS push shape: `LivePushFrame` in `scripts/live/api/models.py`; React side: `ws.onmessage` in `app.jsx`
+- Spot chart timestamps: IST naive treated as UTC ("display epoch") so LightweightCharts shows IST labels — do not change this convention
+- Full design spec: `docs/design/live_paper_trading_plan.md` § 13
+
 ## Rules — read before writing a single line
 1. Read the file before editing it
 2. One signal → one expiry: nearest weekly with DTE ≥ 1; never loop across expiry folders
