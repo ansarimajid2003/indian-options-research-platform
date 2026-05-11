@@ -1223,156 +1223,205 @@ Server preflight must verify:
 
 ## 13. Web Dashboard
 
-A single-page Streamlit dashboard provides real-time visibility into the server-side live paper run.
-It is read-only: no orders are placed, no Dhan websocket is opened, and no engine state is
-modified. The dashboard is useful for monitoring, but the collector and paper engine must continue
-normally if the dashboard is closed or the laptop disconnects.
+A multi-tab web dashboard provides real-time visibility into the live paper run plus historical
+data exploration and backtest comparison. It is read-only: no orders are placed, no Dhan websocket
+is opened, and no engine state is modified. The collector and paper engine must continue normally
+if the dashboard is closed or the laptop disconnects.
 
 ### 13.1 Technology Choice
 
 | Layer | Choice | Rationale |
 |---|---|---|
-| Framework | Streamlit | Pure Python; no separate JS build; native pandas/plotly support; fits the project's manual-dependency workflow |
-| Data bridge | `options_backtest/dashboard_bridge.py` | Isolates Streamlit from live websocket threads; reads only flushed files and snapshot exports |
+| Backend API | FastAPI (Python, async) | Stays in the project's Python stack; native async/WebSocket support; Pydantic response models double as the React frontend contract; `uvicorn` runs as a lightweight server process |
+| Data bridge | `options_backtest/dashboard_bridge.py` | Isolates the API from live engine threads; reads only flushed snapshot files; TTL-cached so every API call doesn't re-read disk |
+| Financial charts | TradingView Lightweight Charts (open source) | TradingView-quality OHLC charts — candlestick, line, histogram, crosshair sync across panes; handles millions of bars with level-of-detail decimation |
+| Option chain / data grids | AG Grid (free Community tier) | Industry-standard virtualised grid; renders 500+ strike rows at 60 fps; sortable, filterable columns; same grid Kotak Neo uses |
+| UI framework | React + Tailwind CSS + shadcn/ui | Dark-theme financial design; full layout control (no Streamlit grid constraints); Claude Design owns this layer |
+| Real-time transport | FastAPI WebSocket → browser | True push (~10 ms latency) instead of 5 s poll; depth cache can stream ticks directly |
 | Storage root | `/media/WD-Storage/indian-markets-live` | Keeps large live artifacts on the WD hard drive rather than SSD/root |
-| Alerts | `scripts/live/health_monitor.py` + Telegram | Pushes backend failures to the user even when the laptop/dashboard is offline |
+| Alerts | `scripts/live/health_monitor.py` + Telegram | Pushes backend failures to user's phone even when the laptop/dashboard is offline |
 | Server-down monitor | External Healthchecks.io heartbeat | Alerts when `zimaos` itself stops sending heartbeats |
-| Caching | `st.cache_data` + short TTL | Live snapshots refreshed every 5-10 s; no high-frequency tick rendering |
 
-No new JavaScript build step, no npm, no React/Vue. The dashboard is launched as a standard Python script.
+**Why not Streamlit:** Streamlit re-runs the entire Python script on every user interaction (wrong execution model for a trading dashboard), has no native WebSocket push, cannot produce TradingView-quality charts without a custom component, and cannot render the Kotak Neo-style option chain grid (calls \| strikes \| puts, ITM colour coding, Greeks columns) with its native table widget.
+
+**Implementation split:**
+- Phase 7a (this project): FastAPI backend + `dashboard_bridge.py` — all Python; produces clean JSON API and WebSocket contract that Claude Design builds against.
+- Phase 7b (Claude Design): React frontend — TradingView Lightweight Charts, AG Grid, dark theme, full Kotak Neo-style layout.
 
 ### 13.2 Dashboard Layout
 
-Version 1 is a live-ops dashboard only. Historical exploration and broad backtest comparison are
-deferred until the server runner has survived full market sessions.
+The dashboard has three tabs. Tab 1 ships in Phase 7. Tabs 2 and 3 are v2 scope — built only after the server runner has survived full market sessions.
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│  Indian Markets Dashboard — Wing-6 Paper Live Ops             │
-├─────────────────────────────────────────────────────────────┤
-│  [ Live Paper Trading ] [ Server Health ] [ Storage ]        │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  Indian Markets  ·  Wing-6 Live Paper                               │
+├─────────────────────────────────────────────────────────────────────┤
+│  [ Live Monitor ]  [ Historical Explorer ]  [ Backtests ]           │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Tab 1 — Live Paper Trading
+Design reference: Kotak Neo — dark background (`#0d0d0d`), card-based layout, colour-coded P&L (green/red), subtle borders, monospaced numbers.
 
-Purpose: monitor the current session as it runs.
+#### Tab 1 — Live Monitor
 
-**Header tiles (auto-refresh 5 s):**
-- Session date, market status (`PRE_OPEN / OPEN / CLOSED / HOLIDAY`)
-- Server hostname, process status, current public outbound IP
-- WD free space and last successful flush time
-- Open P&L (gross and net, today)
-- Quote freshness (% of watched instruments with age < 5 s)
-- Depth readiness (% of 246 configured major-index NSE depth channels ready)
+Purpose: monitor the current session in real time.
 
-**Main panels:**
-- **Open Positions table**: symbol, expiry, strikes (CE/PE short/long), entry time, entry premium, current mark, current spread, unrealised gross/net PnL, quote age per leg.
-- **Intraday Equity Curve**: live updating line chart of today's cumulative net PnL vs time (09:20–15:20).
-- **Signal Log**: scrollable feed of every skip/entry/exit with timestamp, symbol, reason code, and filter state (VIX, DTE, bucket).
-- **Depth Health**: per-symbol heatmap showing quote age and available depth quantity for each of the four legs.
-- **Storage / Writer Health**: latest raw packet flush, latest parquet flush, backpressure flag,
-  WD free space, and unresolved write errors.
-- **Alert State**: active alerts, last Telegram notification status, alert counts by severity,
-  and recovery timestamps.
+**Header strip (WebSocket push, ~1 s refresh):**
+- Session date + market status badge (`PRE_OPEN` / `OPEN` / `CLOSED` / `HOLIDAY`)
+- Server process status, uptime, public outbound IP
+- WD free space + last flush time
+- Today's gross P&L and net P&L (colour coded)
+- Quote freshness % (instruments with age < 5 s)
+- Depth readiness % (of 246 NSE depth channels)
+
+**Main panels (4-column grid, dark cards):**
+- **Open Positions** (AG Grid): symbol, expiry, short/long CE and PE strikes, entry time, entry premium, current mark, current spread, unrealised gross / net P&L, quote age per leg. Colour rows green/red on P&L sign.
+- **Intraday Equity Curve** (Lightweight Charts area chart): cumulative net P&L vs time, 09:20–15:20 IST. Real-time tick append via WebSocket.
+- **Signal Log** (virtual scrolling list): every skip/entry/exit event — timestamp, symbol, reason code, VIX/DTE/bucket filter state.
+- **Depth Health** (heatmap grid): quote age and available depth quantity for each of the four legs per symbol. Red cell = stale or insufficient.
+- **Storage / Writer Health** (status cards): raw packet flush age, parquet flush age, backpressure flag, WD free space trend.
+- **Alert State** (timeline): active alerts, last Telegram delivery timestamp, alert counts by severity, recovery events.
 
 **Sidebar:**
-- Select profile (`wing6_4x1_all_vix_filtered` locked by default)
-- Refresh interval (5 s / 10 s / 30 s / manual)
+- Profile indicator (locked to `wing6_4x1_all_vix_filtered`)
+- WebSocket connection status indicator
 - Audio alert toggle on `partial_entry_blocked` or `forced_stale_exit`
 
-Data sources:
-- `data/live/paper_trades/{YYYYMMDD}.json` (logical path on WD storage)
-- `DepthCache` snapshot export → `data/live/snapshots/depth_cache_{HHMMSS}.json`
-- Live feed state export → `data/live/snapshots/feed_state_{HHMMSS}.json`
+API data sources (all served by FastAPI):
+- `GET /api/live/session` → session status
+- `GET /api/live/positions` → open positions
+- `GET /api/live/equity-curve` → intraday P&L series
+- `GET /api/live/signal-log` → event log
+- `GET /api/live/depth-health` → per-leg freshness
+- `GET /api/live/storage-health` → writer status
+- `GET /api/live/alerts` → alert state and history
+- `WS /ws/live` → combined real-time push (positions + equity tick + depth health update)
 
-- `data/live/snapshots/latest_alert_state.json`
-- `data/live/alerts/{YYYYMMDD}_alerts.jsonl`
-
-#### Future Tab 2 - Historical Data Explorer
-
-Historical Data Explorer and Backtests are version-2 tabs. They should be built only after the
-server runner is stable for full market sessions, and should read canonical JSON/CSV/parquet
-artifacts rather than parsing markdown reports as primary data.
+#### Tab 2 — Historical Explorer (v2 scope)
 
 Purpose: browse and visualise any archived dataset without writing analysis scripts.
 
-**Sidebar:**
-- Dataset type: `Spot 1-min`, `Dhan Options 1-min`, `Order Book (raw depth)`, `Order Book 1-min`, `Bhavcopy EOD`, `India VIX`
-- Symbol filter: `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `MIDCPNIFTY`, `SENSEX`
-- Date range picker
-- For options: expiry selector, strike selector, CE/PE toggle
-- For order book: depth level slider (1–20), show spread/imbalance toggle
+**Controls (top bar):**
+- Dataset type: `Spot 1-min`, `Dhan Options 1-min`, `Order Book`, `Bhavcopy EOD`, `India VIX`
+- Symbol, date range, expiry, strike, CE/PE (context-sensitive)
+- Depth level slider (1–20) and spread/imbalance overlays for order book data
 
 **Main panels:**
-- **Time-series chart**: OHLC or line, with optional volume/OI overlay. Uses plotly for zoom/pan.
-- **Data table**: paginated view of the underlying DataFrame (first 1,000 rows to keep render fast).
-- **Quick stats**: mean, min, max, std of close, total volume, mean spread, mean imbalance for the selected window.
-- **Download**: CSV export of the current filtered view.
+- **OHLC/line chart** (Lightweight Charts): zoom/pan, volume and OI overlays, crosshair.
+- **Data table** (AG Grid): virtualised, 10,000+ rows at 60 fps, column filters, CSV export.
+- **Quick stats**: mean, min, max, std, total volume, mean spread, mean imbalance.
 
-Data sources:
-- `data/processed/spot/*_1min_*.csv`
-- `data/processed/options/dhan/{symbol}/`
-- `data/live/order_book/` (logical path on WD storage)
-- `data/processed/nse/bhavcopy/fo/`
-- `data/processed/market_archive_cleaned/INDIA VIX_*.csv`
+API data sources:
+- `GET /api/historical/spot/{symbol}?start=&end=`
+- `GET /api/historical/options/{symbol}/{expiry}/{strike}/{opt_type}`
+- `GET /api/historical/order-book/{date}/{symbol}/{expiry}/{strike}/{opt_type}`
+- `GET /api/historical/bhavcopy/{symbol}?start=&end=`
+- `GET /api/historical/vix?start=&end=`
 
-#### Future Tab 3 - Backtests
+#### Tab 3 — Backtests (v2 scope)
 
 Purpose: compare backtest results, inspect trade ledgers, and validate live paper sessions against historical runs.
 
-**Sidebar:**
-- Backtest directory: `reports/backtests/` or `data/live/reports/`
-- Select one or more backtest JSON/ledger files (multi-select)
-- Filter: symbol, date range, strategy
+**Controls (sidebar):**
+- Multi-select backtest JSON/ledger files from `reports/backtests/` or `data/live/reports/`
+- Symbol, date range, strategy filters
 
 **Main panels:**
-- **Metrics comparison table**: Trades, Net PnL, CAGR, Sharpe, Sortino, Calmar, MaxDD, Win%, PF, t-stat. One row per selected backtest.
-- **Equity-curve overlay**: normalised equity curves for all selected backtests on the same axis.
-- **Trade distribution**: histogram of per-trade net PnL; optional symbol facet.
-- **Underwater / drawdown chart**: peak-to-trough drawdown over time.
-- **Monthly returns heatmap**: rows = years, columns = months, cells = net return %.
-- **Trade ledger drill-down**: click a backtest row to expand a sortable/filterable trade table (entry/exit date, symbol, strikes, gross, charges, net, reason).
+- **Metrics comparison table** (AG Grid): Trades, Net PnL, CAGR, Sharpe, Sortino, Calmar, MaxDD, Win%, PF, t-stat. One row per selected backtest.
+- **Equity-curve overlay** (Lightweight Charts): normalised cumulative curves on the same axis.
+- **Trade P&L distribution** (histogram): per-trade net PnL, optional symbol facet.
+- **Drawdown chart** (Lightweight Charts): peak-to-trough over time.
+- **Monthly returns heatmap**: rows = years, columns = months, colour-coded return %.
+- **Trade ledger drill-down** (AG Grid): click a backtest row → expandable sortable/filterable trade table.
 
-Data sources:
-- `reports/backtests/*.json` (engine summary + ledger)
-- `data/live/reports/{YYYYMMDD}_paper_summary.json` (canonical machine-readable summary)
-- `data/live/paper_trades/*.json` (converted to ledger format on the fly)
+API data sources:
+- `GET /api/backtests` → list of available backtest summaries
+- `GET /api/backtests/{id}` → full ledger for one backtest
+- `GET /api/backtests/{id}/equity-curve`
 
 ### 13.3 Dashboard Bridge (`options_backtest/dashboard_bridge.py`)
 
-The bridge enforces a strict read-only boundary between the dashboard and live engine state.
+The bridge enforces a strict read-only boundary between the FastAPI layer and the live engine state. It owns all file I/O and TTL caching; the API routes call bridge methods and return Pydantic models.
 
 ```python
 class DashboardBridge:
-    def live_paper_ledger(self, session_date: date) -> pd.DataFrame: ...
-    def depth_health_snapshot(self) -> pd.DataFrame: ...
-    def feed_health_snapshot(self) -> pd.DataFrame: ...
-    def process_health_snapshot(self) -> dict: ...
-    def alert_state(self) -> dict: ...
-    def alert_history(self, session_date: date) -> pd.DataFrame: ...
-    def signal_log(self, session_date: date) -> pd.DataFrame: ...
-    def backtest_summaries(self, root: Path) -> pd.DataFrame: ...
+    # --- Live monitor ---
+    def get_session_status(self) -> SessionStatus: ...          # process health + market status
+    def get_open_positions(self) -> list[PositionRow]: ...      # from latest_open_positions.json
+    def get_equity_curve(self, session_date: date) -> list[EquityPoint]: ...  # from paper_trades JSON
+    def get_signal_log(self, session_date: date) -> list[SignalLogEntry]: ... # from paper_trades JSON
+    def get_depth_health(self) -> list[DepthHealthRow]: ...     # from latest_depth_cache.json
+    def get_storage_health(self) -> StorageHealth: ...          # file mtime checks + WD free space
+    def get_alert_state(self) -> AlertState: ...                # from latest_alert_state.json
+    def get_alert_history(self, session_date: date) -> list[AlertEntry]: ...  # from alerts JSONL
+
+    # --- Historical (v2) ---
     def historical_spot(self, symbol: str, start: date, end: date) -> pd.DataFrame: ...
     def historical_options(self, symbol: str, expiry: date, strike: int, opt_type: str) -> pd.DataFrame: ...
     def historical_order_book(self, session_date: date, symbol: str, expiry: date, strike: int, opt_type: str) -> pd.DataFrame: ...
+    def historical_vix(self, start: date, end: date) -> pd.DataFrame: ...
+
+    # --- Backtests (v2) ---
+    def backtest_summaries(self, root: Path) -> list[BacktestSummary]: ...
+    def backtest_ledger(self, backtest_id: str) -> pd.DataFrame: ...
+    def backtest_equity_curve(self, backtest_id: str) -> list[EquityPoint]: ...
 ```
 
 Rules:
+- All methods are synchronous; FastAPI wraps them with `run_in_executor` for the async endpoints.
 - Live methods poll the filesystem; they never hold websocket connections.
-- File reads use `pd.read_json(..., lines=True)` or `pd.read_parquet` with `columns=` projection to minimise I/O.
-- If a live file is locked by the writer, the bridge retries once after 100 ms and returns the last known good snapshot rather than crashing the dashboard.
-- Snapshot writers must write `*.tmp`, flush, then atomically rename to `latest_*.json`.
-- All timestamps are rendered in IST (`Asia/Kolkata`).
+- File reads use `pd.read_parquet(..., columns=[...])` projection to minimise I/O on large parquet files.
+- Each data source has its own TTL cache (live snapshots: 3 s; paper trades JSON: 5 s; historical parquet: 60 s).
+- If a live file is locked by the writer (OSError/PermissionError on Windows, or mtime unchanged mid-write on Linux), the bridge retries once after 100 ms and returns the last known good snapshot rather than crashing the API.
+- All timestamps are returned as ISO-8601 strings in IST (`Asia/Kolkata`) for JSON serialisation.
+- Returns empty/default objects (never raises) when files are missing — dashboard renders "waiting for data" state rather than 500 errors.
 
-### 13.4 Files To Create
+### 13.4 FastAPI Application (`scripts/live/api/`)
 
-| File | Purpose |
-|---|---|
-| `scripts/live/dashboard.py` | Streamlit entry point; page layout, widgets, and chart rendering |
-| `options_backtest/dashboard_bridge.py` | Read-only data accessors; isolates Streamlit from engine internals |
+```text
+scripts/live/api/
+    __init__.py
+    main.py          # FastAPI app, CORS, lifespan, static file mount for React build
+    models.py        # All Pydantic response models — this is the React contract
+    routes/
+        live.py      # /api/live/* REST + /ws/live WebSocket
+        historical.py  # /api/historical/* (v2 scope, stubbed)
+        backtests.py   # /api/backtests/* (v2 scope, stubbed)
+```
 
-### 13.5 Launch Commands
+**WebSocket push protocol (`/ws/live`):**
+
+The server sends a JSON frame every second during market hours and every 5 s otherwise:
+
+```json
+{
+  "ts": "2026-06-03T09:21:05.412+05:30",
+  "session": { ... },
+  "positions": [ ... ],
+  "equity_tick": { "ts": "...", "net_pnl": 1240.50 },
+  "depth_health": [ ... ],
+  "storage_health": { ... },
+  "alerts": { ... }
+}
+```
+
+The React client appends `equity_tick` to its local series (no full re-fetch on every tick).
+
+### 13.5 Files To Create
+
+| File | Purpose | Phase |
+|---|---|---|
+| `options_backtest/dashboard_bridge.py` | Read-only data accessors with TTL cache; isolates API from engine internals | 7a |
+| `scripts/live/api/__init__.py` | Package marker | 7a |
+| `scripts/live/api/main.py` | FastAPI app; CORS; lifespan; mounts static React build at `/` | 7a |
+| `scripts/live/api/models.py` | All Pydantic response models — the React frontend contract | 7a |
+| `scripts/live/api/routes/live.py` | `/api/live/*` REST endpoints + `/ws/live` WebSocket | 7a |
+| `scripts/live/api/routes/historical.py` | `/api/historical/*` endpoints (stubbed, v2) | 7a |
+| `scripts/live/api/routes/backtests.py` | `/api/backtests/*` endpoints (stubbed, v2) | 7a |
+| `scripts/live/systemd/dashboard-api.service` | systemd unit for FastAPI server on zimaos | 7a |
+| `dashboard/` | React app (Vite + Tailwind + shadcn/ui + LightweightCharts + AG Grid) | 7b |
+
+### 13.6 Launch Commands
 
 ```bash
 # On zimaos: live paper trading + order book collector
@@ -1382,24 +1431,26 @@ cd /DATA/live-paper/indian-markets
 # On zimaos: independent health monitor and Telegram alerts
 .venv/bin/python scripts/live/health_monitor.py --profile wing6_4x1_all_vix_filtered
 
-# On zimaos: dashboard bound to localhost only
-.venv/bin/streamlit run scripts/live/dashboard.py --server.port 8501 --server.address 127.0.0.1
+# On zimaos: dashboard API (FastAPI + uvicorn), bound to localhost only
+.venv/bin/uvicorn scripts.live.api.main:app --host 127.0.0.1 --port 8000
 
-# On laptop: view dashboard through SSH tunnel
-ssh -L 8501:127.0.0.1:8501 zimaos
+# On laptop: access API and React dev server through SSH tunnel
+ssh -L 8000:127.0.0.1:8000 zimaos
+
+# React dev server (laptop, during Phase 7b development)
+cd dashboard && npm run dev   # proxies /api/* and /ws/* to localhost:8000
 ```
 
-On `zimaos`, the collector/paper engine and dashboard should be separate managed processes.
-Stopping the dashboard must never affect the collector or paper engine. Laptop disconnection must
-only close the tunnel/browser view.
+On `zimaos`, the API process is a separate systemd-managed process. Stopping the dashboard API must never affect the collector or paper engine. The React build (`dashboard/dist/`) is served as static files by the FastAPI app — no separate web server needed in production.
 
-### 13.6 Security & Safety
+### 13.7 Security & Safety
 
-- Dashboard is read-only. No broker API calls, no token storage, no order placement.
-- Bind Streamlit to `127.0.0.1` by default and access it through SSH tunneling.
-- If the dashboard is exposed beyond localhost, run it behind a reverse proxy with authentication
-  or a private overlay network; do not expose raw Streamlit to the public internet.
-- Redact token-like strings from any log or snapshot file that the dashboard might display.
+- Dashboard API is read-only. No broker API calls, no token storage, no order placement.
+- Bind `uvicorn` to `127.0.0.1` by default and access through SSH tunneling.
+- CORS is configured to allow only the React dev origin (`localhost:5173`) and the tunnel origin (`localhost:8000`) — never `*`.
+- If the API is exposed beyond localhost, place it behind a reverse proxy (nginx) with HTTP Basic Auth or mTLS; do not expose it directly to the public internet.
+- The bridge redacts token-like strings (regex `[A-Za-z0-9_\-]{100,}`) from any log line or snapshot field before returning it to the API.
+- Python dependencies for Phase 7a: `fastapi`, `uvicorn[standard]`, `websockets` (already installed).
 
 ---
 
@@ -1421,7 +1472,8 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 - [x] Create directory `/DATA/live-paper/` on `zimaos` (not under `/root`)
 - [x] `git clone` repo into `/DATA/live-paper/indian-markets/` — bare remote + working checkout via `git push zimaos main`
 - [x] `python3 -m venv /DATA/live-paper/indian-markets/.venv`
-- [x] Install runtime stack: `pandas` 3.0.2, `numpy` 2.4.4, `pyarrow` 24.0.0, `websockets` 16.0, `requests` 2.33.1, `sentry-sdk` 2.59.0, `streamlit` 1.57.0, `plotly` 6.7.0
+- [x] Install runtime stack: `pandas` 3.0.2, `numpy` 2.4.4, `pyarrow` 24.0.0, `websockets` 16.0, `requests` 2.33.1, `sentry-sdk` 2.59.0
+- [ ] Install dashboard API stack (Phase 7a): `fastapi`, `uvicorn[standard]`
 - [x] Create WD storage layout:
   ```
   /media/WD-Storage/indian-markets-live/{raw_depth_packets,order_book,order_book_1min,paper_trades,reports,logs,snapshots,alerts}/
@@ -1617,24 +1669,56 @@ Validation artifact: `reports/backtests/options/monitoring/20260511_phase6_syste
 
 ---
 
-### Phase 7 — Dashboard
+### Phase 7a — Dashboard Backend + Bridge
 
-- [ ] Write `options_backtest/dashboard_bridge.py` (Section 12.3):
-  - [ ] All 11 public methods implemented
-  - [ ] Live methods poll filesystem; no websocket connections held
-  - [ ] File reads use `columns=` projection
-  - [ ] On file-lock collision: retry once after 100 ms, then return last good snapshot
-  - [ ] All timestamps rendered in IST
-- [ ] Write `scripts/live/dashboard.py` (Section 12.2):
-  - [ ] Tab 1 — Live Paper Trading: header tiles, open positions table, intraday equity curve, signal log, depth health heatmap, storage/writer health, alert state
-  - [ ] Auto-refresh configurable (5 s / 10 s / 30 s / manual)
-  - [ ] Sidebar: profile lock, refresh interval, audio alert toggle
-  - [ ] Binds to `127.0.0.1:8501` by default; does not open any Dhan connection
-  - [ ] Tabs 2 and 3 (Historical Explorer, Backtests) stubbed with "coming in v2" placeholder
-- [ ] Create `systemd` unit or `tmux` session for dashboard on `zimaos`
-- [ ] Test: open SSH tunnel from laptop (`ssh -L 8501:127.0.0.1:8501 zimaos`)
-- [ ] Test: open `http://localhost:8501` on laptop → confirm Tab 1 renders without errors
-- [ ] Test: stop the dashboard → confirm paper engine and collector continue running
+- [ ] Install additional Python deps in `.venv`: `fastapi`, `uvicorn[standard]`
+- [ ] Write `options_backtest/dashboard_bridge.py` (Section 13.3):
+  - [ ] All dataclasses: `SessionStatus`, `PositionRow`, `EquityPoint`, `SignalLogEntry`, `DepthHealthRow`, `StorageHealth`, `AlertState`, `AlertEntry`
+  - [ ] All live methods implemented: `get_session_status`, `get_open_positions`, `get_equity_curve`, `get_signal_log`, `get_depth_health`, `get_storage_health`, `get_alert_state`, `get_alert_history`
+  - [ ] Historical methods stubbed: `historical_spot`, `historical_options`, `historical_order_book`, `historical_vix`
+  - [ ] Backtest methods stubbed: `backtest_summaries`, `backtest_ledger`, `backtest_equity_curve`
+  - [ ] Per-source TTL cache (live snapshots 3 s, paper trades JSON 5 s, historical parquet 60 s)
+  - [ ] Missing file → returns empty/default object, never raises
+  - [ ] File-lock collision → retry once after 100 ms, return last good snapshot
+  - [ ] All timestamps as ISO-8601 IST strings in output dataclasses
+  - [ ] Token-like strings redacted from log/snapshot content before return
+- [ ] Write `scripts/live/api/models.py` (Section 13.4):
+  - [ ] Pydantic models for every response type matching the bridge dataclasses
+  - [ ] WebSocket push frame model (`LivePushFrame`)
+  - [ ] This file is the contract handed to Claude Design for Phase 7b
+- [ ] Write `scripts/live/api/routes/live.py`:
+  - [ ] `GET /api/live/session`
+  - [ ] `GET /api/live/positions`
+  - [ ] `GET /api/live/equity-curve?date=YYYYMMDD`
+  - [ ] `GET /api/live/signal-log?date=YYYYMMDD`
+  - [ ] `GET /api/live/depth-health`
+  - [ ] `GET /api/live/storage-health`
+  - [ ] `GET /api/live/alerts?date=YYYYMMDD`
+  - [ ] `WS /ws/live` — pushes `LivePushFrame` every 1 s (market hours) or 5 s (off-hours)
+- [ ] Write `scripts/live/api/routes/historical.py` — all endpoints return `{"status": "v2_scope_pending"}` stub
+- [ ] Write `scripts/live/api/routes/backtests.py` — all endpoints return `{"status": "v2_scope_pending"}` stub
+- [ ] Write `scripts/live/api/main.py`:
+  - [ ] CORS: allow `localhost:5173` (React dev) and `localhost:8000` (tunnel) only
+  - [ ] Lifespan: instantiate `DashboardBridge` once; inject via `app.state`
+  - [ ] Mount React `dashboard/dist/` as static files at `/` (fallback to `index.html`)
+  - [ ] Include all three route modules
+- [ ] Write `scripts/live/systemd/dashboard-api.service` — `uvicorn` bound to `127.0.0.1:8000`
+- [ ] Smoke test: `uvicorn scripts.live.api.main:app` locally → `curl http://127.0.0.1:8000/api/live/session` returns valid JSON
+- [ ] Smoke test: open WS to `/ws/live` → confirm push frames arrive every second
+- [ ] Test: stop the API → confirm paper engine and collector continue running unaffected
+
+### Phase 7b — Dashboard Frontend (Claude Design handoff)
+
+Handoff deliverables from Phase 7a: `scripts/live/api/models.py` (full Pydantic contract) + sample JSON responses for every endpoint + `scripts/live/api/main.py` (working FastAPI app).
+
+- [ ] Scaffold `dashboard/` with Vite + React + TypeScript + Tailwind CSS + shadcn/ui
+- [ ] Install TradingView Lightweight Charts and AG Grid Community
+- [ ] Tab 1 — Live Monitor: all panels from Section 13.2 implemented and connected to live API + WebSocket
+- [ ] Tab 2 — Historical Explorer: connected to `/api/historical/*` (activates when Phase 7a historical methods are implemented)
+- [ ] Tab 3 — Backtests: connected to `/api/backtests/*` (activates when Phase 7a backtest methods are implemented)
+- [ ] Build: `npm run build` → `dashboard/dist/`; confirm FastAPI serves it correctly
+- [ ] Test: open SSH tunnel → `http://localhost:8000` renders full dashboard without console errors
+- [ ] Test: stop the dashboard → confirm paper engine and health monitor continue running
 
 ---
 
@@ -1758,7 +1842,11 @@ Validation artifact: `reports/backtests/options/monitoring/20260511_phase6_syste
 - [ ] Data gap sentinel appears in JSONL when `collect_order_book.py` is restarted mid-session.
 - [ ] EOD summary includes `resumed_after_crash: true` and gap window when resume mode was used.
 - [x] systemd `Restart=on-failure` confirmed for both `live-paper.service` and `health-monitor.service`.
-- [ ] Dashboard is accessed from the laptop via SSH tunnel and Streamlit binds to `127.0.0.1`.
+- [ ] Dashboard API (`uvicorn`) binds to `127.0.0.1:8000` on `zimaos`; accessed from laptop via SSH tunnel.
+- [ ] `GET /api/live/session` returns valid JSON when paper engine is running.
+- [ ] `WS /ws/live` delivers push frames on the correct interval (1 s market hours, 5 s off-hours).
+- [ ] React build served correctly from FastAPI static mount at `/`.
+- [ ] Stopping the dashboard API does not affect the paper engine or health monitor.
 - [ ] No access token appears in git diff, logs, markdown, JSON, or parquet metadata.
 - [ ] Locked profile config matches Section 2 exactly.
 - [ ] `live_resolver.atm_strike()` matches independent live ATM check at 09:25.
