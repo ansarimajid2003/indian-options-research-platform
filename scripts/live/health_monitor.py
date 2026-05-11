@@ -41,6 +41,9 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from options_backtest.calendar import is_trading_day as _is_trading_day
+from scripts.live.renew_token import renew_token as _do_renew_token, write_token_file as _write_token_file
+
+_DEFAULT_TOKEN_FILE = _repo_root / ".env.live"
 
 _IST = ZoneInfo("Asia/Kolkata")
 _log = logging.getLogger(__name__)
@@ -262,6 +265,9 @@ class HealthMonitor:
         self._heartbeat_failed_for: date | None = None
         self._last_external_heartbeat_at: str | None = None
         self._last_external_heartbeat_status: str = "not_sent"
+        self._token_renewed_for: date | None = None
+        self._token_renewal_attempts_today: int = 0
+        self._token_renewal_last_attempt_mono: float | None = None
 
     async def run(self) -> None:
         self._ensure_dirs()
@@ -333,6 +339,9 @@ class HealthMonitor:
         }
         self._started_monotonic = _time.monotonic()
         self._log_scan_offset = 0
+        self._token_renewed_for = None
+        self._token_renewal_attempts_today = 0
+        self._token_renewal_last_attempt_mono = None
 
     async def _critical_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -398,6 +407,7 @@ class HealthMonitor:
             await self._check_wd_free_space_slow()
             if sys.platform != "win32" and self._expected_ip:
                 await self._check_public_ip()
+            await self._maybe_renew_token()
             await self._check_token_expiry()
             await self._check_error_log()
             self._write_alert_state()
@@ -763,8 +773,63 @@ class HealthMonitor:
             await self._alert("warning", "network", "public_ip_check_failed", str(exc))
             return False
 
+    async def _maybe_renew_token(self) -> None:
+        """Renew the Dhan access token at midnight. Two attempts; alert after both fail."""
+        # Only run in the 15-minute window right after midnight.
+        if not (time(0, 0) <= _ist_time() < time(0, 15)):
+            return
+        if self._token_renewed_for == self._session_date:
+            return
+        # Both attempts already exhausted — waiting for manual intervention.
+        if self._token_renewal_attempts_today >= 2:
+            return
+        # Enforce 5-minute gap between attempt 1 and attempt 2.
+        now_mono = _time.monotonic()
+        if self._token_renewal_last_attempt_mono is not None:
+            if now_mono - self._token_renewal_last_attempt_mono < 300.0:
+                return
+        # Already valid for the full session — nothing to do.
+        if self._access_token:
+            exp = _jwt_expiry(self._access_token)
+            eod_buffer = datetime.combine(self._session_date, _EOD_BUFFER_END, tzinfo=_IST)
+            if exp is not None and exp >= eod_buffer:
+                self._token_renewed_for = self._session_date
+                return
+        client_id = os.environ.get("DHAN_CLIENT_ID", "")
+        pin = os.environ.get("DHAN_PIN", "")
+        totp_secret = os.environ.get("DHAN_TOTP_SECRET", "")
+        if not all([client_id, pin, totp_secret]):
+            return  # Creds not configured — _check_token_expiry will alert at preflight
+        self._token_renewal_attempts_today += 1
+        self._token_renewal_last_attempt_mono = now_mono
+        attempt = self._token_renewal_attempts_today
+        _log.info("renewing Dhan access token (attempt %d/2)", attempt)
+        try:
+            token, expiry = await asyncio.to_thread(_do_renew_token, client_id, pin, totp_secret)
+            self._access_token = token
+            token_file_path = Path(os.environ.get("DHAN_TOKEN_FILE", str(_DEFAULT_TOKEN_FILE)))
+            _write_token_file(token, expiry, token_file_path)
+            self._token_renewed_for = self._session_date
+            await self._clear_alert("token", "token_expires_before_eod")
+            await self._clear_alert("token", "token_expiring_soon")
+            await self._clear_alert("token", "token_renewal_failed")
+            await self._send_telegram(f"Dhan token renewed — valid until {expiry}", severity="info")
+            _log.info("token renewed successfully, expiry=%s", expiry)
+        except Exception as exc:
+            _log.error("token renewal attempt %d failed: %r", attempt, exc)
+            if attempt >= 2:
+                await self._alert(
+                    "critical", "token", "token_renewal_failed",
+                    f"Dhan token renewal failed after 2 attempts — manual intervention required: {exc!s:.100}",
+                )
+
     async def _check_token_expiry(self) -> bool | None:
         if not self._access_token:
+            return None
+        # Token staleness overnight is expected — only check from preflight window onward.
+        if _ist_time() < _HEARTBEAT_START:
+            await self._clear_alert("token", "token_expires_before_eod")
+            await self._clear_alert("token", "token_expiring_soon")
             return None
         exp = _jwt_expiry(self._access_token)
         if exp is None:
