@@ -327,8 +327,27 @@ def _write_depth_cache_snapshot(
     security_ids: list[str],
 ) -> None:
     summary = depth_cache.readiness_summary(security_ids, max_age_seconds=5)
+    now = _now_ist()
+
+    # Per-security top-of-book (best bid/ask + qty + age)
+    tob_rows: dict[str, dict] = {}
+    for sid in depth_cache.tracked_ids():
+        snap = depth_cache.snapshot(sid)
+        if snap is None:
+            continue
+        bid_age_ms = int((now - snap.bid_ts).total_seconds() * 1000)
+        ask_age_ms = int((now - snap.ask_ts).total_seconds() * 1000)
+        tob_rows[sid] = {
+            "bid": snap.best_bid,
+            "ask": snap.best_ask,
+            "bid_qty": snap.total_bid_qty,
+            "ask_qty": snap.total_ask_qty,
+            "bid_age_ms": bid_age_ms,
+            "ask_age_ms": ask_age_ms,
+        }
+
     payload = {
-        "written_at": _now_ist().isoformat(),
+        "written_at": now.isoformat(),
         "session_date": date_str,
         "pid": os.getpid(),
         "configured_security_ids": len(security_ids),
@@ -336,6 +355,7 @@ def _write_depth_cache_snapshot(
         "ready": int(summary["ready"]),
         "total": int(summary["total"]),
         "ready_pct": round(float(summary["ready_pct"]), 2),
+        "tob": tob_rows,
     }
     _write_atomic_json(live_root / "snapshots" / "latest_depth_cache.json", payload)
 

@@ -394,6 +394,34 @@ class LiveDhanContractResolver:
             out[sid] = {"greeks": entry.greeks, "iv": entry.iv}
         return out
 
+    def instrument_map(self) -> dict[str, dict]:
+        """Return {security_id: {strike, option_type, expiry}} for all tracked instruments."""
+        with self._chain_lock:
+            entries = list(self._id_to_contract.items())
+        return {
+            sid: {
+                "strike": entry.strike,
+                "option_type": entry.option_type.value if hasattr(entry.option_type, "value") else str(entry.option_type),
+                "expiry": entry.expiry.isoformat() if hasattr(entry.expiry, "isoformat") else str(entry.expiry),
+                "ticker": entry.ticker,
+            }
+            for sid, entry in entries
+        }
+
+    def quote_snapshot(self) -> dict[str, dict]:
+        """Return {security_id: {ltp, oi, volume, received_at_iso}} for all cached quotes."""
+        with self._quote_lock:
+            entries = list(self._quote_cache.items())
+        out = {}
+        for sid, q in entries:
+            out[sid] = {
+                "ltp": q.ltp,
+                "oi": q.oi,
+                "volume": q.volume,
+                "ts": q.received_at.isoformat() if q.received_at is not None else None,
+            }
+        return out
+
     def bar_at(self, contract: Contract, timestamp: pd.Timestamp) -> pd.Series | None:
         """Return latest quote as a Series compatible with engine bar format.
 

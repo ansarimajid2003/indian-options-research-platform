@@ -1,13 +1,6 @@
 // App shell — wired to /ws/live and /api/live/* endpoints
-// Falls back to mock data + simulation when the API server is offline
 
-const {
-  fmtINR, fmtNum, fmtPct, ist,
-  INITIAL_POSITIONS, generateEquitySeed,
-  SIGNAL_LOG_SEED, DEPTH_HEALTH_SEED, ALERTS_SEED,
-  generateFrame, computePnL,
-  generateSpotSeed, generateOptionChain,
-} = window.WingData;
+const { fmtINR, fmtNum, fmtPct, ist, computePnL } = window.WingData;
 
 // ── Adapters: API model → UI shape ──────────────────────────────────────
 
@@ -36,16 +29,15 @@ function adaptPosition(apiPos) {
     long_pe_premium:  lPe.price   || 0,
     current_mark:  apiPos.current_mark ?? apiPos.entry_credit,
     leg_ages: [
-      sCe.quote_age_ms ?? 500,
-      lCe.quote_age_ms ?? 500,
-      sPe.quote_age_ms ?? 500,
-      lPe.quote_age_ms ?? 500,
+      sCe.quote_age_ms ?? null,
+      lCe.quote_age_ms ?? null,
+      sPe.quote_age_ms ?? null,
+      lPe.quote_age_ms ?? null,
     ],
   };
 }
 
 function adaptEquityPoint(apiEq) {
-  // ts is ISO-8601 IST; LightweightCharts needs unix epoch seconds
   const ms = new Date(apiEq.ts).getTime();
   return {
     time: Math.floor(ms / 1000),
@@ -54,7 +46,6 @@ function adaptEquityPoint(apiEq) {
   };
 }
 
-// Extract "HH:MM:SS" from any ISO-8601 or "HH:MM:SS" string
 function _timeOnly(ts) {
   if (!ts) return '—';
   const m = ts.match(/T?(\d{2}:\d{2}:\d{2})/);
@@ -64,12 +55,11 @@ function _timeOnly(ts) {
 function adaptAlert(apiAlert) {
   const timeStr = _timeOnly(apiAlert.ts);
   return {
-    ts:          timeStr,
-    severity:    apiAlert.severity,
-    component:   apiAlert.component,
-    message:     apiAlert.message,
-    delivery:    'sent',
-    delivery_ts: timeStr,
+    ts:        timeStr,
+    severity:  apiAlert.severity,
+    component: apiAlert.component,
+    reason:    apiAlert.reason,
+    message:   apiAlert.message,
   };
 }
 
@@ -126,10 +116,10 @@ function HeaderStrip({ summary, session }) {
   const dayOfWeek    = sessionDate !== '—'
     ? new Date(sessionDate + 'T00:00:00').toLocaleDateString('en-US', {weekday:'short'}).toUpperCase()
     : '—';
-  const marketStatus = sess.market_status || 'OPEN';
-  const enginePhase  = sess.engine_phase  || 'monitoring';
+  const marketStatus = sess.market_status || 'CLOSED';
+  const enginePhase  = sess.engine_phase  || 'offline';
   const enginePid    = sess.engine_pid    != null ? sess.engine_pid : '—';
-  const subCount     = sess.feed_subscribed_count != null ? sess.feed_subscribed_count : 246;
+  const subCount     = sess.feed_subscribed_count != null ? sess.feed_subscribed_count : 0;
 
   return (
     <div className="strip">
@@ -146,29 +136,29 @@ function HeaderStrip({ summary, session }) {
       <div className="strip-cell">
         <span className="strip-label">Feed · positions</span>
         <span className={`strip-value small ${sess.feed_connected ? 'pos' : 'neg'}`}>
-          {sess.feed_connected !== undefined ? (sess.feed_connected ? 'LIVE' : 'DISC') : 'LIVE'}
+          {sess.feed_connected ? 'LIVE' : 'DISC'}
         </span>
-        <span className="strip-sub">{sess.open_position_count ?? '—'} pos · {subCount} sub</span>
+        <span className="strip-sub">{sess.open_position_count ?? 0} pos · {subCount} sub</span>
       </div>
       <div className="strip-cell">
         <span className="strip-label">Gross P&L · today</span>
-        <span className={`strip-value ${summary.gross >= 0 ? 'pos' : 'neg'}`}>{fmtINR(summary.gross)}</span>
+        <span className={`strip-value ${(summary.gross||0) >= 0 ? 'pos' : 'neg'}`}>{fmtINR(summary.gross)}</span>
         <span className="strip-sub muted">peak {fmtINR(summary.peakGross)}</span>
       </div>
       <div className="strip-cell">
         <span className="strip-label">Net P&L · today</span>
-        <span className={`strip-value ${summary.net >= 0 ? 'pos' : 'neg'}`}>{fmtINR(summary.net)}</span>
-        <span className="strip-sub muted">charges {fmtINR(summary.gross - summary.net, {noSign:true})}</span>
+        <span className={`strip-value ${(summary.net||0) >= 0 ? 'pos' : 'neg'}`}>{fmtINR(summary.net)}</span>
+        <span className="strip-sub muted">charges {fmtINR((summary.gross||0) - (summary.net||0), {noSign:true})}</span>
       </div>
       <div className="strip-cell">
         <span className="strip-label">Quote freshness · &lt;5s</span>
-        <span className="strip-value">{summary.quoteFreshness.toFixed(1)}<span style={{color:'var(--text-3)', fontSize:12}}>%</span></span>
-        <Meter value={summary.quoteFreshness} max={100} warnAt={92} critAt={80}/>
+        <span className="strip-value">{(summary.quoteFreshness||0).toFixed(1)}<span style={{color:'var(--text-3)', fontSize:12}}>%</span></span>
+        <Meter value={summary.quoteFreshness||0} max={100} warnAt={92} critAt={80}/>
       </div>
       <div className="strip-cell">
         <span className="strip-label">Depth ready · {subCount} ch</span>
-        <span className="strip-value">{summary.depthReady.toFixed(1)}<span style={{color:'var(--text-3)', fontSize:12}}>%</span></span>
-        <Meter value={summary.depthReady} max={100} warnAt={90} critAt={75}/>
+        <span className="strip-value">{(summary.depthReady||0).toFixed(1)}<span style={{color:'var(--text-3)', fontSize:12}}>%</span></span>
+        <Meter value={summary.depthReady||0} max={100} warnAt={90} critAt={75}/>
       </div>
       <div className="strip-cell">
         <span className="strip-label">WD Free · last flush</span>
@@ -176,16 +166,16 @@ function HeaderStrip({ summary, session }) {
           {summary.wdFreeGb != null ? `${(summary.wdFreeGb / 1000).toFixed(2)}` : '—'}
           {summary.wdFreeGb != null && <span style={{color:'var(--text-3)', fontSize:12}}> TB</span>}
         </span>
-        <span className="strip-sub">{summary.wdMountOk != null ? (summary.wdMountOk ? 'mount ok' : 'MOUNT ERR') : 'WD mount'}</span>
+        <span className="strip-sub">{summary.wdMountOk != null ? (summary.wdMountOk ? 'mount ok' : 'MOUNT ERR') : '—'}</span>
       </div>
     </div>
   );
 }
 
 // ── Sidebar ──────────────────────────────────────────────────────────────
-function Sidebar({ audioOn, onToggleAudio, depth, wdHistory, storage, connected, session }) {
-  const feedConnected = session?.feed_connected ?? connected;
-  const subCount      = session?.feed_subscribed_count ?? 246;
+function Sidebar({ audioOn, onToggleAudio, depthSummary, wdHistory, storage, connected, session }) {
+  const feedConnected = session?.feed_connected ?? false;
+  const subCount      = session?.feed_subscribed_count ?? 0;
   return (
     <aside className="sidebar">
       <div className="side-section">
@@ -208,7 +198,7 @@ function Sidebar({ audioOn, onToggleAudio, depth, wdHistory, storage, connected,
         <div className="ws-card">
           <div className="label">
             <span className="ttl">Dhan Feed</span>
-            <span className="sub">{subCount} sub · 0 seq gap</span>
+            <span className="sub">{subCount} sub · live</span>
           </div>
           <span className={`badge ${feedConnected ? 'ok' : 'ghost'}`}>
             <span className="dot"/>{feedConnected ? 'LIVE' : 'DISC'}
@@ -236,6 +226,7 @@ function Sidebar({ audioOn, onToggleAudio, depth, wdHistory, storage, connected,
             ['GET','get','/api/live/depth-health'],
             ['GET','get','/api/live/storage-health'],
             ['GET','get','/api/live/alerts'],
+            ['GET','get','/api/live/option-chain/{sym}'],
             ['WS', 'ws', '/ws/live'],
           ].map(([m, mc, p]) => (
             <div className="api-row" key={p}>
@@ -248,7 +239,7 @@ function Sidebar({ audioOn, onToggleAudio, depth, wdHistory, storage, connected,
           ))}
         </div>
       </div>
-      <DepthHealthPanel depth={depth} />
+      <DepthHealthPanel depthSummary={depthSummary} />
       <StoragePanel wdHistory={wdHistory} storage={storage} />
     </aside>
   );
@@ -261,46 +252,31 @@ function App() {
     "brandSub":  "NSE · LIVE PAPER",
     "accentColor": "#4ade80",
     "showGross": false,
-    "tickSpeed": 1200,
   }/*EDITMODE-END*/);
 
-  // ── State ──────────────────────────────────────────────────────────────
-  const [positions, setPositions] = useState(() =>
-    INITIAL_POSITIONS.map(p => ({...p, leg_ages: [...p.leg_ages]})));
-  const [equity,    setEquity]    = useState(() => generateEquitySeed());
-  const [depth,     setDepth]     = useState(() =>
-    DEPTH_HEALTH_SEED.map(d => ({...d, legs: d.legs.map(l => ({...l}))})));
-  const [signalLog, setSignalLog] = useState(SIGNAL_LOG_SEED);
-  const [alerts,    setAlerts]    = useState(ALERTS_SEED);
-  const [session,   setSession]   = useState(null);
-  const [storage,   setStorage]   = useState(null);
-  const [connected, setConnected] = useState(false);
-  const [audioOn,   setAudioOn]   = useState(true);
+  // ── State — all start empty, filled exclusively from API ──────────────
+  const [positions,  setPositions]  = useState([]);
+  const [equity,     setEquity]     = useState([]);
+  const [signalLog,  setSignalLog]  = useState([]);
+  const [alerts,     setAlerts]     = useState([]);
+  const [session,    setSession]    = useState(null);
+  const [storage,    setStorage]    = useState(null);
+  const [connected,  setConnected]  = useState(false);
+  const [audioOn,    setAudioOn]    = useState(true);
+  const [wdHistory,  setWdHistory]  = useState([]);
 
-  const [wdHistory, setWdHistory] = useState(() => {
-    const arr = []; let v = 1900;
-    for (let i = 0; i < 40; i++) { v -= 0.4 + Math.random() * 0.6; arr.push(v); }
-    return arr;
+  // Spot data — starts empty, replaced by API data on mount
+  const [spotData, setSpotData] = useState({
+    NIFTY: [], FINNIFTY: [], MIDCPNIFTY: [], SENSEX: [],
   });
 
-  // Spot data — starts as mock, replaced by API data on mount
-  const [spotData, setSpotData] = useState(() => ({
-    NIFTY:      generateSpotSeed('NIFTY'),
-    FINNIFTY:   generateSpotSeed('FINNIFTY'),
-    MIDCPNIFTY: generateSpotSeed('MIDCPNIFTY'),
-    SENSEX:     generateSpotSeed('SENSEX'),
-  }));
-  // Option chain — mock only (live quotes v2 scope)
-  const [chainData] = useState(() => ({
-    NIFTY:      generateOptionChain('NIFTY'),
-    FINNIFTY:   generateOptionChain('FINNIFTY'),
-    MIDCPNIFTY: generateOptionChain('MIDCPNIFTY'),
-    SENSEX:     generateOptionChain('SENSEX'),
-  }));
+  // Option chain — fetched from /api/live/option-chain/{symbol}
+  const [chainData, setChainData] = useState({
+    NIFTY: [], FINNIFTY: [], MIDCPNIFTY: [], SENSEX: [],
+  });
+  const [chainLoaded, setChainLoaded] = useState(false);
 
-  const seriesRef  = useRef(null);
-  // mutable snapshot so the offline simulation always reads current state
-  const simRef     = useRef({ positions, equity, depth });
+  const seriesRef = useRef(null);
 
   // ── Initial REST fetch ─────────────────────────────────────────────────
   useEffect(() => {
@@ -316,30 +292,65 @@ function App() {
       getJson('/api/live/signal-log'),
       getJson('/api/live/alerts'),
     ]).then(([sess, pos, eq, sig, al]) => {
-      if (sess)                      setSession(sess);
-      if (pos?.length)               setPositions(pos.map(adaptPosition));
-      if (eq?.length) {
+      if (sess) setSession(sess);
+
+      // Always replace state with API response (even if empty array)
+      setPositions(Array.isArray(pos) ? pos.map(adaptPosition) : []);
+
+      if (Array.isArray(eq) && eq.length) {
         const pts = eq.map(adaptEquityPoint);
         setEquity(pts);
         window.__pendingEquityData = pts;
       }
-      if (sig?.length)               setSignalLog(sig.map(adaptSignalLog));
-      if (al?.active_alerts?.length) setAlerts(al.active_alerts.map(adaptAlert));
+
+      if (Array.isArray(sig)) setSignalLog(sig.map(adaptSignalLog));
+
+      if (al?.active_alerts) setAlerts(al.active_alerts.map(adaptAlert));
     });
 
-    // Fetch real spot bars (last session) for all 4 symbols in parallel
+    // Spot bars
     Promise.all(
       ['NIFTY','FINNIFTY','MIDCPNIFTY','SENSEX'].map(sym =>
         getJson(`/api/live/spot/${sym}`)
       )
     ).then(([n, f, m, s]) => {
-      setSpotData(prev => ({
-        NIFTY:      n?.length ? n : prev.NIFTY,
-        FINNIFTY:   f?.length ? f : prev.FINNIFTY,
-        MIDCPNIFTY: m?.length ? m : prev.MIDCPNIFTY,
-        SENSEX:     s?.length ? s : prev.SENSEX,
-      }));
+      setSpotData({
+        NIFTY:      Array.isArray(n) ? n : [],
+        FINNIFTY:   Array.isArray(f) ? f : [],
+        MIDCPNIFTY: Array.isArray(m) ? m : [],
+        SENSEX:     Array.isArray(s) ? s : [],
+      });
     });
+
+    // Option chain — initial fetch
+    fetchChainData(getJson);
+  }, []);
+
+  function fetchChainData(getJsonFn) {
+    const getJson = getJsonFn || (url =>
+      fetch(url, {headers:{'Accept':'application/json'}})
+        .then(r => r.ok ? r.json() : null)
+        .catch(() => null));
+
+    Promise.all(
+      ['NIFTY','FINNIFTY','MIDCPNIFTY','SENSEX'].map(sym =>
+        getJson(`/api/live/option-chain/${sym}`)
+      )
+    ).then(([n, f, m, s]) => {
+      setChainData({
+        NIFTY:      Array.isArray(n) ? n : [],
+        FINNIFTY:   Array.isArray(f) ? f : [],
+        MIDCPNIFTY: Array.isArray(m) ? m : [],
+        SENSEX:     Array.isArray(s) ? s : [],
+      });
+      setChainLoaded(true);
+    });
+  }
+
+  // Poll option chain every 5s (live quotes refresh)
+  useEffect(() => {
+    const id = setInterval(() => fetchChainData(), 5000);
+    return () => clearInterval(id);
   }, []);
 
   // ── WebSocket ──────────────────────────────────────────────────────────
@@ -360,12 +371,10 @@ function App() {
         try {
           const f = JSON.parse(ev.data);
 
-          if (f.session)  setSession(f.session);
+          if (f.session) setSession(f.session);
 
-          if (f.positions?.length) {
-            const adapted = f.positions.map(adaptPosition);
-            setPositions(adapted);
-            simRef.current.positions = adapted;
+          if (f.positions !== undefined) {
+            setPositions(Array.isArray(f.positions) ? f.positions.map(adaptPosition) : []);
           }
 
           if (f.equity_tick) {
@@ -392,7 +401,7 @@ function App() {
           if (f.alerts?.active_alerts) {
             setAlerts(f.alerts.active_alerts.map(adaptAlert));
           }
-        } catch(e) { /* malformed frame — ignore */ }
+        } catch(e) {}
       };
     }
 
@@ -401,35 +410,13 @@ function App() {
     return () => { alive = false; clearTimeout(timer); try { ws?.close(); } catch(e) {} };
   }, []);
 
-  // ── Offline simulation (active only when WebSocket is disconnected) ────
-  useEffect(() => { simRef.current = { positions, equity, depth }; }, [positions, equity, depth]);
-
-  useEffect(() => {
-    if (connected) return;
-    const id = setInterval(() => {
-      const frame = generateFrame(simRef.current);
-      if (seriesRef.current && frame.equity_tick) {
-        try { seriesRef.current.update({ time: frame.equity_tick.time, value: frame.equity_tick.value }); }
-        catch(e) {}
-      }
-      setPositions([...simRef.current.positions]);
-      setDepth([...simRef.current.depth]);
-      setEquity([...simRef.current.equity]);
-    }, tweaks.tickSpeed);
-    return () => clearInterval(id);
-  }, [connected, tweaks.tickSpeed]);
-
   // ── Summary for HeaderStrip ────────────────────────────────────────────
   const lastEq    = equity[equity.length - 1] || {};
-  const peakGross = equity.reduce((m, p) => Math.max(m, p.cumulative_gross_pnl ?? 0), -Infinity);
-  const allAges   = depth.flatMap(d => d.legs.map(l => l.age));
+  const peakGross = equity.reduce((m, p) => Math.max(m, p.cumulative_gross_pnl ?? 0), 0);
 
-  const quoteFreshness = session?.quote_freshness_pct ??
-    (allAges.length ? (allAges.filter(a => a < 5000).length / allAges.length * 100) : 94.0);
-  const depthReady = session?.depth?.ready_pct ??
-    (allAges.length ? (allAges.filter(a => a < 2000).length / allAges.length * 100) : 92.4);
-
-  const marketClosed = !session || session.market_status === 'CLOSED' || session.market_status === 'HOLIDAY';
+  const quoteFreshness = session?.quote_freshness_pct ?? 0;
+  const depthReady     = session?.depth?.ready_pct ?? 0;
+  const marketClosed   = !session || session.market_status === 'CLOSED' || session.market_status === 'HOLIDAY';
 
   const summary = {
     gross:          lastEq.cumulative_gross_pnl ?? 0,
@@ -440,6 +427,9 @@ function App() {
     wdFreeGb:  storage?.wd_free_gb  ?? null,
     wdMountOk: storage?.wd_mount_ok ?? null,
   };
+
+  // DepthSummary from session.depth (aggregate stats only)
+  const depthSummary = session?.depth ?? null;
 
   return (
     <div data-screen-label="01 Live Monitor">
@@ -452,14 +442,14 @@ function App() {
           <EquityCurvePanel seriesRef={seriesRef} equityState={equity}
             accentColor={tweaks.accentColor} />
           <SpotChartsRow spotData={spotData} marketClosed={marketClosed} />
-          <OptionChainPanel chainData={chainData} marketClosed={marketClosed} />
+          <OptionChainPanel chainData={chainData} chainLoaded={chainLoaded} marketClosed={marketClosed} session={session} />
           <SignalLogPanel entries={signalLog} />
           <AlertsPanel alerts={alerts} />
         </div>
         <Sidebar
           audioOn={audioOn}
           onToggleAudio={() => setAudioOn(v => !v)}
-          depth={depth}
+          depthSummary={depthSummary}
           wdHistory={wdHistory}
           storage={storage}
           connected={connected}
@@ -475,10 +465,6 @@ function App() {
           <TweakColor label="Equity curve colour" tweakKey="accentColor" tweaks={tweaks} setTweak={setTweak}
             options={['#4ade80','#38bdf8','#a78bfa','#fb923c']} />
           <TweakToggle label="Show Gross P&L" tweakKey="showGross" tweaks={tweaks} setTweak={setTweak} />
-        </TweakSection>
-        <TweakSection label="Simulation">
-          <TweakSlider label="Tick speed (ms)" tweakKey="tickSpeed" tweaks={tweaks} setTweak={setTweak}
-            min={400} max={4000} step={200} />
         </TweakSection>
       </TweaksPanel>
     </div>

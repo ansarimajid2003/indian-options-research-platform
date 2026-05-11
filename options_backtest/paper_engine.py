@@ -540,6 +540,7 @@ class PaperTradingEngine:
                 instruments_to_sub.append({"ExchangeSegment": exch_seg, "SecurityId": sid})
 
         self._subscribed_ids = instruments_to_sub
+        self._write_instrument_map()
 
         if self._ws is not None and self._feed_connected:
             await self._subscribe_instruments(self._ws, instruments_to_sub)
@@ -1034,6 +1035,31 @@ class PaperTradingEngine:
             "quote_freshness_pct": freshness_pct,
         }
         _write_atomic(self._snapshot_dir / "latest_feed_state.json", state)
+
+        # Per-security quotes: merge last_tob + resolver quote snapshots + chain greeks
+        quotes: dict[str, dict] = {}
+        for resolver in self._resolvers.values():
+            for sid, q in resolver.quote_snapshot().items():
+                quotes[sid] = q
+        for sid, tob in self._last_tob.items():
+            if sid not in quotes:
+                quotes[sid] = {"ltp": tob.get("ltp", 0.0), "oi": 0, "volume": 0, "ts": tob.get("ts", pd.Timestamp.now(tz="Asia/Kolkata")).isoformat()}
+        # Attach IV and greeks from chain_greeks cache
+        for sid, meta in self._chain_greeks.items():
+            if sid in quotes:
+                quotes[sid]["iv"] = meta.get("iv")
+                quotes[sid]["delta"] = (meta.get("greeks") or {}).get("delta")
+                quotes[sid]["theta"] = (meta.get("greeks") or {}).get("theta")
+        if quotes:
+            _write_atomic(self._snapshot_dir / "latest_quotes.json", {"written_at": _ts_str(), "quotes": quotes})
+
+    def _write_instrument_map(self) -> None:
+        imap: dict[str, dict] = {}
+        for symbol, resolver in self._resolvers.items():
+            for sid, info in resolver.instrument_map().items():
+                imap[sid] = {"symbol": symbol, **info}
+        if imap:
+            _write_atomic(self._snapshot_dir / "latest_instrument_map.json", {"written_at": _ts_str(), "instruments": imap})
 
     def _write_process_health(self) -> None:
         health = {

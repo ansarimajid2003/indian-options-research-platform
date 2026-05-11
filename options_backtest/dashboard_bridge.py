@@ -401,6 +401,66 @@ class DashboardBridge:
         result = self._cached(f"signals_{date_str}", _TTL_TRADES, _load)
         return result if result is not None else []
 
+    # ── Option chain ─────────────────────────────────────────────────────────
+
+    def get_option_chain(self, symbol: str) -> list[dict]:
+        """
+        Build a per-strike option chain row list for `symbol` using three snapshot files:
+          - latest_instrument_map.json  (security_id → symbol/strike/expiry/option_type)
+          - latest_quotes.json          (security_id → ltp/iv/delta/theta/oi/ts)
+          - latest_depth_cache.json     (security_id → bid/ask/qty/age)
+
+        Returns rows sorted by strike ascending, each row:
+          {strike, expiry, ce: {ltp,bid,ask,bid_qty,ask_qty,iv,delta,theta,oi,age_ms},
+                            pe: {same}}
+        Returns [] if instrument_map file is missing.
+        """
+        imap_data = self._read_json(self._snap("latest_instrument_map.json"))
+        if not imap_data:
+            return []
+        quotes_data = self._read_json(self._snap("latest_quotes.json")) or {}
+        depth_data = self._read_json(self._snap("latest_depth_cache.json")) or {}
+
+        instruments: dict[str, dict] = imap_data.get("instruments", {})
+        quotes: dict[str, dict] = quotes_data.get("quotes", {})
+        tob: dict[str, dict] = depth_data.get("tob", {})
+
+        # Filter to requested symbol, group by (expiry, strike)
+        by_strike: dict[tuple, dict] = {}
+        for sid, info in instruments.items():
+            if info.get("symbol") != symbol:
+                continue
+            expiry = info.get("expiry", "")
+            strike = info.get("strike", 0)
+            otype = info.get("option_type", "").upper()  # "CE" or "PE"
+            if otype not in ("CE", "PE"):
+                continue
+
+            q = quotes.get(sid, {})
+            d = tob.get(sid, {})
+
+            leg = {
+                "ltp":     q.get("ltp", 0.0),
+                "iv":      q.get("iv"),
+                "delta":   q.get("delta"),
+                "theta":   q.get("theta"),
+                "oi":      q.get("oi", 0),
+                "bid":     d.get("bid", 0.0),
+                "ask":     d.get("ask", 0.0),
+                "bid_qty": d.get("bid_qty", 0),
+                "ask_qty": d.get("ask_qty", 0),
+                "age_ms":  max(d.get("bid_age_ms", 0), d.get("ask_age_ms", 0)),
+                "sid":     sid,
+            }
+
+            key = (expiry, strike)
+            if key not in by_strike:
+                by_strike[key] = {"strike": strike, "expiry": expiry}
+            by_strike[key][otype.lower()] = leg
+
+        rows = sorted(by_strike.values(), key=lambda r: (r["expiry"], r["strike"]))
+        return rows
+
     # ── Depth health ─────────────────────────────────────────────────────────
 
     def get_depth_summary(self) -> DepthSummary | None:

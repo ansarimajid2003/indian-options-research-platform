@@ -257,6 +257,11 @@ def get_alerts(
     return state_model
 
 
+@router.get("/option-chain/{symbol}", summary="Live per-strike option chain for a symbol")
+def get_option_chain(symbol: str, request: Request) -> list[dict]:
+    return _bridge(request).get_option_chain(symbol.upper())
+
+
 @router.get("/spot/{symbol}", summary="1-min spot OHLCV bars (last N trading sessions)")
 def get_spot_bars(
     symbol: str,
