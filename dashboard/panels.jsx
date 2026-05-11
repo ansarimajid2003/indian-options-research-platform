@@ -175,11 +175,14 @@ function EquityCurvePanel({ seriesRef, equityState, accentColor = '#4ade80' }) {
           <div className="delta muted">charges {fmtINR((last.cumulative_gross_pnl ?? 0) - (last.cumulative_net_pnl ?? 0), {noSign:true})}</div>
         </div>
       </div>
-      {equityState.length === 0 ? (
-        <EmptyState icon="◈" title="NO TRADES YET" sub="Equity curve populates when positions are closed" />
-      ) : (
+      <div style={{position:'relative'}}>
         <div ref={containerRef} className="eq-chart" />
-      )}
+        {equityState.length === 0 && (
+          <div style={{position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center', background:'#111'}}>
+            <EmptyState icon="◈" title="NO TRADES YET" sub="Equity curve populates when positions are closed" />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -429,15 +432,23 @@ function SpotChartCard({ symbol, bars, marketClosed }) {
               {marketClosed && <span className="badge ghost" style={{marginLeft:6, fontSize:9}}>LAST SESSION</span>}
             </>
           ) : (
-            <span className="spot-price" style={{opacity:0.4}}>—</span>
+            <span className="spot-price" style={{opacity:0.4}}>loading…</span>
           )}
         </div>
-        <span className="spot-meta">{bars.length ? `H ${last.high?.toFixed(2)} · L ${last.low?.toFixed(2)}` : 'loading…'}</span>
+        <span className="spot-meta">{bars.length ? `H ${last.high?.toFixed(2)} · L ${last.low?.toFixed(2)}` : ''}</span>
       </div>
-      {bars.length
-        ? <div ref={containerRef} className="spot-chart-container" />
-        : <EmptyState icon="↗" title="LOADING SPOT DATA" sub={`${symbol} · fetching from CSV`} />
-      }
+      {/* Container always rendered so ref is available on mount */}
+      <div style={{position:'relative'}}>
+        <div ref={containerRef} className="spot-chart-container" />
+        {!bars.length && (
+          <div style={{
+            position:'absolute', inset:0, display:'flex', alignItems:'center',
+            justifyContent:'center', background:'#111', borderRadius:2,
+          }}>
+            <EmptyState icon="↗" title="LOADING" sub={`${symbol} spot bars`} />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -491,21 +502,20 @@ function OptionChainPanel({ chainData, chainLoaded, marketClosed, session }) {
 
   // Derive spot and ATM from rows
   const spot = rows.length ? _chainSpot(rows) : null;
-  const atmStrike = spot != null
-    ? (() => {
-        const steps = rows.map(r => r.strike);
-        if (!steps.length) return null;
-        const step = steps.length > 1 ? steps[1] - steps[0] : 100;
-        return Math.round(spot / step) * step;
-      })()
-    : null;
+  const step = rows.length > 1 ? rows[1].strike - rows[0].strike : 100;
+  const atmStrike = spot != null ? Math.round(spot / step) * step : null;
+
+  // Only show ATM ± 15 strikes so far-OTM dead rows don't dominate the view
+  const visibleRows = atmStrike != null
+    ? rows.filter(r => Math.abs(r.strike - atmStrike) <= 15 * step)
+    : rows;
 
   return (
     <div className="panel span-alerts" style={{position:'relative'}}>
       <div className="panel-header">
         <div className="panel-title">
           Option Chain
-          <span className="count">DHAN LIVE · ATM ± 10 STRIKES</span>
+          <span className="count">DHAN LIVE · ATM ± 15 STRIKES</span>
         </div>
         <div className="panel-actions">
           {marketClosed
@@ -596,7 +606,7 @@ function OptionChainPanel({ chainData, chainLoaded, marketClosed, session }) {
               </tr>
             </thead>
             <tbody>
-              {rows.map(row => {
+              {visibleRows.map(row => {
                 const ce = row.ce || {};
                 const pe = row.pe || {};
                 const isAtm = row.strike === atmStrike;
