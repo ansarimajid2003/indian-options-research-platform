@@ -7,9 +7,10 @@ Multi-index options backtest engine + research pipeline for Indian equity indice
 
 Current phase: defined-risk short-vol deployment → live monitoring / scaling.
 
-The codebase is organised into three layers:
+The codebase is organised into four layers:
 - **Engine** (`options_backtest/`): broker-neutral backtest engine with tiered fill model, cost accounting, and strategy plug-ins.
 - **Data & research** (`market_data/`, `scripts/`, `data/`, `reports/`): data loaders, validation pipelines, analysis notebooks, and backtest result stores.
+- **Live infrastructure** (`scripts/live/`): Dhan market-data collector, paper-trading engine runner, health monitor, and dashboard API — all deployed on zimaos.
 - **Tests** (`tests/`): unit tests and bias audits.
 
 ## Technology Stack
@@ -51,7 +52,25 @@ The codebase is organised into three layers:
 │   ├── analysis/              # Backtest runners, PnL attribution, research studies
 │   ├── data/                  # Data inventory, validation, cleaning builders
 │   ├── download/              # Scrapers and downloaders (Dhan, Shoonya, NSE bhavcopy)
-│   └── live/                  # Live-market collectors (Kotak Neo)
+│   └── live/                  # Live-market infrastructure (deployed on zimaos)
+│       ├── api/               # FastAPI dashboard backend
+│       │   ├── main.py        # App entry point; mounts static dashboard/
+│       │   ├── models.py      # Pydantic response models (LivePushFrame, etc.)
+│       │   └── routes/
+│       │       ├── live.py    # /api/live/* REST + /ws/live WebSocket
+│       │       ├── historical.py
+│       │       └── backtests.py
+│       ├── systemd/           # dashboard-api.service, health-monitor.service
+│       ├── health_monitor.py  # Writes alert/storage snapshots; Telegram alerts
+│       └── dhan_connection_check.py
+├── dashboard/                 # CDN React 18 frontend (no build step)
+│   ├── index.html             # Loads scripts in strict order
+│   ├── app.jsx                # Root component; REST fetch + WS wiring; adapter fns
+│   ├── panels.jsx             # SpotChartCard, EquityCurvePanel, PositionsPanel, etc.
+│   ├── components.jsx         # Shared: Icon, MarketBadge, Sparkline, Meter, useClock
+│   ├── data.jsx               # window.WingData mock data (fallback / offline)
+│   ├── tweaks-panel.jsx       # Dev tweaks panel
+│   └── styles.css
 ├── tests/                     # Unit tests and bias audits
 │   ├── test_options_backtest.py
 │   └── test_bias_audit.py
@@ -74,7 +93,7 @@ The codebase is organised into three layers:
 ├── ENGINE_ARCHITECTURE.md     # Single-source-of-truth for engine internals
 ├── AGENTS.md                  # This file
 ├── .gitignore                 # Excludes data/, reports/, logs/, venvs
-└── CLAUDE.md                  # Claude-specific project context
+└── CLAUDE.md                  # Claude-specific project context + dashboard access
 ```
 
 ## Build and Run Commands
@@ -227,10 +246,11 @@ Break-even move: ~₹1/unit. All pre-2026 backtests are **invalid** until re-run
 3. ~~**Short-vol contributor validation**~~ ✓ Done May 2026.
 4. ~~**Structure upgrade**~~ ✓ Done May 2026 — Wing-6 IC validated: defined-risk iron condor across NIFTY/FINNIFTY/MIDCPNIFTY. Primary 1:2:2 lots, Sharpe 2.454, MaxDD -1.0%, t-stat 4.798.
 5. ~~**SENSEX integration**~~ ✓ Done May 2026 — SENSEX added to engine (calendar.py, cli.py), Dhan data backfilled (May 2023–May 2026, 84 parquet files, 19M bars). Wing-6 IC DTE<=2 filter: Sharpe 3.69, t-stat 5.62, 141 trades. Expanded portfolio (N:F:M:S 1:1:1:1): Sharpe 2.746, t-stat 5.30.
-6. **Live deployment prep** — broker integration, order sizing, daily signal generation.
-6. **OOS monitoring** — track top performers monthly; pause variant if OOS Sharpe < 1.5 for two consecutive months.
-7. **Data validation** — cross-check Shoonya vs Dhan, confirm MIDCPNIFTY/BANKNIFTY/FINNIFTY spot CSV coverage post-2024.
-8. **ML layer** — only after 3+ years clean OOS; turnover-regularized model with DTE/moneyness/IV/volume/OI.
+6. ~~**Web dashboard**~~ ✓ Done May 2026 — FastAPI backend + CDN React frontend deployed on zimaos; real spot charts (4 indices), alert timeline, storage health, equity curve, positions panel. See § Web Dashboard above.
+7. **Live deployment prep** — broker integration, order sizing, daily signal generation.
+8. **OOS monitoring** — track top performers monthly; pause variant if OOS Sharpe < 1.5 for two consecutive months.
+9. **Data validation** — cross-check Shoonya vs Dhan, confirm MIDCPNIFTY/BANKNIFTY/FINNIFTY spot CSV coverage post-2024.
+10. **ML layer** — only after 3+ years clean OOS; turnover-regularized model with DTE/moneyness/IV/volume/OI.
 
 ## Data
 
@@ -252,6 +272,39 @@ Break-even move: ~₹1/unit. All pre-2026 backtests are **invalid** until re-run
 - **SENSEX expiry regime breaks:** BSE launched weekly options May 2023 (Friday expiry); shifted to Tuesday Jan 2025; shifted to Thursday Sep 2025. `calendar.py` handles all three transitions. Lot size changed 10→20 on Jan 10 2025.
 - **Quarantine:** `20250925`, `20251224` excluded from all runs.
 - Data manifest: `data/manifests/data_inventory_manifest.csv` (502 datasets, 30 GB).
+
+## Web Dashboard
+
+Live read-only monitoring dashboard deployed on zimaos. Shows real-time positions, equity curve, spot charts, alert timeline, and storage health.
+
+**Access from laptop:**
+```bash
+ssh -L 9000:127.0.0.1:8000 zimaos   # keep terminal open
+# open http://localhost:9000/ in browser
+```
+(Local port 8000 is occupied; use 9000.)
+
+**Services on zimaos (auto-start on boot):**
+- `dashboard-api.service` — FastAPI/uvicorn, `127.0.0.1:8000`, `LIVE_ROOT=/media/WD-Storage/indian-markets-live`
+- `health-monitor.service` — writes alert/storage snapshots (~60 s off-hours, ~30 s during market)
+
+**Restart command:** `ssh zimaos "systemctl restart dashboard-api health-monitor"`
+
+**Wiring summary:**
+
+| Layer | Key files |
+|---|---|
+| Backend entry | `scripts/live/api/main.py` — FastAPI app; mounts `dashboard/` as static root |
+| Routes | `scripts/live/api/routes/live.py` — all `/api/live/*` REST + `/ws/live` WS push |
+| Data bridge | `options_backtest/dashboard_bridge.py` — TTL-cached file reader (3 s live / 5 s trades / 60 s hist); never opens Dhan sockets |
+| Frontend | `dashboard/app.jsx` — REST fetch on mount; WS for live updates; `adaptPosition()`, `adaptEquityPoint()`, `adaptAlert()` shape API→UI |
+| Mock fallback | `dashboard/data.jsx` (`window.WingData`) — used when API data not yet loaded |
+| Spot charts | `/api/live/spot/{symbol}?days=N` → last N sessions from `data/processed/spot/*.csv`; timestamps are "display epoch" (IST naive treated as UTC so chart shows IST labels) |
+| WS frame | `LivePushFrame` in `scripts/live/api/models.py`; pushed every 1 s (market hours) / 5 s (off-hours) |
+
+**Market-closed behaviour:** spot charts show last session data with "LAST SESSION" badge; option chain shows "MARKET CLOSED" overlay; storage and alert panels always show live values from WD drive.
+
+**Full design spec:** `docs/design/live_paper_trading_plan.md` § 13 (Web Dashboard).
 
 ## Security Considerations
 
