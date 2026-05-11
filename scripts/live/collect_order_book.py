@@ -383,8 +383,8 @@ async def _depth_snapshot_loop(
     interval_seconds: float = 10.0,
 ) -> None:
     while True:
-        _write_depth_cache_snapshot(live_root, date_str, depth_cache, security_ids)
-        _write_collector_state(live_root, date_str, "running", security_ids)
+        await asyncio.to_thread(_write_depth_cache_snapshot, live_root, date_str, depth_cache, security_ids)
+        await asyncio.to_thread(_write_collector_state, live_root, date_str, "running", security_ids)
         await asyncio.sleep(interval_seconds)
 
 
@@ -569,94 +569,6 @@ def _depth_collection_settings(profile: dict) -> tuple[list[str], int, int]:
     offset_range = int(cfg.get("atm_offset_range", _DEFAULT_ATM_OFFSET_RANGE))
     max_depth_connections = int(cfg.get("max_depth_connections", _DEFAULT_MAX_DEPTH_CONNECTIONS))
     return symbols, offset_range, max_depth_connections
-
-
-async def collect_order_book(
-    profile: dict,
-    session_date: date,
-    depth_cache: DepthCache,
-    access_token: str,
-    client_id: str,
-    live_root: Path | None = None,
-    dry_run: bool = False,
-) -> None:
-    """
-    Main coroutine called from run_paper_trading.py via asyncio.gather.
-
-    profile: the loaded wing6_4x1_all_vix_filtered config dict.
-    """
-    if live_root is None:
-        live_root = _live_root()
-
-    date_str = session_date.strftime("%Y%m%d")
-    collectors: list[DepthCollector] = []
-
-    if dry_run:
-        print(f"[collect_order_book] DRY RUN — skipping WD space check and websocket connections")
-        gap_start = _now_ist().isoformat()
-        await asyncio.sleep(1)
-        gap_end = _now_ist().isoformat()
-        _write_gap_sentinel(live_root, date_str, "DRY_RUN", gap_start, gap_end, "dry_run")
-        print(f"[collect_order_book] gap sentinel written for DRY_RUN")
-        return
-
-    # Startup checks
-    _check_wd_space(live_root, min_gb=100.0)
-
-    for symbol in _NSE_SYMBOLS:
-        sym_cfg = profile.get("symbols", {}).get(symbol, {})
-        if not sym_cfg.get("trade", False) or sym_cfg.get("depth_source") != "dhan_20depth":
-            continue
-        scrip_id = sym_cfg["dhan_scrip_id"]
-        segment = sym_cfg.get("dhan_segment", "IDX_I")
-
-        resolver = LiveDhanContractResolver(
-            symbol=symbol,
-            access_token=access_token,
-            client_id=client_id,
-            spot_security_id=str(scrip_id),
-            vix_security_id=str(profile.get("vix", {}).get("dhan_scrip_id", 21)),
-        )
-        # Fetch nearest active expiry
-        expiries = resolver.fetch_expiry_list(scrip_id, segment)
-        if not expiries:
-            print(f"[collect_order_book] SKIP {symbol} — no active expiries")
-            continue
-        expiry = expiries[0]
-
-        gap_start = _now_ist().isoformat()
-        try:
-            sids, id_to_meta = _build_subscription_universe(symbol, resolver, expiry, scrip_id, segment)
-        except Exception as exc:
-            print(f"[collect_order_book] SKIP {symbol} — chain discovery failed: {exc}")
-            gap_end = _now_ist().isoformat()
-            _write_gap_sentinel(live_root, date_str, symbol, gap_start, gap_end, f"chain_discovery_failed: {exc}")
-            continue
-
-        print(f"[collect_order_book] {symbol}: {len(sids)} instruments for expiry {expiry}")
-        collector = DepthCollector(
-            symbol=symbol,
-            security_ids=sids,
-            id_to_meta=id_to_meta,
-            depth_cache=depth_cache,
-            access_token=access_token,
-            client_id=client_id,
-            live_root=live_root,
-            date_str=date_str,
-        )
-        collectors.append(collector)
-
-    if not collectors:
-        print("[collect_order_book] No symbols to collect — exiting")
-        return
-
-    tasks = [asyncio.create_task(c.run()) for c in collectors]
-    try:
-        await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        for c in collectors:
-            c.stop()
-        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def collect_order_book(

@@ -51,7 +51,7 @@ _SEG_NSE_FNO = "NSE_FNO"
 _SEG_BSE_FNO = "BSE_FNO"
 
 # Freshness limits (seconds)
-_VIX_MAX_AGE = 60
+_VIX_MAX_AGE = 300
 _SPOT_MAX_AGE = 5
 _OPTION_MAX_AGE = 5
 _DEPTH_MAX_AGE = 5
@@ -1014,8 +1014,8 @@ class PaperTradingEngine:
     async def _snapshot_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                self._write_feed_state()
-                self._write_process_health()
+                await asyncio.to_thread(self._write_feed_state)
+                await asyncio.to_thread(self._write_process_health)
             except Exception as exc:
                 _log.warning("snapshot_loop: error — %r", exc)
             await asyncio.sleep(_SNAPSHOT_INTERVAL)
