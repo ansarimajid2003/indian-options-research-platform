@@ -269,7 +269,9 @@ class _NormalizedBuffer:
             if out_path.exists():
                 existing = pd.read_parquet(out_path)
                 df = pd.concat([existing, df], ignore_index=True)
-            pq.write_table(pa.Table.from_pandas(df), str(out_path), compression="snappy")
+            tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+            pq.write_table(pa.Table.from_pandas(df), str(tmp_path), compression="snappy")
+            tmp_path.replace(out_path)
             # 1-min OHLCV aggregate
             self._write_1min(df, ikey)
         self._rows = defaultdict(list)
@@ -287,9 +289,14 @@ class _NormalizedBuffer:
         out_path = self._dir_1min / f"{ikey}.parquet"
         if out_path.exists():
             existing = pd.read_parquet(out_path)
+            if "timestamp" in existing.columns:
+                existing["timestamp"] = pd.to_datetime(existing["timestamp"])
+                existing = existing.set_index("timestamp").sort_index()
             agg = pd.concat([existing, agg])
             agg = agg[~agg.index.duplicated(keep="last")].sort_index()
-        pq.write_table(pa.Table.from_pandas(agg.reset_index()), str(out_path), compression="snappy")
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        pq.write_table(pa.Table.from_pandas(agg.reset_index()), str(tmp_path), compression="snappy")
+        tmp_path.replace(out_path)
 
 
 def _write_gap_sentinel(live_root: Path, date_str: str, symbol: str, gap_start: str, gap_end: str, reason: str) -> None:
@@ -325,13 +332,15 @@ def _write_depth_cache_snapshot(
     date_str: str,
     depth_cache: DepthCache,
     security_ids: list[str],
+    id_to_meta: dict[str, dict] | None = None,
 ) -> None:
     summary = depth_cache.readiness_summary(security_ids, max_age_seconds=5)
     now = _now_ist()
+    tracked = set(depth_cache.tracked_ids())
 
     # Per-security top-of-book (best bid/ask + qty + age)
     tob_rows: dict[str, dict] = {}
-    for sid in depth_cache.tracked_ids():
+    for sid in tracked:
         snap = depth_cache.snapshot(sid)
         if snap is None:
             continue
@@ -346,15 +355,31 @@ def _write_depth_cache_snapshot(
             "ask_age_ms": ask_age_ms,
         }
 
+    by_symbol: dict[str, dict[str, float | int]] = {}
+    if id_to_meta:
+        for sid in security_ids:
+            meta = id_to_meta.get(sid, {})
+            symbol = str(meta.get("symbol", "UNKNOWN"))
+            rec = by_symbol.setdefault(symbol, {"total": 0, "tracked": 0, "ready": 0, "ready_pct": 0.0})
+            rec["total"] = int(rec["total"]) + 1
+            if sid in tracked:
+                rec["tracked"] = int(rec["tracked"]) + 1
+            if depth_cache.is_ready(sid, max_age_seconds=5):
+                rec["ready"] = int(rec["ready"]) + 1
+        for rec in by_symbol.values():
+            total = int(rec["total"])
+            rec["ready_pct"] = round(float(rec["ready"]) / total * 100, 2) if total else 0.0
+
     payload = {
         "written_at": now.isoformat(),
         "session_date": date_str,
         "pid": os.getpid(),
         "configured_security_ids": len(security_ids),
-        "tracked_security_ids": len(depth_cache.tracked_ids()),
+        "tracked_security_ids": len(tracked),
         "ready": int(summary["ready"]),
         "total": int(summary["total"]),
         "ready_pct": round(float(summary["ready_pct"]), 2),
+        "by_symbol": by_symbol,
         "tob": tob_rows,
     }
     _write_atomic_json(live_root / "snapshots" / "latest_depth_cache.json", payload)
@@ -400,10 +425,11 @@ async def _depth_snapshot_loop(
     date_str: str,
     depth_cache: DepthCache,
     security_ids: list[str],
+    id_to_meta: dict[str, dict],
     interval_seconds: float = 10.0,
 ) -> None:
     while True:
-        await asyncio.to_thread(_write_depth_cache_snapshot, live_root, date_str, depth_cache, security_ids)
+        await asyncio.to_thread(_write_depth_cache_snapshot, live_root, date_str, depth_cache, security_ids, id_to_meta)
         await asyncio.to_thread(_write_collector_state, live_root, date_str, "running", security_ids)
         await asyncio.sleep(interval_seconds)
 
@@ -697,10 +723,10 @@ async def collect_order_book(
         live_root=live_root,
         date_str=date_str,
     )
-    _write_depth_cache_snapshot(live_root, date_str, depth_cache, all_sids)
+    _write_depth_cache_snapshot(live_root, date_str, depth_cache, all_sids, all_meta)
     tasks = [
         asyncio.create_task(collector.run()),
-        asyncio.create_task(_depth_snapshot_loop(live_root, date_str, depth_cache, all_sids)),
+        asyncio.create_task(_depth_snapshot_loop(live_root, date_str, depth_cache, all_sids, all_meta)),
     ]
     try:
         done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

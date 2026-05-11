@@ -58,6 +58,8 @@ _FEED_ACTIVE_START = time(9, 10)
 _FEED_ACTIVE_END = time(15, 31)
 _HEARTBEAT_START = time(8, 55)
 _EOD_BUFFER_END = time(16, 5)
+_CHAIN_CHECK_START = time(9, 17)
+_ONE_MIN_CHECK_START = time(9, 30)
 
 _WD_MIN_GB_INTRADAY = 20.0
 _WD_MIN_GB_PRE_RUN = 100.0
@@ -244,6 +246,11 @@ class HealthMonitor:
         self._started_monotonic = _time.monotonic()
         self._good_ticks = 0
         self._total_ticks = 0
+        self._uptime_counters: dict[str, dict[str, int]] = {
+            "paper_engine": {"good": 0, "total": 0},
+            "depth_collector": {"good": 0, "total": 0},
+            "full_readiness": {"good": 0, "total": 0},
+        }
         self._wd_free_gb = 0.0
         self._alert_counts: dict[str, int] = {"critical": 0, "warning": 0, "info": 0}
         self._active_alerts: dict[str, dict] = {}
@@ -319,6 +326,11 @@ class HealthMonitor:
         self._consecutive_bad = {"quote_freshness": 0, "depth_readiness": 0}
         self._good_ticks = 0
         self._total_ticks = 0
+        self._uptime_counters = {
+            "paper_engine": {"good": 0, "total": 0},
+            "depth_collector": {"good": 0, "total": 0},
+            "full_readiness": {"good": 0, "total": 0},
+        }
         self._started_monotonic = _time.monotonic()
         self._log_scan_offset = 0
 
@@ -344,20 +356,34 @@ class HealthMonitor:
 
     async def _run_critical_checks(self) -> None:
         try:
+            runner = await self._check_runner_process()
+            collector = await self._check_collector_heartbeat()
+            feed = await self._check_feed_state()
+            depth_snapshot = await self._check_depth_snapshot()
+            quote_freshness = await self._check_quote_freshness()
+            vix_warmup = await self._check_vix_warmup()
+            chain_fetch = await self._check_chain_fetch()
+            depth_readiness = await self._check_depth_readiness()
+            storage = await self._check_wd_mount()
             results = [
-                await self._check_runner_process(),
-                await self._check_collector_heartbeat(),
-                await self._check_feed_state(),
-                await self._check_depth_snapshot(),
-                await self._check_quote_freshness(),
-                await self._check_depth_readiness(),
-                await self._check_wd_mount(),
+                runner,
+                collector,
+                feed,
+                depth_snapshot,
+                quote_freshness,
+                vix_warmup,
+                chain_fetch,
+                depth_readiness,
+                storage,
             ]
             if sys.platform != "win32":
                 results.append(await self._check_clock_sync())
+            self._record_uptime("paper_engine", [runner, feed, quote_freshness, vix_warmup, chain_fetch])
+            self._record_uptime("depth_collector", [collector, depth_snapshot, depth_readiness])
             self._total_ticks += 1
             if all(result for result in results if result is not None):
                 self._good_ticks += 1
+            self._record_uptime("full_readiness", results)
             self._write_alert_state()
         except asyncio.CancelledError:
             raise
@@ -368,6 +394,7 @@ class HealthMonitor:
         try:
             await self._check_raw_packet_flush()
             await self._check_parquet_flush()
+            await self._check_1min_ohlcv_progression()
             await self._check_wd_free_space_slow()
             if sys.platform != "win32" and self._expected_ip:
                 await self._check_public_ip()
@@ -511,6 +538,50 @@ class HealthMonitor:
         await self._clear_alert("quote_freshness", "quote_freshness_low")
         return True
 
+    async def _check_vix_warmup(self) -> bool | None:
+        if not _is_feed_active():
+            await self._clear_alert("vix", "vix_quote_missing")
+            await self._clear_alert("vix", "vix_quote_stale")
+            return None
+        data = self._load_json_snapshot("latest_feed_state.json")
+        if data is None:
+            return False
+        core_quotes = data.get("core_quotes", {})
+        vix = core_quotes.get("INDIA_VIX", {})
+        if not vix or not vix.get("seen", False):
+            await self._alert("critical", "vix", "vix_quote_missing", "VIX quote not received after feed warm-up window")
+            return False
+        if not vix.get("fresh", False):
+            age = vix.get("age_seconds")
+            await self._alert("critical", "vix", "vix_quote_stale", f"VIX quote stale: age={age}s")
+            return False
+        await self._clear_alert("vix", "vix_quote_missing")
+        await self._clear_alert("vix", "vix_quote_stale")
+        return True
+
+    async def _check_chain_fetch(self) -> bool | None:
+        if not _is_trading_day(self._session_date) or _ist_time() < _CHAIN_CHECK_START or _ist_time() > _FEED_ACTIVE_END:
+            await self._clear_chain_alerts()
+            return None
+        data = self._load_json_snapshot("latest_feed_state.json")
+        if data is None:
+            return False
+        chain_status = data.get("chain_status", {})
+        expected = self._expected_trading_symbols()
+        if not expected:
+            return None
+        ok = True
+        for symbol in expected:
+            rec = chain_status.get(symbol, {})
+            reason = f"chain_not_loaded_{symbol.lower()}"
+            if rec.get("status") != "loaded":
+                msg = rec.get("error") or rec.get("reason") or "missing chain status"
+                await self._alert("critical", "chain_fetch", reason, f"{symbol} option chain not loaded: {msg}")
+                ok = False
+            else:
+                await self._clear_alert("chain_fetch", reason)
+        return ok
+
     async def _check_depth_readiness(self) -> bool | None:
         if not _is_feed_active():
             self._consecutive_bad["depth_readiness"] = 0
@@ -520,6 +591,23 @@ class HealthMonitor:
         if data is None:
             return False
         pct = float(data.get("ready_pct", data.get("depth_ready_pct", 0.0)))
+        by_symbol = data.get("by_symbol", {})
+        for symbol, rec in by_symbol.items():
+            sym_pct = float(rec.get("ready_pct", 0.0))
+            reason = f"depth_ready_low_{str(symbol).lower()}"
+            if sym_pct < _DEPTH_READY_MIN_PCT:
+                await self._alert(
+                    "critical",
+                    "depth_readiness",
+                    reason,
+                    (
+                        f"{symbol} depth ready {sym_pct:.1f}% "
+                        f"({int(rec.get('ready', 0))}/{int(rec.get('total', 0))}, "
+                        f"tracked {int(rec.get('tracked', 0))})"
+                    ),
+                )
+            else:
+                await self._clear_alert("depth_readiness", reason)
         if pct < _DEPTH_READY_MIN_PCT:
             self._consecutive_bad["depth_readiness"] += 1
             if self._consecutive_bad["depth_readiness"] >= 2:
@@ -618,6 +706,41 @@ class HealthMonitor:
         await self._clear_alert("parquet", "parquet_flush_stale")
         return True
 
+    async def _check_1min_ohlcv_progression(self) -> bool | None:
+        if not _is_trading_day(self._session_date) or _ist_time() < _ONE_MIN_CHECK_START or _ist_time() > _FEED_ACTIVE_END:
+            await self._clear_alert("order_book_1min", "one_min_missing")
+            await self._clear_alert("order_book_1min", "one_min_stuck")
+            await self._clear_alert("order_book_1min", "one_min_read_error")
+            return None
+        root = self._live_root / "order_book_1min" / self._date_str
+        files = list(root.glob("*.parquet")) if root.exists() else []
+        if not files:
+            await self._alert("warning", "order_book_1min", "one_min_missing", "no 1-minute order-book parquet files found")
+            return False
+        try:
+            import pyarrow.parquet as pq
+        except ImportError:
+            await self._alert("warning", "order_book_1min", "one_min_read_error", "pyarrow unavailable for 1-minute parquet row-count check")
+            return False
+        max_rows = 0
+        readable = 0
+        for path in files[:200]:
+            try:
+                max_rows = max(max_rows, pq.ParquetFile(path).metadata.num_rows)
+                readable += 1
+            except Exception:
+                continue
+        if readable == 0:
+            await self._alert("warning", "order_book_1min", "one_min_read_error", "no readable 1-minute order-book parquets")
+            return False
+        if max_rows <= 1:
+            await self._alert("warning", "order_book_1min", "one_min_stuck", f"1-minute order-book bars stuck at max_rows={max_rows} after {_ONE_MIN_CHECK_START}")
+            return False
+        await self._clear_alert("order_book_1min", "one_min_missing")
+        await self._clear_alert("order_book_1min", "one_min_stuck")
+        await self._clear_alert("order_book_1min", "one_min_read_error")
+        return True
+
     async def _check_wd_free_space_slow(self) -> bool:
         if self._wd_free_gb < _WD_MIN_GB_PRE_RUN and not _is_market_hours():
             await self._alert("warning", "storage", "wd_low_space_warn", f"pre-run WD free {self._wd_free_gb:.1f} GB (< 100 GB)")
@@ -686,6 +809,35 @@ class HealthMonitor:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return None
+
+    def _expected_trading_symbols(self) -> list[str]:
+        symbols = self._profile.get("symbols", {})
+        expected = [
+            str(symbol).upper()
+            for symbol, cfg in symbols.items()
+            if isinstance(cfg, dict) and cfg.get("trade", False)
+        ]
+        return sorted(expected)
+
+    async def _clear_chain_alerts(self) -> None:
+        for symbol in self._expected_trading_symbols():
+            await self._clear_alert("chain_fetch", f"chain_not_loaded_{symbol.lower()}")
+
+    def _record_uptime(self, name: str, results: list[bool | None]) -> None:
+        relevant = [result for result in results if result is not None]
+        if not relevant:
+            return
+        counter = self._uptime_counters.setdefault(name, {"good": 0, "total": 0})
+        counter["total"] += 1
+        if all(relevant):
+            counter["good"] += 1
+
+    def _uptime_pct(self, name: str) -> float:
+        counter = self._uptime_counters.get(name, {"good": 0, "total": 0})
+        total = counter.get("total", 0)
+        if not total:
+            return 0.0
+        return round(counter.get("good", 0) / total * 100, 2)
 
     async def _maybe_send_backend_healthy(self) -> None:
         if self._backend_open_sent_for == self._session_date:
@@ -821,11 +973,18 @@ class HealthMonitor:
 
     def _write_alert_state(self) -> None:
         uptime_pct = round(self._good_ticks / self._total_ticks * 100, 2) if self._total_ticks else 0.0
+        uptime_components = {
+            "paper_engine_uptime_pct": self._uptime_pct("paper_engine"),
+            "depth_collector_uptime_pct": self._uptime_pct("depth_collector"),
+            "full_readiness_uptime_pct": self._uptime_pct("full_readiness"),
+        }
         state = {
             "written_at": _now_ist().isoformat(),
             "session_date": self._session_date.isoformat(),
             "phase": self._phase,
             "uptime_pct": uptime_pct,
+            **uptime_components,
+            "uptime_counters": self._uptime_counters,
             "active_alerts": list(self._active_alerts.values()),
             "alert_counts": dict(self._alert_counts),
             "wd_free_gb": round(self._wd_free_gb, 2),
@@ -848,6 +1007,9 @@ class HealthMonitor:
             f"# Health Monitor Uptime Summary - {self._session_date}",
             "",
             f"- Uptime: {uptime_pct:.2f}%",
+            f"- Paper engine uptime: {self._uptime_pct('paper_engine'):.2f}%",
+            f"- Depth collector uptime: {self._uptime_pct('depth_collector'):.2f}%",
+            f"- Full readiness uptime: {self._uptime_pct('full_readiness'):.2f}%",
             f"- Alert counts: critical={self._alert_counts.get('critical', 0)}, warning={self._alert_counts.get('warning', 0)}, info={self._alert_counts.get('info', 0)}",
             f"- Data-gap minutes: {data_gap_minutes:.1f}",
             f"- WD free space: {self._wd_free_gb:.1f} GB",
@@ -865,6 +1027,9 @@ class HealthMonitor:
         msg = (
             f"[EOD] Health monitor summary {self._session_date}\n"
             f"Uptime: {uptime_pct:.2f}%\n"
+            f"Paper engine: {self._uptime_pct('paper_engine'):.2f}% | "
+            f"Depth collector: {self._uptime_pct('depth_collector'):.2f}% | "
+            f"Full readiness: {self._uptime_pct('full_readiness'):.2f}%\n"
             f"Alerts: critical={self._alert_counts.get('critical', 0)} warning={self._alert_counts.get('warning', 0)}\n"
             f"Data gaps: {data_gap_minutes:.1f} min\n"
             f"WD free: {self._wd_free_gb:.1f} GB\n"

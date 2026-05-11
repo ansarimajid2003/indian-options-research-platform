@@ -4,7 +4,7 @@ Documentation=file:///DATA/live-paper/indian-markets/docs/design/live_paper_trad
 After=network-online.target health-monitor.service
 Wants=network-online.target health-monitor.service
 StartLimitIntervalSec=600
-StartLimitBurst=5
+StartLimitBurst=8
 
 [Service]
 Type=simple

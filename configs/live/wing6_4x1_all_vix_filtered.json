@@ -10,8 +10,8 @@
   },
   "depth_collection": {
     "symbols": ["NIFTY", "FINNIFTY", "MIDCPNIFTY"],
-    "atm_offset_range": 20,
-    "max_depth_connections": 5
+    "atm_offset_range": 8,
+    "max_depth_connections": 3
   },
   "global": {
     "entry_time": "09:20",

@@ -5,7 +5,7 @@ import json
 import base64
 import struct
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -227,10 +227,10 @@ class LivePaperTests(unittest.TestCase):
         self.assertEqual(validate_profile(profile).status, "PASS")
         budget = validate_depth_budget(profile)
         self.assertEqual(budget.status, "PASS")
-        self.assertIn("246 instruments", budget.detail)
+        self.assertIn("102 instruments", budget.detail)
 
         too_small = json.loads(json.dumps(profile))
-        too_small["depth_collection"]["max_depth_connections"] = 4
+        too_small["depth_collection"]["max_depth_connections"] = 2
         self.assertEqual(validate_depth_budget(too_small).status, "FAIL")
 
     def test_resume_checkpoint_metadata_reaches_eod_summary(self) -> None:
@@ -287,6 +287,97 @@ class LivePaperTests(unittest.TestCase):
         alert = asyncio.run(run_case())
         self.assertEqual(alert["component"], "quote_freshness")
         self.assertEqual(alert["reason"], "quote_freshness_low")
+
+    def test_health_monitor_flags_missing_vix_warmup(self) -> None:
+        async def run_case() -> dict:
+            root = Path("tmp_live_tests") / "vix_warmup_case"
+            (root / "snapshots").mkdir(parents=True, exist_ok=True)
+            (root / "snapshots" / "latest_feed_state.json").write_text(json.dumps({
+                "written_at": datetime.now(tz=ZoneInfo("Asia/Kolkata")).isoformat(),
+                "connected": True,
+                "core_quotes": {"INDIA_VIX": {"seen": False, "fresh": False}},
+            }))
+            monitor = HealthMonitor(profile={}, live_root=root)
+            with patch("scripts.live.health_monitor._is_feed_active", return_value=True):
+                await monitor._check_vix_warmup()
+            alert_path = root / "alerts" / f"{monitor._date_str}_alerts.jsonl"
+            return json.loads(alert_path.read_text().splitlines()[-1])
+
+        alert = asyncio.run(run_case())
+        self.assertEqual(alert["component"], "vix")
+        self.assertEqual(alert["reason"], "vix_quote_missing")
+
+    def test_health_monitor_flags_chain_fetch_failures(self) -> None:
+        async def run_case() -> dict:
+            root = Path("tmp_live_tests") / "chain_fetch_case"
+            (root / "snapshots").mkdir(parents=True, exist_ok=True)
+            (root / "snapshots" / "latest_feed_state.json").write_text(json.dumps({
+                "written_at": datetime.now(tz=ZoneInfo("Asia/Kolkata")).isoformat(),
+                "connected": True,
+                "chain_status": {
+                    "NIFTY": {"status": "loaded", "instrument_count": 34},
+                    "SENSEX": {"status": "failed", "error": "HTTP 429"},
+                },
+            }))
+            profile = {
+                "symbols": {
+                    "NIFTY": {"trade": True},
+                    "SENSEX": {"trade": True},
+                    "BANKNIFTY": {"trade": False},
+                }
+            }
+            monitor = HealthMonitor(profile=profile, live_root=root)
+            with patch("scripts.live.health_monitor._is_trading_day", return_value=True), \
+                    patch("scripts.live.health_monitor._ist_time", return_value=time(9, 18)):
+                await monitor._check_chain_fetch()
+            alert_path = root / "alerts" / f"{monitor._date_str}_alerts.jsonl"
+            return json.loads(alert_path.read_text().splitlines()[-1])
+
+        alert = asyncio.run(run_case())
+        self.assertEqual(alert["component"], "chain_fetch")
+        self.assertEqual(alert["reason"], "chain_not_loaded_sensex")
+
+    def test_health_monitor_flags_stuck_1min_order_book(self) -> None:
+        async def run_case() -> dict:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            root = Path("tmp_live_tests") / "one_min_stuck_case"
+            date_str = datetime.now(tz=ZoneInfo("Asia/Kolkata")).strftime("%Y%m%d")
+            out_dir = root / "order_book_1min" / date_str
+            out_dir.mkdir(parents=True, exist_ok=True)
+            table = pa.table({
+                "timestamp": ["2026-05-12T09:15:00+05:30"],
+                "open": [1.0],
+                "high": [1.0],
+                "low": [1.0],
+                "close": [1.0],
+                "volume": [1],
+                "spread_pct_mean": [0.1],
+            })
+            pq.write_table(table, out_dir / "NIFTY_2026-05-12_25000_CE.parquet")
+            monitor = HealthMonitor(profile={}, live_root=root)
+            with patch("scripts.live.health_monitor._is_trading_day", return_value=True), \
+                    patch("scripts.live.health_monitor._ist_time", return_value=time(9, 31)):
+                await monitor._check_1min_ohlcv_progression()
+            alert_path = root / "alerts" / f"{monitor._date_str}_alerts.jsonl"
+            return json.loads(alert_path.read_text().splitlines()[-1])
+
+        alert = asyncio.run(run_case())
+        self.assertEqual(alert["component"], "order_book_1min")
+        self.assertEqual(alert["reason"], "one_min_stuck")
+
+    def test_health_monitor_alert_state_has_split_uptime(self) -> None:
+        root = Path("tmp_live_tests") / "split_uptime_case"
+        monitor = HealthMonitor(profile={}, live_root=root)
+        monitor._record_uptime("paper_engine", [True, True])
+        monitor._record_uptime("depth_collector", [True, False])
+        monitor._record_uptime("full_readiness", [True, False])
+        monitor._write_alert_state()
+        state = json.loads((root / "snapshots" / "latest_alert_state.json").read_text())
+        self.assertEqual(state["paper_engine_uptime_pct"], 100.0)
+        self.assertEqual(state["depth_collector_uptime_pct"], 0.0)
+        self.assertEqual(state["full_readiness_uptime_pct"], 0.0)
 
 
 if __name__ == "__main__":

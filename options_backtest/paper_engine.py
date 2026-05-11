@@ -252,6 +252,7 @@ class PaperTradingEngine:
 
         # Greeks/IV cache from option chain REST (security_id -> dict)
         self._chain_greeks: dict[str, dict] = {}
+        self._chain_status: dict[str, dict] = {}
 
         # Last parsed type-8 top-of-book per security_id (for SENSEX fallback)
         self._last_tob: dict[str, dict] = {}
@@ -348,11 +349,15 @@ class PaperTradingEngine:
         self._phase = "connecting"
         feed_task = asyncio.create_task(self._feed_loop())
 
-        # 09:10 — check feed connection; grant up to 45s grace for mid-session restarts
+        # 09:10 — check feed connection; mid-session restarts need extra time
+        # because the websocket task starts from cold after systemd restarts.
         await _sleep_until(_T_CHECK_FEED, self._session_date)
         if not self._feed_connected:
-            _log.info("paper_engine: feed not connected at 09:10 check — waiting up to 45s")
-            for _ in range(45):
+            now = _now_ist()
+            entry_cutoff = datetime.combine(self._session_date, _T_ENTRY, tzinfo=_IST)
+            grace = 120 if now > entry_cutoff else 45
+            _log.info("paper_engine: feed not connected at 09:10 check — waiting up to %ds", grace)
+            for _ in range(grace):
                 await asyncio.sleep(1)
                 if self._feed_connected:
                     _log.info("paper_engine: feed connected during grace period")
@@ -431,8 +436,18 @@ class PaperTradingEngine:
                     self._ws = ws
                     self._feed_connected = True
                     _log.info("live_feed: connected")
+                    await self._subscribe_instruments(ws, self._core_subscriptions())
                     if self._subscribed_ids:
-                        await self._subscribe_instruments(ws, self._subscribed_ids)
+                        core_keys = {
+                            (inst["ExchangeSegment"], str(inst["SecurityId"]))
+                            for inst in self._core_subscriptions()
+                        }
+                        queued = [
+                            inst for inst in self._subscribed_ids
+                            if (inst["ExchangeSegment"], str(inst["SecurityId"])) not in core_keys
+                        ]
+                        if queued:
+                            await self._subscribe_instruments(ws, queued)
                     async for raw in ws:
                         if isinstance(raw, bytes):
                             self._handle_feed_packet(raw)
@@ -523,6 +538,22 @@ class PaperTradingEngine:
             }
             await ws.send(json.dumps(sub))
 
+    def _core_subscriptions(self) -> list[dict]:
+        """Spot indices + VIX; subscribe immediately on every websocket connect."""
+        spot_ids = {
+            "NIFTY": "13",
+            "FINNIFTY": "27",
+            "MIDCPNIFTY": "442",
+            "SENSEX": "51",
+            "BANKNIFTY": "25",
+        }
+        instruments = [
+            {"ExchangeSegment": _SEG_IDX, "SecurityId": sid}
+            for sid in spot_ids.values()
+        ]
+        instruments.append({"ExchangeSegment": _SEG_IDX, "SecurityId": self._vix_security_id})
+        return instruments
+
     # ──────────────────────────────────────────────────────────────────────────
     # Chain fetch + subscriptions
     # ──────────────────────────────────────────────────────────────────────────
@@ -532,14 +563,9 @@ class PaperTradingEngine:
         depth_cfg = self._profile.get("depth_collection", {})
         chain_offset_range = int(depth_cfg.get("atm_offset_range", 20))
 
-        # Always subscribe spot indices and VIX
-        spot_ids = {
-            "NIFTY": "13", "FINNIFTY": "27", "MIDCPNIFTY": "442",
-            "SENSEX": "51", "BANKNIFTY": "25",
-        }
-        for sym, sid in spot_ids.items():
-            instruments_to_sub.append({"ExchangeSegment": _SEG_IDX, "SecurityId": sid})
-        instruments_to_sub.append({"ExchangeSegment": _SEG_IDX, "SecurityId": self._vix_security_id})
+        # Keep core subscriptions in the persisted subscription set so reconnects
+        # after chain fetch restore spot/VIX plus options in one pass.
+        instruments_to_sub.extend(self._core_subscriptions())
 
         for symbol, resolver in self._resolvers.items():
             sym_cfg = self._profile["symbols"][symbol]
@@ -551,17 +577,34 @@ class PaperTradingEngine:
                 expiry = expiry_on_or_after(symbol, self._session_date, expiry_type=expiry_type)
             except Exception as exc:
                 _log.warning("chain_fetch: %s — expiry resolution failed: %r", symbol, exc)
+                self._chain_status[symbol] = {
+                    "status": "failed",
+                    "reason": "expiry_resolution_failed",
+                    "error": repr(exc),
+                    "checked_at": _ts_str(),
+                }
                 continue
 
+            self._chain_status[symbol] = {
+                "status": "pending",
+                "expiry": expiry.isoformat(),
+                "checked_at": _ts_str(),
+            }
             for attempt in range(3):
                 try:
                     if attempt > 0:
-                        await asyncio.sleep(1.2 * attempt)
+                        await asyncio.sleep(2.0 * (2 ** attempt))
                     resolver.refresh_option_chain(expiry, scrip_id, segment)
                     sids = resolver.security_ids_around_chain_atm(offset_range=chain_offset_range)
                     if not sids:
                         raise ValueError(f"no ATM +/- {chain_offset_range} security ids from option chain")
                     self._chain_greeks.update(resolver.chain_metadata(sids))
+                    self._chain_status[symbol] = {
+                        "status": "loaded",
+                        "expiry": expiry.isoformat(),
+                        "instrument_count": len(sids),
+                        "checked_at": _ts_str(),
+                    }
                     break
                 except Exception as exc:
                     if attempt < 2:
@@ -569,11 +612,19 @@ class PaperTradingEngine:
                     else:
                         _log.warning("chain_fetch: %s — REST failed after 3 attempts: %r", symbol, exc)
                         self._log_signal("skip", symbol, "chain_not_loaded")
+                        self._chain_status[symbol] = {
+                            "status": "failed",
+                            "expiry": expiry.isoformat(),
+                            "reason": "chain_not_loaded",
+                            "error": repr(exc),
+                            "checked_at": _ts_str(),
+                        }
                         sids = []
             if not sids:
                 continue
-            # 0.3s between symbols to stay within Dhan 5 req/s limit
-            await asyncio.sleep(0.3)
+            # Restart-time bursts can trip Dhan rate limits; slow down after open.
+            chain_delay = 2.0 if _now_ist().time() > _T_CHAIN_FETCH else 0.3
+            await asyncio.sleep(chain_delay)
 
             _log.info("chain_fetch: %s expiry=%s instruments=%d", symbol, expiry, len(sids))
 
@@ -1075,20 +1126,19 @@ class PaperTradingEngine:
                     if inst.get("ExchangeSegment") in (_SEG_NSE_FNO, _SEG_BSE_FNO)]
         ready = sum(1 for sid in sub_sids if self._is_quote_fresh(sid)) if sub_sids else 0
         freshness_pct = round(ready / len(sub_sids) * 100, 1) if sub_sids else 0.0
+        quotes = self._merged_quote_snapshot()
 
         state = {
             "written_at": _ts_str(),
             "connected": self._feed_connected,
             "subscribed_count": len(self._subscribed_ids),
             "quote_freshness_pct": freshness_pct,
+            "core_quotes": self._core_quote_state(quotes),
+            "chain_status": dict(self._chain_status),
         }
         _write_atomic(self._snapshot_dir / "latest_feed_state.json", state)
 
         # Per-security quotes: merge last_tob + resolver quote snapshots + chain greeks
-        quotes: dict[str, dict] = {}
-        for resolver in self._resolvers.values():
-            for sid, q in resolver.quote_snapshot().items():
-                quotes[sid] = q
         for sid, tob in self._last_tob.items():
             if sid not in quotes:
                 quotes[sid] = {"ltp": tob.get("ltp", 0.0), "oi": 0, "volume": 0, "ts": tob.get("ts", pd.Timestamp.now(tz="Asia/Kolkata")).isoformat()}
@@ -1100,6 +1150,40 @@ class PaperTradingEngine:
                 quotes[sid]["theta"] = (meta.get("greeks") or {}).get("theta")
         if quotes:
             _write_atomic(self._snapshot_dir / "latest_quotes.json", {"written_at": _ts_str(), "quotes": quotes})
+
+    def _merged_quote_snapshot(self) -> dict[str, dict]:
+        quotes: dict[str, dict] = {}
+        for resolver in self._resolvers.values():
+            for sid, q in resolver.quote_snapshot().items():
+                quotes[sid] = q
+        return quotes
+
+    def _core_quote_state(self, quotes: dict[str, dict]) -> dict[str, dict]:
+        core_ids = {
+            "NIFTY": "13",
+            "FINNIFTY": "27",
+            "MIDCPNIFTY": "442",
+            "SENSEX": "51",
+            "BANKNIFTY": "25",
+            "INDIA_VIX": self._vix_security_id,
+        }
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        out: dict[str, dict] = {}
+        for name, sid in core_ids.items():
+            quote = quotes.get(str(sid))
+            ts = pd.Timestamp(quote["ts"]) if quote and quote.get("ts") else None
+            age = (now - ts).total_seconds() if ts is not None else None
+            max_age = 60 if name == "INDIA_VIX" else _SPOT_MAX_AGE
+            out[name] = {
+                "security_id": str(sid),
+                "seen": quote is not None,
+                "fresh": bool(age is not None and age <= max_age),
+                "age_seconds": round(age, 1) if age is not None else None,
+                "ltp": quote.get("ltp") if quote else None,
+                "ts": quote.get("ts") if quote else None,
+                "max_age_seconds": max_age,
+            }
+        return out
 
     def _update_spot_bar(self, symbol: str, ltp: float, ts: pd.Timestamp) -> None:
         """Accumulate spot LTP ticks into 1-min OHLCV bars (called from async feed handler)."""
