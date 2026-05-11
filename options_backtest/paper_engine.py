@@ -16,7 +16,7 @@ import logging
 import os
 import struct
 import time as _time
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -79,6 +79,8 @@ async def _sleep_until(target_time: time, session_date: date) -> None:
     now = _now_ist()
     if now < target:
         await asyncio.sleep((target - now).total_seconds())
+    else:
+        await asyncio.sleep(0)  # yield to scheduler so queued tasks can run
 
 
 def _ts_str() -> str:
@@ -337,11 +339,18 @@ class PaperTradingEngine:
         self._phase = "connecting"
         feed_task = asyncio.create_task(self._feed_loop())
 
-        # 09:10 — check feed connection
+        # 09:10 — check feed connection; grant up to 45s grace for mid-session restarts
         await _sleep_until(_T_CHECK_FEED, self._session_date)
         if not self._feed_connected:
+            _log.info("paper_engine: feed not connected at 09:10 check — waiting up to 45s")
+            for _ in range(45):
+                await asyncio.sleep(1)
+                if self._feed_connected:
+                    _log.info("paper_engine: feed connected during grace period")
+                    break
+        if not self._feed_connected:
             self._log_signal("skip", "ALL", "feed_not_connected")
-            _log.error("paper_engine: feed not connected at 09:10 — aborting day")
+            _log.error("paper_engine: feed not connected after grace period — aborting day")
             self._stop_event.set()
             await asyncio.gather(feed_task, snapshot_task, return_exceptions=True)
             return
@@ -359,11 +368,16 @@ class PaperTradingEngine:
         await _sleep_until(_T_ENTRY, self._session_date)
         self._phase = "entry"
 
-        # Skip entry if we resumed from checkpoint (crash recovery already has positions)
-        if not self._open_positions:
-            await self._enter_all_symbols()
-        else:
+        # Skip entry if we resumed from checkpoint, or if restarting mid-session
+        # (> 5 min past entry window — fills at this time are not representative)
+        _entry_cutoff = datetime.combine(self._session_date, _T_ENTRY, tzinfo=_IST)
+        _late_restart = _now_ist() > _entry_cutoff + timedelta(minutes=5)
+        if self._open_positions:
             _log.info("paper_engine: resumed from checkpoint — skipping entry phase")
+        elif _late_restart:
+            _log.info("paper_engine: mid-session restart past entry window — skipping entry, fetching chains for option chain snapshot")
+        else:
+            await self._enter_all_symbols()
 
         # 09:21–15:19 — monitor (mark-to-market snapshots only)
         self._phase = "monitoring"

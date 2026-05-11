@@ -130,18 +130,15 @@ function EquityCurvePanel({ seriesRef, equityState, accentColor = '#4ade80' }) {
     chartRef.current = chart;
     netSeriesRef.current = series;
     seriesRef.current = series;
-    if (equityState.length) {
-      series.setData(equityState.map(p => ({ time: p.time, value: p.cumulative_net_pnl })));
-      setTimeout(() => chart.timeScale().fitContent(), 80);
-    }
-    if (window.__pendingEquityData) {
-      const pending = window.__pendingEquityData.map(p => ({ time: p.time, value: p.cumulative_net_pnl }));
-      series.setData(pending);
-      window.__pendingEquityData = null;
-      setTimeout(() => chart.timeScale().fitContent(), 80);
-    }
     return () => { chart.remove(); };
   }, []);
+
+  // Load/update equity data when it arrives
+  useEffect(() => {
+    if (!netSeriesRef.current || !equityState.length) return;
+    netSeriesRef.current.setData(equityState.map(p => ({ time: p.time, value: p.cumulative_net_pnl })));
+    setTimeout(() => chartRef.current?.timeScale().fitContent(), 80);
+  }, [equityState]);
 
   useEffect(() => {
     if (!netSeriesRef.current) return;
@@ -375,8 +372,9 @@ function SpotChartCard({ symbol, bars, marketClosed }) {
   const seriesRef = useRef(null);
   const [tf, setTf] = useState(1);
 
+  // Create chart on mount unconditionally — data is set by the bars effect below
   useEffect(() => {
-    if (!containerRef.current || !window.LightweightCharts || !bars.length) return;
+    if (!containerRef.current || !window.LightweightCharts) return;
     const chart = window.LightweightCharts.createChart(containerRef.current, {
       autoSize: true,
       layout: { background: { type: 'solid', color: '#111111' }, textColor: '#6e6e6e', fontFamily: 'JetBrains Mono', fontSize: 9 },
@@ -391,26 +389,19 @@ function SpotChartCard({ symbol, bars, marketClosed }) {
       borderUpColor: '#4ade80', borderDownColor: '#f87171',
       wickUpColor: 'rgba(74,222,128,0.5)', wickDownColor: 'rgba(248,113,113,0.5)',
     });
-    series.setData(aggregateBars(bars, 1));
     chartRef.current = chart;
     seriesRef.current = series;
-    setTimeout(() => chart.timeScale().fitContent(), 80);
     return () => chart.remove();
   }, []);
 
+  // Set/update data whenever bars or tf changes
   useEffect(() => {
-    if (!seriesRef.current || !bars.length) return;
+    if (!seriesRef.current) return;
+    if (!bars.length) return;
     const tfOpt = TF_OPTIONS.find(t => t.minutes === tf) || TF_OPTIONS[0];
     seriesRef.current.setData(aggregateBars(bars, tfOpt.minutes));
     setTimeout(() => chartRef.current?.timeScale().fitContent(), 50);
-  }, [bars]);
-
-  useEffect(() => {
-    if (!seriesRef.current || !bars.length) return;
-    const tfOpt = TF_OPTIONS.find(t => t.minutes === tf);
-    seriesRef.current.setData(aggregateBars(bars, tfOpt.minutes));
-    setTimeout(() => chartRef.current?.timeScale().fitContent(), 50);
-  }, [tf]);
+  }, [bars, tf]);
 
   const last  = bars[bars.length - 1] || {};
   const first = bars[0] || {};
