@@ -692,11 +692,11 @@ async def collect_order_book(
         raise
     finally:
         collector.stop()
-        _write_collector_state(live_root, date_str, "stopped", all_sids)
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.to_thread(_write_collector_state, live_root, date_str, "stopped", all_sids)
 
 
 if __name__ == "__main__":
