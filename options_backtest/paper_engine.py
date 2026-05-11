@@ -531,16 +531,27 @@ class PaperTradingEngine:
                 _log.warning("chain_fetch: %s — expiry resolution failed: %r", symbol, exc)
                 continue
 
-            try:
-                resolver.refresh_option_chain(expiry, scrip_id, segment)
-                sids = resolver.security_ids_around_chain_atm(offset_range=chain_offset_range)
-                if not sids:
-                    raise ValueError(f"no ATM +/- {chain_offset_range} security ids from option chain")
-                self._chain_greeks.update(resolver.chain_metadata(sids))
-            except Exception as exc:
-                _log.warning("chain_fetch: %s — REST failed: %r", symbol, exc)
-                self._log_signal("skip", symbol, "chain_not_loaded")
+            for attempt in range(3):
+                try:
+                    if attempt > 0:
+                        await asyncio.sleep(1.2 * attempt)
+                    resolver.refresh_option_chain(expiry, scrip_id, segment)
+                    sids = resolver.security_ids_around_chain_atm(offset_range=chain_offset_range)
+                    if not sids:
+                        raise ValueError(f"no ATM +/- {chain_offset_range} security ids from option chain")
+                    self._chain_greeks.update(resolver.chain_metadata(sids))
+                    break
+                except Exception as exc:
+                    if attempt < 2:
+                        _log.warning("chain_fetch: %s — attempt %d failed: %r — retrying", symbol, attempt + 1, exc)
+                    else:
+                        _log.warning("chain_fetch: %s — REST failed after 3 attempts: %r", symbol, exc)
+                        self._log_signal("skip", symbol, "chain_not_loaded")
+                        sids = []
+            if not sids:
                 continue
+            # 0.3s between symbols to stay within Dhan 5 req/s limit
+            await asyncio.sleep(0.3)
 
             _log.info("chain_fetch: %s expiry=%s instruments=%d", symbol, expiry, len(sids))
 
