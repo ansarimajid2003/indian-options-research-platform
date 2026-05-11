@@ -44,7 +44,7 @@ body {
 .topbar {
   height: 48px;
   display: grid;
-  grid-template-columns: 280px 1fr 280px;
+  grid-template-columns: 280px 1fr 360px;
   align-items: center;
   border-bottom: 1px solid var(--border);
   background: linear-gradient(180deg, #0d0d0d, var(--bg));
@@ -91,6 +91,22 @@ body {
 .tab.disabled { color: var(--text-4); cursor: not-allowed; }
 
 .topbar-right { display: flex; align-items: center; gap: 10px; justify-content: flex-end; padding: 0 16px; }
+.cmd-input {
+  width: 72px;
+  height: 24px;
+  background: var(--panel-3);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0 8px;
+  outline: none;
+  border-radius: 0;
+}
+.cmd-input::placeholder { color: var(--text-4); }
+.cmd-input:focus { border-color: var(--cyan); }
 .clock {
   font-family: 'JetBrains Mono', monospace; font-size: 12px;
   color: var(--text-2);
@@ -131,6 +147,13 @@ body {
   font-size: 11px; color: var(--text-3);
   font-family: 'JetBrains Mono', monospace;
 }
+
+.handoff-shell {
+  min-height: calc(100vh - 48px);
+  padding: 12px;
+  background: var(--bg);
+}
+.handoff-panel { min-height: 220px; }
 
 /* status badges */
 .badge {
@@ -716,4 +739,3 @@ svg.icon { display: block; }
   font-family: 'JetBrains Mono', monospace;
 }
 .chain-footer span { display: flex; gap: 5px; align-items: center; }
-

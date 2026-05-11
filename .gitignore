@@ -46,6 +46,7 @@ exports/
 downloads/
 
 # Generated backtest run output (large trade ledger CSVs)
+reports/backtests/dashboard_runs/
 reports/backtests/options/focused/
 reports/backtests/options/legacy/runs/newer/
 reports/backtests/options/*.csv

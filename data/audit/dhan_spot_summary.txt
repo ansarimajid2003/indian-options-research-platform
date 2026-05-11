@@ -1,8 +1,8 @@
 DHAN SPOT DATA AUDIT SUMMARY
-Files processed: 13
+Files processed: 14
 Files with errors: 0
-Clean rows: 289,023
+Clean rows: 292,398
 Bad OHLC rows: 65
 
 Per-symbol rows:
-  SENSEX    :    289,023
+  SENSEX    :    292,398

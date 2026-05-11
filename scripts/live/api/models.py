@@ -229,13 +229,32 @@ class V2PendingResponse(BaseModel):
 
 class BacktestSummaryModel(BaseModel):
     id: str
+    name: str = ""
     strategy: str
+    symbol: str = ""
     start_date: str
     end_date: str
+    date_from: str = ""
+    date_to: str = ""
     trades: int
     net_pnl: float
+    cagr: float | None = None
     sharpe: float | None = None
+    sortino: float | None = None
+    calmar: float | None = None
     max_dd_pct: float | None = None
+    win_rate: float | None = None
+    profit_factor: float | None = None
+    t_stat: float | None = None
+    created_at: str = ""
+    source_path: str = ""
+    source_kind: str = "canonical"
+    legacy: bool = False
+    compat_version: str = "v2"
+    has_ledger: bool = True
+    has_equity: bool = True
+    has_decisions: bool = False
+    warnings: list[str] = Field(default_factory=list)
 
 
 class BacktestListResponse(BaseModel):
@@ -252,6 +271,12 @@ class OHLCVBar(BaseModel):
     close: float
     volume: int
     oi: int | None = None
+    iv_clean: float | None = None
+    strike: float | None = None
+    spot: float | None = None
+    expiry: str | None = None
+    option_type: str | None = None
+    settle_price: float | None = None
 
 
 class OHLCVResponse(BaseModel):
@@ -259,3 +284,92 @@ class OHLCVResponse(BaseModel):
     bars: list[OHLCVBar] = Field(default_factory=list)
     truncated: bool = False
     """True when the response was capped at the row limit"""
+
+    stats: dict[str, float] = Field(default_factory=dict)
+    """bars_count, mean_close, min_close, max_close, std_close, total_volume, truncated"""
+
+    source: str = ""
+    generated_at: str = ""
+    row_count: int = 0
+    cache_age_s: float | None = None
+    data_age_s: float | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class HistoricalMetadata(BaseModel):
+    symbol: str
+    date_min: str = ""
+    date_max: str = ""
+    expiries: list[str] = Field(default_factory=list)
+    strikes: list[int] = Field(default_factory=list)
+    expiry_types: list[str] = Field(default_factory=list)
+    atm_offsets: list[str] = Field(default_factory=list)
+    opt_types: list[str] = Field(default_factory=list)
+    source: str = ""
+
+
+class DrawdownPoint(BaseModel):
+    date: str
+    drawdown_pct: float
+
+
+class MonthlyReturn(BaseModel):
+    year: int
+    month: int
+    net_pnl: float
+    return_pct: float
+
+
+class TradeLedgerRow(BaseModel):
+    entry_date: str = ""
+    exit_date: str = ""
+    symbol: str = ""
+    expiry: str = ""
+    dte: int | None = None
+    vix: float | None = None
+    vix_bucket: str | None = None
+    entry_credit: float = 0.0
+    gross_pnl: float = 0.0
+    net_pnl: float = 0.0
+    exit_reason: str = ""
+    entry_legs_raw: str | None = None
+    exit_legs_raw: str | None = None
+    legacy: bool = False
+    symbol_inferred: bool = False
+
+
+class LedgerResponse(BaseModel):
+    total: int
+    page: int
+    size: int
+    rows: list[TradeLedgerRow]
+    source_kind: str = "canonical"
+    warnings: list[str] = Field(default_factory=list)
+
+
+class EventOverlayPoint(BaseModel):
+    ts: str
+    symbol: str = ""
+    event_type: str
+    severity: str = "info"
+    label: str = ""
+    details: dict[str, str | float | int | None] = Field(default_factory=dict)
+
+
+class DecisionLogRow(BaseModel):
+    ts: str
+    symbol: str
+    decision: str
+    reason: str
+    vix: float | None = None
+    dte: int | None = None
+    expiry: str | None = None
+    eligible: bool | None = None
+    selected: bool | None = None
+
+
+class DecisionLogResponse(BaseModel):
+    total: int
+    rows: list[DecisionLogRow]
+    has_decisions: bool = False
+    warnings: list[str] = Field(default_factory=list)

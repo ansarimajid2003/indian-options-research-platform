@@ -76,11 +76,19 @@ function adaptSignalLog(apiEntry) {
 }
 
 // ── TopBar ───────────────────────────────────────────────────────────────
-function TopBar({ activeTab, onTab, brandName, brandSub }) {
+function TopBar({ activeTab, onTab, onCommand, brandName, brandSub }) {
   const now = useClock();
+  const [command, setCommand] = useState('');
   const hh = String(now.getHours()).padStart(2,'0');
   const mm = String(now.getMinutes()).padStart(2,'0');
   const ss = String(now.getSeconds()).padStart(2,'0');
+  function submitCommand(ev) {
+    if (ev.key !== 'Enter') return;
+    const text = command.trim();
+    if (!text) return;
+    onCommand(text);
+    setCommand('');
+  }
   return (
     <div className="topbar">
       <div className="brand">
@@ -94,10 +102,22 @@ function TopBar({ activeTab, onTab, brandName, brandSub }) {
           <Icon name="dot" size={9} color="oklch(0.78 0.18 150)"/>
           Live Monitor
         </div>
-        <div className="tab disabled">Historical Explorer<span className="pill">v2</span></div>
-        <div className="tab disabled">Backtests<span className="pill">v2</span></div>
+        <div className={`tab ${activeTab==='historical' ? 'active' : ''}`} onClick={() => onTab('historical')}>
+          Historical Explorer<span className="pill">v2</span>
+        </div>
+        <div className={`tab ${activeTab==='backtests' ? 'active' : ''}`} onClick={() => onTab('backtests')}>
+          Backtests<span className="pill">v2</span>
+        </div>
       </div>
       <div className="topbar-right">
+        <input
+          className="cmd-input"
+          value={command}
+          onChange={ev => setCommand(ev.target.value)}
+          onKeyDown={submitCommand}
+          placeholder="CMD"
+          aria-label="Dashboard command"
+        />
         <span className="clock">
           <span className="muted">IST</span>
           <span>{hh}<span style={{color:'var(--text-4)'}}>:</span>{mm}<span style={{color:'var(--text-4)'}}>:</span>{ss}</span>
@@ -110,6 +130,38 @@ function TopBar({ activeTab, onTab, brandName, brandSub }) {
 }
 
 // ── HeaderStrip ──────────────────────────────────────────────────────────
+function HistoricalTabPlaceholder({ symbol }) {
+  return (
+    <div className="handoff-shell" data-screen-label="02 Historical Explorer">
+      <div className="panel handoff-panel">
+        <div className="panel-header">
+          <div className="panel-title">Historical Explorer <span className="count">{symbol}</span></div>
+          <span className="badge ghost">v2 shell</span>
+        </div>
+        <div className="panel-body pad">
+          <div className="empty">FRONTEND COMPONENT PENDING</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BacktestsTabPlaceholder() {
+  return (
+    <div className="handoff-shell" data-screen-label="03 Backtests">
+      <div className="panel handoff-panel">
+        <div className="panel-header">
+          <div className="panel-title">Backtests</div>
+          <span className="badge ghost">v2 shell</span>
+        </div>
+        <div className="panel-body pad">
+          <div className="empty">FRONTEND COMPONENT PENDING</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function HeaderStrip({ summary, session }) {
   const sess = session || {};
   const sessionDate  = sess.session_date || '—';
@@ -264,6 +316,9 @@ function App() {
   const [connected,  setConnected]  = useState(false);
   const [audioOn,    setAudioOn]    = useState(true);
   const [wdHistory,  setWdHistory]  = useState([]);
+  const [activeTab,  setActiveTab]  = useState('live');
+  const [historicalSymbol, setHistoricalSymbol] = useState('NIFTY');
+  const alertPanelRef = useRef(null);
 
   // Spot data — starts empty, replaced by API data on mount
   const [spotData, setSpotData] = useState({
@@ -277,6 +332,28 @@ function App() {
   const [chainLoaded, setChainLoaded] = useState(false);
 
   const seriesRef = useRef(null);
+
+  function handleCommand(raw) {
+    const parts = raw.toUpperCase().split(/\s+/).filter(Boolean);
+    const cmd = parts[0] || '';
+    if (cmd === 'LIVE') {
+      setActiveTab('live');
+      return;
+    }
+    if (cmd === 'HIST') {
+      if (parts[1]) setHistoricalSymbol(parts[1]);
+      setActiveTab('historical');
+      return;
+    }
+    if (cmd === 'BT' || cmd === 'BACKTESTS') {
+      setActiveTab('backtests');
+      return;
+    }
+    if (cmd === 'ALRT') {
+      setActiveTab('live');
+      window.setTimeout(() => alertPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
+    }
+  }
 
   // ── Initial REST fetch ─────────────────────────────────────────────────
   useEffect(() => {
@@ -430,32 +507,42 @@ function App() {
 
   // DepthSummary from session.depth (aggregate stats only)
   const depthSummary = session?.depth ?? null;
+  const HistoricalComponent = window.HistoricalTab?.HistoricalTab || window.HistoricalTab || HistoricalTabPlaceholder;
+  const BacktestsComponent = window.BacktestsTab?.BacktestsTab || window.BacktestsTab || BacktestsTabPlaceholder;
 
   return (
     <div data-screen-label="01 Live Monitor">
-      <TopBar activeTab="live" onTab={() => {}}
+      <TopBar activeTab={activeTab} onTab={setActiveTab} onCommand={handleCommand}
         brandName={tweaks.brandName} brandSub={tweaks.brandSub} />
-      <HeaderStrip summary={summary} session={session} />
-      <div className="shell">
-        <div className="workspace">
-          <PositionsPanel positions={positions} />
-          <EquityCurvePanel seriesRef={seriesRef} equityState={equity}
-            accentColor={tweaks.accentColor} />
-          <SpotChartsRow spotData={spotData} marketClosed={marketClosed} />
-          <OptionChainPanel chainData={chainData} chainLoaded={chainLoaded} marketClosed={marketClosed} session={session} />
-          <SignalLogPanel entries={signalLog} />
-          <AlertsPanel alerts={alerts} />
-        </div>
-        <Sidebar
-          audioOn={audioOn}
-          onToggleAudio={() => setAudioOn(v => !v)}
-          depthSummary={depthSummary}
-          wdHistory={wdHistory}
-          storage={storage}
-          connected={connected}
-          session={session}
-        />
-      </div>
+      {activeTab === 'live' && (
+        <>
+          <HeaderStrip summary={summary} session={session} />
+          <div className="shell">
+            <div className="workspace">
+              <PositionsPanel positions={positions} />
+              <EquityCurvePanel seriesRef={seriesRef} equityState={equity}
+                accentColor={tweaks.accentColor} />
+              <SpotChartsRow spotData={spotData} marketClosed={marketClosed} />
+              <OptionChainPanel chainData={chainData} chainLoaded={chainLoaded} marketClosed={marketClosed} session={session} />
+              <SignalLogPanel entries={signalLog} />
+              <div ref={alertPanelRef}>
+                <AlertsPanel alerts={alerts} />
+              </div>
+            </div>
+            <Sidebar
+              audioOn={audioOn}
+              onToggleAudio={() => setAudioOn(v => !v)}
+              depthSummary={depthSummary}
+              wdHistory={wdHistory}
+              storage={storage}
+              connected={connected}
+              session={session}
+            />
+          </div>
+        </>
+      )}
+      {activeTab === 'historical' && <HistoricalComponent symbol={historicalSymbol} />}
+      {activeTab === 'backtests' && <BacktestsComponent />}
       <TweaksPanel tweaks={tweaks} setTweak={setTweak}>
         <TweakSection label="Branding">
           <TweakText label="Dashboard name" tweakKey="brandName" tweaks={tweaks} setTweak={setTweak} />

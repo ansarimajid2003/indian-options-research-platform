@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 import time as _time
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as _time_cls
@@ -28,12 +29,31 @@ import pandas as pd
 from .calendar import is_trading_day as _is_trading_day
 
 _REPO_ROOT = Path(__file__).parents[1]
+_DATA_ROOT = Path(os.environ.get("MARKET_DATA_ROOT", _REPO_ROOT / "data"))
+_REPORT_ROOT = Path(os.environ.get("BACKTEST_REPORT_ROOT", _REPO_ROOT / "reports" / "backtests"))
 _SPOT_FILES: dict[str, Path] = {
-    "NIFTY":      _REPO_ROOT / "data" / "processed" / "spot" / "nifty50_1min_CANONICAL.csv",
-    "FINNIFTY":   _REPO_ROOT / "data" / "processed" / "spot" / "finnifty_1min_DHAN.csv",
-    "MIDCPNIFTY": _REPO_ROOT / "data" / "processed" / "spot" / "midcpnifty_1min_DHAN.csv",
-    "SENSEX":     _REPO_ROOT / "data" / "processed" / "spot" / "sensex_1min_DHAN.csv",
+    "NIFTY":      _DATA_ROOT / "processed" / "spot" / "nifty50_1min_CANONICAL.csv",
+    "BANKNIFTY":  _DATA_ROOT / "processed" / "spot" / "banknifty_1min_DHAN.csv",
+    "FINNIFTY":   _DATA_ROOT / "processed" / "spot" / "finnifty_1min_DHAN.csv",
+    "MIDCPNIFTY": _DATA_ROOT / "processed" / "spot" / "midcpnifty_1min_DHAN.csv",
+    "SENSEX":     _DATA_ROOT / "processed" / "spot" / "sensex_1min_DHAN.csv",
 }
+_VIX_FILES = [
+    _DATA_ROOT / "processed" / "spot" / "indiavix_1min_DHAN.csv",
+    _DATA_ROOT / "processed" / "market_archive_cleaned" / "INDIA VIX_minute.csv",
+    _DATA_ROOT / "processed" / "market_archive_cleaned" / "INDIA VIX_day.csv",
+]
+_OPTIONS_ROOT = _DATA_ROOT / "processed" / "options" / "dhan"
+_BHAVCOPY_ROOT = _DATA_ROOT / "processed" / "nse" / "bhavcopy" / "fo"
+_BACKTEST_ROOT = _REPORT_ROOT / "dashboard_runs"
+_LEGACY_BACKTEST_ROOTS = [
+    _REPORT_ROOT / "options" / "focused",
+    _REPORT_ROOT / "options" / "risk_management",
+    _REPORT_ROOT / "options" / "research_validation",
+    _REPORT_ROOT / "options" / "monitoring",
+    _REPORT_ROOT / "options" / "legacy",
+]
+_HIST_ROW_LIMIT = 20_000
 
 _IST_NAME = "Asia/Kolkata"
 try:
@@ -728,14 +748,6 @@ class DashboardBridge:
 
     # ── Historical data (v2 scope — stubs) ──────────────────────────────────
 
-    def historical_spot(self, symbol: str, start: date, end: date) -> pd.DataFrame:
-        return pd.DataFrame()
-
-    def historical_options(
-        self, symbol: str, expiry: date, strike: int, opt_type: str
-    ) -> pd.DataFrame:
-        return pd.DataFrame()
-
     def historical_order_book(
         self,
         session_date: date,
@@ -746,19 +758,597 @@ class DashboardBridge:
     ) -> pd.DataFrame:
         return pd.DataFrame()
 
-    def historical_vix(self, start: date, end: date) -> pd.DataFrame:
-        return pd.DataFrame()
-
     # ── Backtest data (v2 scope — stubs) ─────────────────────────────────────
 
-    def backtest_summaries(self, root: Path) -> list:
-        return []
+    # v2 historical/backtest implementation. These later definitions replace
+    # the narrow stubs above while keeping this block easy to remove if needed.
+
+    @staticmethod
+    def _path_source(path: Path) -> str:
+        try:
+            return str(path.relative_to(_REPO_ROOT))
+        except ValueError:
+            return str(path)
+
+    @staticmethod
+    def _iso_ist(ts: Any) -> str:
+        stamp = pd.Timestamp(ts)
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize(_IST_NAME)
+        else:
+            stamp = stamp.tz_convert(_IST_NAME)
+        return stamp.isoformat()
+
+    @staticmethod
+    def _date_filter(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+        if df.empty:
+            return df
+        return df.loc[(df.index.date >= start) & (df.index.date <= end)]
+
+    @staticmethod
+    def _cap_rows(df: pd.DataFrame, limit: int = _HIST_ROW_LIMIT) -> pd.DataFrame:
+        truncated = len(df) > limit
+        out = df.iloc[:limit].copy() if truncated else df.copy()
+        out.attrs.update(df.attrs)
+        out.attrs["truncated"] = truncated
+        return out
+
+    @staticmethod
+    def _atm_sort_key(stem: str) -> int:
+        if stem == "ATM":
+            return 0
+        if stem.startswith("ATMm"):
+            return -int(stem.removeprefix("ATMm"))
+        if stem.startswith("ATMp"):
+            return int(stem.removeprefix("ATMp"))
+        return 999
+
+    @staticmethod
+    def _numeric(value: Any) -> float | None:
+        try:
+            if value is None or pd.isna(value):
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _safe_slug(text: str) -> str:
+        slug = re.sub(r"[^A-Za-z0-9_\-]+", "_", text).strip("_").lower()
+        return slug[:80] or "backtest"
+
+    @staticmethod
+    def _symbol_from_name(name: str) -> str:
+        upper = name.upper()
+        for sym in ("BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "NIFTY"):
+            if sym in upper:
+                return sym
+        return ""
+
+    @staticmethod
+    def _first_date(df: pd.DataFrame, candidates: list[str]) -> str | None:
+        for col in candidates:
+            if col in df.columns:
+                s = pd.to_datetime(df[col], errors="coerce").dropna()
+                if not s.empty:
+                    return pd.Timestamp(s.min()).date().isoformat()
+        return None
+
+    @staticmethod
+    def _last_date(df: pd.DataFrame, candidates: list[str]) -> str | None:
+        for col in candidates:
+            if col in df.columns:
+                s = pd.to_datetime(df[col], errors="coerce").dropna()
+                if not s.empty:
+                    return pd.Timestamp(s.max()).date().isoformat()
+        return None
+
+    @staticmethod
+    def _as_ist_index(values: Any) -> pd.DatetimeIndex:
+        raw = pd.to_datetime(values, errors="coerce")
+        mask = ~pd.isna(raw)
+        idx = pd.DatetimeIndex(raw[mask])
+        if idx.tz is None:
+            return idx.tz_localize(_IST_NAME)
+        return idx.tz_convert(_IST_NAME)
+
+    def _read_ohlcv_csv(self, path: Path, start: date, end: date) -> pd.DataFrame:
+        if not path.exists():
+            return pd.DataFrame()
+        df = pd.read_csv(path)
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        ts_col = "datetime" if "datetime" in df.columns else "timestamp"
+        if ts_col not in df.columns:
+            return pd.DataFrame()
+        parsed = pd.to_datetime(df[ts_col], errors="coerce")
+        mask = ~pd.isna(parsed)
+        df = df.loc[mask].copy()
+        idx = pd.DatetimeIndex(parsed.loc[mask])
+        df.index = idx.tz_localize(_IST_NAME) if idx.tz is None else idx.tz_convert(_IST_NAME)
+        for col in ("open", "high", "low", "close"):
+            if col not in df.columns:
+                df[col] = df["close"] if "close" in df.columns else 0.0
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "volume" not in df.columns:
+            df["volume"] = 0
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype("int64")
+        df = df[["open", "high", "low", "close", "volume"]].dropna(subset=["close"]).sort_index()
+        return self._date_filter(df, start, end)
+
+    def _resample_ohlcv(self, df: pd.DataFrame, tf_minutes: int) -> pd.DataFrame:
+        if df.empty or tf_minutes <= 1:
+            return df
+        agg: dict[str, str] = {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+        for col in ("oi", "iv_clean", "strike", "spot"):
+            if col in df.columns:
+                agg[col] = "last"
+        out = df.resample(f"{tf_minutes}min").agg(agg).dropna(subset=["open", "high", "low", "close"])
+        out.attrs.update(df.attrs)
+        return out
+
+    def _format_ohlcv(self, df: pd.DataFrame, extras: list[str] | None = None) -> pd.DataFrame:
+        extras = extras or []
+        if df.empty:
+            out = pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume", *extras])
+            out.attrs.update(df.attrs)
+            return out
+        out = df.copy()
+        out.insert(0, "ts", [self._iso_ist(ts) for ts in out.index])
+        cols = ["ts", "open", "high", "low", "close", "volume", *[c for c in extras if c in out.columns]]
+        out = out[cols].reset_index(drop=True)
+        out.attrs.update(df.attrs)
+        return out
+
+    def historical_spot(self, symbol: str, start: date, end: date, tf_minutes: int = 1) -> pd.DataFrame:
+        sym = symbol.upper()
+        path = _SPOT_FILES.get(sym)
+        if not path:
+            return pd.DataFrame()
+        cache_key = f"hist_spot_{sym}_{start}_{end}_{tf_minutes}"
+
+        def _load() -> pd.DataFrame:
+            df = self._read_ohlcv_csv(path, start, end)
+            df = self._resample_ohlcv(df, max(int(tf_minutes), 1))
+            df.attrs["source"] = self._path_source(path)
+            return self._format_ohlcv(self._cap_rows(df))
+
+        result = self._cached(cache_key, _TTL_HIST, _load)
+        return result if result is not None else pd.DataFrame()
+
+    def historical_options_metadata(self, symbol: str) -> dict:
+        sym = symbol.upper()
+        root = _OPTIONS_ROOT / sym.lower()
+        cache_key = f"hist_options_meta_{sym}"
+
+        def _load() -> dict:
+            if not root.exists():
+                return {}
+            files = sorted(root.rglob("*.parquet"))
+            if not files:
+                return {}
+            expiry_types = sorted({p.relative_to(root).parts[0] for p in files if len(p.relative_to(root).parts) >= 4})
+            offsets = sorted({p.stem for p in files}, key=self._atm_sort_key)
+            opt_types = sorted({p.parent.name for p in files if p.parent.name in {"call", "put"}})
+            sample_files = [
+                p for p in files
+                if p.stem == "ATM" and p.parent.name == "call"
+            ] or files[:1]
+            ts_parts = []
+            for sample_path in sample_files:
+                sample = pd.read_parquet(sample_path, columns=["timestamp"])
+                ts_parts.append(pd.to_datetime(sample["timestamp"], errors="coerce").dropna())
+            ts = pd.concat(ts_parts, ignore_index=True) if ts_parts else pd.Series(dtype="datetime64[ns]")
+            return {
+                "symbol": sym,
+                "date_min": pd.Timestamp(ts.min()).date().isoformat() if not ts.empty else None,
+                "date_max": pd.Timestamp(ts.max()).date().isoformat() if not ts.empty else None,
+                "expiry_types": expiry_types,
+                "atm_offsets": offsets,
+                "opt_types": opt_types or ["call", "put"],
+                "source": self._path_source(root),
+            }
+
+        result = self._cached(cache_key, 300.0, _load)
+        return result if result is not None else {}
+
+    def historical_options(
+        self,
+        symbol: str,
+        expiry_type: str,
+        atm_offset: str,
+        opt_type: str,
+        start: date,
+        end: date,
+    ) -> pd.DataFrame:
+        sym = symbol.upper()
+        exp = expiry_type.lower()
+        side = opt_type.lower()
+        if side in {"ce", "c"}:
+            side = "call"
+        elif side in {"pe", "p"}:
+            side = "put"
+        path = _OPTIONS_ROOT / sym.lower() / exp / "expiry_code_1" / side / f"{atm_offset}.parquet"
+        cache_key = f"hist_options_{sym}_{exp}_{atm_offset}_{side}_{start}_{end}"
+
+        def _load() -> pd.DataFrame:
+            if not path.exists():
+                return pd.DataFrame()
+            cols = ["timestamp", "open", "high", "low", "close", "volume", "oi", "iv_clean", "strike", "spot"]
+            df = pd.read_parquet(path, columns=cols)
+            df.index = self._as_ist_index(df["timestamp"])
+            df = df.drop(columns=["timestamp"]).sort_index()
+            df = self._date_filter(df, start, end)
+            df.attrs["source"] = self._path_source(path)
+            return self._format_ohlcv(self._cap_rows(df), extras=["oi", "iv_clean", "strike", "spot"])
+
+        result = self._cached(cache_key, _TTL_HIST, _load)
+        return result if result is not None else pd.DataFrame()
+
+    def historical_vix(self, start: date, end: date, tf_minutes: int = 1) -> pd.DataFrame:
+        cache_key = f"hist_vix_{start}_{end}_{tf_minutes}"
+
+        def _load() -> pd.DataFrame:
+            chosen = next((p for p in _VIX_FILES if p.exists()), None)
+            if chosen is None:
+                return pd.DataFrame()
+            df = self._read_ohlcv_csv(chosen, start, end)
+            if "close" not in df.columns:
+                return pd.DataFrame()
+            close = pd.to_numeric(df["close"], errors="coerce")
+            df = pd.DataFrame({
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 0,
+            }, index=df.index).dropna(subset=["close"])
+            df = self._resample_ohlcv(df, max(int(tf_minutes), 1))
+            df.attrs["source"] = self._path_source(chosen)
+            df.attrs["warnings"] = ["daily_vix_source"] if chosen.name == "INDIA VIX_day.csv" else []
+            return self._format_ohlcv(self._cap_rows(df))
+
+        result = self._cached(cache_key, _TTL_HIST, _load)
+        return result if result is not None else pd.DataFrame()
+
+    def historical_bhavcopy(self, symbol: str, start: date, end: date) -> pd.DataFrame:
+        sym = symbol.upper()
+        cache_key = f"hist_bhavcopy_{sym}_{start}_{end}"
+
+        def _load() -> pd.DataFrame:
+            if not _BHAVCOPY_ROOT.exists():
+                return pd.DataFrame()
+            frames = []
+            for year in range(start.year, end.year + 1):
+                path = _BHAVCOPY_ROOT / f"nifty_options_eod_{year}.parquet"
+                if path.exists():
+                    frames.append(pd.read_parquet(path))
+            if not frames:
+                return pd.DataFrame()
+            df = pd.concat(frames, ignore_index=True)
+            df.columns = [str(c).strip().lower() for c in df.columns]
+            if "symbol" in df.columns:
+                df = df[df["symbol"].astype(str).str.upper() == sym]
+            date_col = next((c for c in ("timestamp", "datetime", "date", "trad_dt", "trade_date") if c in df.columns), None)
+            if date_col is None:
+                return pd.DataFrame()
+            dt = pd.to_datetime(df[date_col], errors="coerce")
+            df = df.loc[(dt.dt.date >= start) & (dt.dt.date <= end)].copy()
+            if df.empty:
+                return pd.DataFrame()
+            def _col(*names: str, default: Any = 0) -> pd.Series:
+                for name in names:
+                    if name in df.columns:
+                        return df[name]
+                return pd.Series(default, index=df.index)
+            out = pd.DataFrame({
+                "ts": [pd.Timestamp(x).date().isoformat() for x in pd.to_datetime(df[date_col], errors="coerce")],
+                "expiry": _col("expiry_dt", "expiry", "expiry_date", default=""),
+                "strike": pd.to_numeric(_col("strike_pr", "strike"), errors="coerce"),
+                "option_type": _col("option_typ", "option_type", default=""),
+                "open": pd.to_numeric(_col("open"), errors="coerce"),
+                "high": pd.to_numeric(_col("high"), errors="coerce"),
+                "low": pd.to_numeric(_col("low"), errors="coerce"),
+                "close": pd.to_numeric(_col("close", "close_pr"), errors="coerce"),
+                "settle_price": pd.to_numeric(_col("settle_pr", "settle_price"), errors="coerce"),
+                "oi": pd.to_numeric(_col("open_int", "open_interest", "oi"), errors="coerce").fillna(0).astype("int64"),
+                "volume": pd.to_numeric(_col("contracts", "volume"), errors="coerce").fillna(0).astype("int64"),
+            })
+            out.attrs["source"] = self._path_source(_BHAVCOPY_ROOT)
+            return self._cap_rows(out)
+
+        result = self._cached(cache_key, _TTL_HIST, _load)
+        return result if result is not None else pd.DataFrame()
+
+    def _legacy_id(self, path: Path, row_index: int | None = None) -> str:
+        try:
+            rel = path.relative_to(_REPORT_ROOT)
+        except ValueError:
+            rel = path
+        suffix = "" if row_index is None else f"_{row_index}"
+        digest = hashlib.sha1(f"{rel.as_posix()}{suffix}".encode("utf-8")).hexdigest()[:12]
+        return f"legacy_{digest}_{self._safe_slug(path.stem)}"
+
+    def _is_ledger_frame(self, df: pd.DataFrame) -> bool:
+        cols = {str(c).lower() for c in df.columns}
+        return "net_pnl" in cols and bool(cols & {"entry_date", "entry_time", "exit_date", "exit_time"})
+
+    def _ledger_summary(self, df: pd.DataFrame, source_path: Path, backtest_id: str, source_kind: str) -> dict:
+        if df.empty:
+            return {}
+        net = pd.to_numeric(df.get("net_pnl", 0), errors="coerce").fillna(0)
+        gross = pd.to_numeric(df.get("gross_pnl", 0), errors="coerce").fillna(0)
+        wins = net[net > 0]
+        losses = net[net < 0]
+        pf = float(wins.sum() / abs(losses.sum())) if abs(losses.sum()) > 0 else None
+        equity = 1_000_000 + net.cumsum()
+        dd = (equity - equity.cummax()) / equity.cummax() * 100
+        by_day = pd.DataFrame({"net_pnl": net, "exit_date": pd.to_datetime(df.get("exit_date", df.get("exit_time")), errors="coerce")})
+        daily = by_day.dropna(subset=["exit_date"]).groupby(by_day["exit_date"].dt.date)["net_pnl"].sum()
+        sharpe = None
+        if len(daily) > 1 and daily.std(ddof=1) != 0:
+            sharpe = float((daily.mean() / daily.std(ddof=1)) * (252 ** 0.5))
+        first = df.iloc[0]
+        symbol = str(first.get("symbol", self._symbol_from_name(source_path.stem)))
+        return {
+            "id": backtest_id,
+            "name": source_path.stem,
+            "strategy": str(first.get("strategy", source_path.stem)),
+            "symbol": symbol.upper() if symbol else "",
+            "start_date": self._first_date(df, ["entry_date", "entry_time"]) or "",
+            "end_date": self._last_date(df, ["exit_date", "exit_time"]) or "",
+            "trades": int(len(df)),
+            "net_pnl": float(net.sum()),
+            "gross_pnl": float(gross.sum()),
+            "sharpe": sharpe,
+            "max_dd_pct": float(dd.min()) if len(dd) else None,
+            "profit_factor": pf,
+            "win_rate": float((net > 0).mean() * 100) if len(net) else None,
+            "source_kind": source_kind,
+            "source": self._path_source(source_path),
+            "has_ledger": True,
+            "has_equity": True,
+            "has_decisions": False,
+            "_path": str(source_path),
+        }
+
+    def _row_summary(self, row: pd.Series, source_path: Path, backtest_id: str, row_index: int) -> dict:
+        name = str(row.get("name", row.get("label", source_path.stem)))
+        return {
+            "id": backtest_id,
+            "name": name,
+            "strategy": str(row.get("strategy", row.get("source", source_path.stem))),
+            "symbol": str(row.get("symbol", row.get("source", ""))).upper(),
+            "start_date": str(row.get("start_date", "")),
+            "end_date": str(row.get("end_date", "")),
+            "trades": int(self._numeric(row.get("trades")) or 0),
+            "net_pnl": float(self._numeric(row.get("net_pnl")) or 0.0),
+            "cagr": self._numeric(row.get("cagr")),
+            "sharpe": self._numeric(row.get("sharpe")),
+            "sortino": self._numeric(row.get("sortino")),
+            "calmar": self._numeric(row.get("calmar")),
+            "max_dd_pct": self._numeric(row.get("max_dd_pct", row.get("max_drawdown_pct"))),
+            "profit_factor": self._numeric(row.get("pf", row.get("profit_factor"))),
+            "win_rate": self._numeric(row.get("win_rate")),
+            "t_stat": self._numeric(row.get("t_stat")),
+            "source_kind": "legacy_summary",
+            "source": self._path_source(source_path),
+            "has_ledger": False,
+            "has_equity": False,
+            "has_decisions": False,
+            "_path": str(source_path),
+            "_row_index": row_index,
+        }
+
+    def _canonical_summary(self, path: Path) -> dict:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        backtest_id = path.name.removesuffix("_summary.json")
+        data.setdefault("id", backtest_id)
+        data.setdefault("name", backtest_id)
+        data.setdefault("source_kind", "canonical")
+        data.setdefault("source", self._path_source(path))
+        data.setdefault("has_ledger", (_BACKTEST_ROOT / f"{backtest_id}_ledger.csv").exists())
+        data.setdefault("has_equity", data["has_ledger"])
+        data.setdefault("has_decisions", (_BACKTEST_ROOT / f"{backtest_id}_decisions.csv").exists())
+        return data
+
+    def _legacy_index(self) -> dict[str, dict]:
+        def _load() -> dict[str, dict]:
+            entries: dict[str, dict] = {}
+            for root in _LEGACY_BACKTEST_ROOTS:
+                if not root.exists():
+                    continue
+                for path in sorted(root.rglob("*.csv")):
+                    try:
+                        df = pd.read_csv(path, nrows=500)
+                    except Exception:
+                        continue
+                    df.columns = [str(c).strip() for c in df.columns]
+                    if self._is_ledger_frame(df):
+                        bid = self._legacy_id(path)
+                        full_df = pd.read_csv(path)
+                        summary = self._ledger_summary(full_df, path, bid, "legacy_ledger")
+                        if summary:
+                            entries[bid] = summary
+                        continue
+                    cols = {str(c).lower() for c in df.columns}
+                    if "net_pnl" not in cols and "sharpe" not in cols and "trades" not in cols:
+                        continue
+                    for i, row in df.head(200).iterrows():
+                        bid = self._legacy_id(path, int(i))
+                        entries[bid] = self._row_summary(row, path, bid, int(i))
+            return entries
+
+        result = self._cached("legacy_backtest_index", 30.0, _load)
+        return result if result is not None else {}
+
+    def backtest_list(self) -> list[dict]:
+        def _load() -> list[dict]:
+            rows: list[dict] = []
+            if _BACKTEST_ROOT.exists():
+                for path in sorted(_BACKTEST_ROOT.glob("*_summary.json")):
+                    try:
+                        rows.append(self._canonical_summary(path))
+                    except Exception:
+                        continue
+            rows.extend(self._legacy_index().values())
+            def _mtime(row: dict) -> float:
+                path = Path(row.get("_path", row.get("source", "")))
+                return path.stat().st_mtime if path.exists() else 0.0
+            rows.sort(key=_mtime, reverse=True)
+            return rows
+
+        result = self._cached("backtest_list", 30.0, _load)
+        return result if result is not None else []
+
+    def backtest_summaries(self, root: Path | None = None) -> list:
+        return self.backtest_list()
+
+    def backtest_summary(self, backtest_id: str) -> dict:
+        path = _BACKTEST_ROOT / f"{backtest_id}_summary.json"
+        if path.exists():
+            try:
+                return self._canonical_summary(path)
+            except Exception:
+                return {}
+        return self._legacy_index().get(backtest_id, {})
+
+    def _normalise_ledger(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        df = df.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        rename = {"dte_at_entry": "dte", "vix_entry": "vix", "entry_credit": "entry_premium"}
+        df.rename(columns={k: v for k, v in rename.items() if k in df.columns}, inplace=True)
+        if "entry_date" not in df.columns and "entry_time" in df.columns:
+            df["entry_date"] = pd.to_datetime(df["entry_time"], errors="coerce").dt.date.astype(str)
+        if "exit_date" not in df.columns and "exit_time" in df.columns:
+            df["exit_date"] = pd.to_datetime(df["exit_time"], errors="coerce").dt.date.astype(str)
+        if "symbol" not in df.columns:
+            df["symbol"] = ""
+        for col in ("gross_pnl", "charges", "net_pnl", "equity", "dte", "vix"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        preferred = [
+            "symbol", "strategy", "expiry", "entry_date", "entry_time", "exit_date", "exit_time",
+            "entry_reason", "exit_reason", "dte", "vix", "vix_bucket", "spot_entry", "spot_exit",
+            "entry_legs", "exit_legs", "legs", "gross_pnl", "charges", "net_pnl", "equity",
+            "entry_premium", "max_theoretical_loss",
+        ]
+        cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+        return df[cols]
 
     def backtest_ledger(self, backtest_id: str) -> pd.DataFrame:
-        return pd.DataFrame()
+        canonical = _BACKTEST_ROOT / f"{backtest_id}_ledger.csv"
+        if canonical.exists():
+            try:
+                return self._normalise_ledger(pd.read_csv(canonical))
+            except Exception:
+                return pd.DataFrame()
+        info = self._legacy_index().get(backtest_id)
+        if not info or not info.get("has_ledger"):
+            df = pd.DataFrame()
+            df.attrs["has_ledger"] = False
+            return df
+        try:
+            return self._normalise_ledger(pd.read_csv(info["_path"]))
+        except Exception:
+            return pd.DataFrame()
 
-    def backtest_equity_curve(self, backtest_id: str) -> list[EquityPoint]:
-        return []
+    def backtest_equity_curve(self, backtest_id: str) -> pd.DataFrame:
+        ledger = self.backtest_ledger(backtest_id)
+        if ledger.empty or "net_pnl" not in ledger.columns:
+            return pd.DataFrame(columns=["date", "equity", "normalised"])
+        date_col = "exit_date" if "exit_date" in ledger.columns else "exit_time"
+        df = ledger.copy()
+        df["_date"] = pd.to_datetime(df[date_col], errors="coerce")
+        df["net_pnl"] = pd.to_numeric(df["net_pnl"], errors="coerce").fillna(0)
+        df = df.dropna(subset=["_date"]).sort_values("_date")
+        if df.empty:
+            return pd.DataFrame(columns=["date", "equity", "normalised"])
+        equity = 1_000_000 + df["net_pnl"].cumsum()
+        return pd.DataFrame({
+            "date": df["_date"].dt.date.astype(str),
+            "equity": equity.round(2),
+            "normalised": (equity / equity.iloc[0]).round(6),
+        }).reset_index(drop=True)
+
+    def backtest_monthly_returns(self, backtest_id: str) -> pd.DataFrame:
+        ledger = self.backtest_ledger(backtest_id)
+        if ledger.empty or "net_pnl" not in ledger.columns:
+            return pd.DataFrame(columns=["year", "month", "net_pnl", "return_pct"])
+        date_col = "exit_date" if "exit_date" in ledger.columns else "exit_time"
+        df = ledger.copy()
+        df["_date"] = pd.to_datetime(df[date_col], errors="coerce")
+        df["net_pnl"] = pd.to_numeric(df["net_pnl"], errors="coerce").fillna(0)
+        df = df.dropna(subset=["_date"])
+        if df.empty:
+            return pd.DataFrame(columns=["year", "month", "net_pnl", "return_pct"])
+        df["year"] = df["_date"].dt.year
+        df["month"] = df["_date"].dt.month
+        out = df.groupby(["year", "month"], as_index=False)["net_pnl"].sum()
+        out["return_pct"] = out["net_pnl"] / 1_000_000 * 100
+        return out
+
+    def backtest_drawdown(self, backtest_id: str) -> pd.DataFrame:
+        equity = self.backtest_equity_curve(backtest_id)
+        if equity.empty:
+            return pd.DataFrame(columns=["date", "drawdown_pct"])
+        curve = pd.to_numeric(equity["equity"], errors="coerce")
+        dd = (curve - curve.cummax()) / curve.cummax() * 100
+        return pd.DataFrame({"date": equity["date"], "drawdown_pct": dd.round(4)})
+
+    def backtest_events(self, backtest_id: str) -> list[dict]:
+        ledger = self.backtest_ledger(backtest_id)
+        if ledger.empty:
+            return []
+        events: list[dict] = []
+        for _, row in ledger.iterrows():
+            symbol = str(row.get("symbol", ""))
+            entry_ts = row.get("entry_time") or row.get("entry_date")
+            exit_ts = row.get("exit_time") or row.get("exit_date")
+            if pd.notna(entry_ts):
+                events.append({
+                    "ts": str(entry_ts),
+                    "symbol": symbol,
+                    "event_type": "entry",
+                    "severity": "info",
+                    "label": "ENTRY",
+                    "details": str(row.get("entry_reason", "")),
+                })
+            if pd.notna(exit_ts):
+                reason = str(row.get("exit_reason", "exit"))
+                severity = "warning" if "stop" in reason.lower() else "info"
+                events.append({
+                    "ts": str(exit_ts),
+                    "symbol": symbol,
+                    "event_type": reason or "exit",
+                    "severity": severity,
+                    "label": reason.upper() if reason else "EXIT",
+                    "details": f"net_pnl={row.get('net_pnl', '')}",
+                })
+        return events
+
+    def backtest_decisions(self, backtest_id: str) -> pd.DataFrame:
+        path = _BACKTEST_ROOT / f"{backtest_id}_decisions.csv"
+        cols = ["ts", "symbol", "decision", "reason", "vix", "dte", "expiry", "eligible", "selected"]
+        if not path.exists():
+            out = pd.DataFrame(columns=cols)
+            out.attrs["has_decisions"] = False
+            return out
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            return pd.DataFrame(columns=cols)
+        for col in cols:
+            if col not in df.columns:
+                df[col] = None
+        return df[cols]
 
 
 # ── Leg parsing helper ────────────────────────────────────────────────────────
