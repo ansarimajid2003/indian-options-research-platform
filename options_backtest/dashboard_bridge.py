@@ -542,12 +542,17 @@ class DashboardBridge:
         cache_key = f"spot_{symbol}_{days}"
 
         def _load() -> list[dict]:
+            # Detect timestamp column name (NIFTY canonical uses "datetime", Dhan files use "timestamp")
+            with open(path, encoding="utf-8") as _f:
+                _hdr = _f.readline().strip().split(",")
+            ts_col = "datetime" if "datetime" in _hdr else "timestamp"
             df = pd.read_csv(
                 path,
-                usecols=["datetime", "open", "high", "low", "close"],
+                usecols=[ts_col, "open", "high", "low", "close"],
                 dtype={"open": "float32", "high": "float32",
                        "low": "float32", "close": "float32"},
             )
+            df.rename(columns={ts_col: "datetime"}, inplace=True)
             df["datetime"] = pd.to_datetime(df["datetime"])
             df.sort_values("datetime", inplace=True)
             session_dates = sorted(df["datetime"].dt.date.unique())
