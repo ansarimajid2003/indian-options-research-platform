@@ -153,7 +153,7 @@ async def _run_live(profile: dict, today: date, live_root: Path, access_token: s
 
     checkpoint = _load_checkpoint(live_root, today)
     if checkpoint is not None:
-        _log.info("orchestrator: crash recovery — resuming from checkpoint with %d open positions",
+        _log.info("RESUME MODE: orchestrator loaded checkpoint with %d open positions",
                   len(checkpoint.get("open_positions", [])))
         engine.resume_from_checkpoint(checkpoint)
 

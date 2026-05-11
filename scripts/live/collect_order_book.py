@@ -340,6 +340,41 @@ def _write_depth_cache_snapshot(
     _write_atomic_json(live_root / "snapshots" / "latest_depth_cache.json", payload)
 
 
+def _write_collector_state(
+    live_root: Path,
+    date_str: str,
+    status: str,
+    security_ids: list[str],
+) -> None:
+    payload = {
+        "written_at": _now_ist().isoformat(),
+        "session_date": date_str,
+        "pid": os.getpid(),
+        "status": status,
+        "configured_security_ids": len(security_ids),
+    }
+    _write_atomic_json(live_root / "snapshots" / "latest_depth_collector_state.json", payload)
+
+
+def _write_restart_gap_if_needed(live_root: Path, date_str: str) -> bool:
+    """Record a restart gap if the previous collector died while marked running."""
+    state_path = live_root / "snapshots" / "latest_depth_collector_state.json"
+    if not state_path.exists():
+        return False
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if state.get("session_date") != date_str or state.get("status") != "running":
+        return False
+    gap_start = state.get("written_at")
+    if not gap_start:
+        return False
+    gap_end = _now_ist().isoformat()
+    _write_gap_sentinel(live_root, date_str, "NSE_MAJOR_INDICES", gap_start, gap_end, "process_restart")
+    return True
+
+
 async def _depth_snapshot_loop(
     live_root: Path,
     date_str: str,
@@ -349,6 +384,7 @@ async def _depth_snapshot_loop(
 ) -> None:
     while True:
         _write_depth_cache_snapshot(live_root, date_str, depth_cache, security_ids)
+        _write_collector_state(live_root, date_str, "running", security_ids)
         await asyncio.sleep(interval_seconds)
 
 
@@ -716,6 +752,9 @@ async def collect_order_book(
         f"[collect_order_book] major-index universe: {len(all_sids)} instruments, "
         f"{depth_connections} depth connections"
     )
+    if _write_restart_gap_if_needed(live_root, date_str):
+        print("[collect_order_book] restart gap sentinel written")
+    _write_collector_state(live_root, date_str, "running", all_sids)
     collector = DepthCollector(
         symbol="NSE_MAJOR_INDICES",
         security_ids=all_sids,
@@ -741,6 +780,7 @@ async def collect_order_book(
         raise
     finally:
         collector.stop()
+        _write_collector_state(live_root, date_str, "stopped", all_sids)
         for task in tasks:
             if not task.done():
                 task.cancel()

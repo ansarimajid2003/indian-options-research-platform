@@ -262,6 +262,10 @@ class PaperTradingEngine:
 
         self._phase = "init"
         self._stop_event = asyncio.Event()
+        self._resumed_after_crash = False
+        self._crash_gap_start: str | None = None
+        self._crash_gap_end: str | None = None
+        self._crash_gap_minutes: float | None = None
 
         # Initialise per-symbol resolvers
         self._build_resolvers()
@@ -304,7 +308,17 @@ class PaperTradingEngine:
             pos.exit_reason = pos_dict.get("exit_reason")
             pos.forced_stale_exit = pos_dict.get("forced_stale_exit", False)
             self._open_positions.append(pos)
-        _log.info("resume: loaded %d open positions from checkpoint", len(self._open_positions))
+        self._resumed_after_crash = True
+        self._crash_gap_start = checkpoint.get("written_at")
+        self._crash_gap_end = _ts_str()
+        self._crash_gap_minutes = self._compute_gap_minutes(self._crash_gap_start, self._crash_gap_end)
+        _log.info(
+            "RESUME MODE: loaded %d open positions from checkpoint gap_start=%s gap_end=%s gap_minutes=%s",
+            len(self._open_positions),
+            self._crash_gap_start,
+            self._crash_gap_end,
+            self._crash_gap_minutes,
+        )
 
     # ──────────────────────────────────────────────────────────────────────────
     # Main run loop
@@ -316,10 +330,12 @@ class PaperTradingEngine:
 
         _log.info("paper_engine: starting session_date=%s", self._session_date)
 
+        self._phase = "waiting_preopen"
+        snapshot_task = asyncio.create_task(self._snapshot_loop())
+
         await _sleep_until(_T_CONNECT, self._session_date)
         self._phase = "connecting"
         feed_task = asyncio.create_task(self._feed_loop())
-        snapshot_task = asyncio.create_task(self._snapshot_loop())
 
         # 09:10 — check feed connection
         await _sleep_until(_T_CHECK_FEED, self._session_date)
@@ -978,6 +994,10 @@ class PaperTradingEngine:
             "gross_pnl": round(gross_pnl, 2),
             "charges": round(total_charges, 2),
             "net_pnl": round(net_pnl, 2),
+            "resumed_after_crash": self._resumed_after_crash,
+            "crash_gap_start": self._crash_gap_start,
+            "crash_gap_end": self._crash_gap_end,
+            "gap_minutes": self._crash_gap_minutes,
             "short_call_strike": strikes.get("short_call", 0),
             "long_call_strike": strikes.get("long_call", 0),
             "short_put_strike": strikes.get("short_put", 0),
@@ -1022,6 +1042,10 @@ class PaperTradingEngine:
             "phase": self._phase,
             "open_positions": len(self._open_positions),
             "session_date": self._session_date.isoformat(),
+            "resumed_after_crash": self._resumed_after_crash,
+            "crash_gap_start": self._crash_gap_start,
+            "crash_gap_end": self._crash_gap_end,
+            "gap_minutes": self._crash_gap_minutes,
         }
         _write_atomic(self._snapshot_dir / "latest_process_health.json", health)
 
@@ -1043,13 +1067,17 @@ class PaperTradingEngine:
         checkpoint = {
             "session_date": self._session_date.isoformat(),
             "written_at": _ts_str(),
+            "resumed_after_crash": self._resumed_after_crash,
+            "crash_gap_start": self._crash_gap_start,
+            "crash_gap_end": self._crash_gap_end,
+            "gap_minutes": self._crash_gap_minutes,
             "open_positions": [p.to_dict() for p in self._open_positions],
         }
         _write_atomic(self._snapshot_dir / "latest_open_positions.json", checkpoint)
 
     def _flush_trades(self) -> None:
         self._trades_path.parent.mkdir(parents=True, exist_ok=True)
-        self._trades_path.write_text(json.dumps(self._completed_trades, indent=2, default=str))
+        self._trades_path.write_text(json.dumps(self._completed_trades, indent=2, default=str), encoding="utf-8")
 
     def _generate_eod_report(self) -> None:
         self._flush_trades()
@@ -1058,6 +1086,19 @@ class PaperTradingEngine:
         total_charges = sum(t.get("charges", 0) for t in self._completed_trades)
         n_trades = len(self._completed_trades)
         wins = sum(1 for t in self._completed_trades if t.get("net_pnl", 0) > 0)
+        summary_payload = {
+            "session_date": self._session_date.isoformat(),
+            "profile": self._profile.get("profile_name", ""),
+            "trades": n_trades,
+            "wins": wins,
+            "gross_pnl": round(total_gross, 2),
+            "charges": round(total_charges, 2),
+            "net_pnl": round(total_net, 2),
+            "resumed_after_crash": self._resumed_after_crash,
+            "crash_gap_start": self._crash_gap_start,
+            "crash_gap_end": self._crash_gap_end,
+            "gap_minutes": self._crash_gap_minutes,
+        }
 
         lines = [
             f"# Paper Trading Report — {self._session_date}",
@@ -1068,10 +1109,25 @@ class PaperTradingEngine:
             f"**Gross PnL:** ₹{total_gross:,.2f}",
             f"**Charges:** ₹{total_charges:,.2f}",
             f"**Net PnL:** ₹{total_net:,.2f}",
+            f"**Resumed after crash:** {str(self._resumed_after_crash).lower()}",
             "",
             "## Trade Detail",
             "",
         ]
+        if self._resumed_after_crash:
+            lines.extend([
+                "## Crash Recovery",
+                "",
+                "```json",
+                json.dumps({
+                    "resumed_after_crash": True,
+                    "crash_gap_start": self._crash_gap_start,
+                    "crash_gap_end": self._crash_gap_end,
+                    "gap_minutes": self._crash_gap_minutes,
+                }, indent=2),
+                "```",
+                "",
+            ])
         for t in self._completed_trades:
             lines.append(
                 f"- **{t['symbol']}** expiry={t['expiry']} credit={t['entry_credit']:.2f} "
@@ -1080,8 +1136,20 @@ class PaperTradingEngine:
             )
 
         self._report_path.parent.mkdir(parents=True, exist_ok=True)
-        self._report_path.write_text("\n".join(lines))
+        self._report_path.write_text("\n".join(lines), encoding="utf-8")
+        _write_atomic(self._live_root / "reports" / f"{self._date_str}_eod_summary.json", summary_payload)
         _log.info("eod_report: written to %s", self._report_path)
+
+    @staticmethod
+    def _compute_gap_minutes(start: str | None, end: str | None) -> float | None:
+        if not start or not end:
+            return None
+        try:
+            start_ts = pd.Timestamp(start)
+            end_ts = pd.Timestamp(end)
+            return round((end_ts - start_ts).total_seconds() / 60.0, 1)
+        except Exception:
+            return None
 
     # ──────────────────────────────────────────────────────────────────────────
     # Signal log

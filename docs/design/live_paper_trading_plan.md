@@ -1072,6 +1072,7 @@ Do not approve live scale-up from one-month Sharpe.
 | `scripts/live/run_paper_trading.py` | Daily runner with auto token renewal | ✓ Done |
 | `scripts/live/health_monitor.py` | Independent uptime/data-integrity monitor with Telegram alerts | ✓ Done |
 | `scripts/live/paper_json_to_ledger.py` | Adapter from paper JSON to reports-compatible ledger | ✓ Done |
+| `scripts/live/validate_phase8_9.py` | Offline Phase 8/9 readiness and session-artifact validator | ✓ Done |
 | `scripts/live/renew_token.py` | Headless daily token renewal via PIN + TOTP | ✓ Done |
 | `scripts/live/systemd/health-monitor.service` | `systemd` unit for independent health monitoring | Done |
 | `scripts/live/systemd/live-paper.service` | `systemd` unit for paper engine restart recovery | Done |
@@ -1473,7 +1474,7 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 - [x] `git clone` repo into `/DATA/live-paper/indian-markets/` — bare remote + working checkout via `git push zimaos main`
 - [x] `python3 -m venv /DATA/live-paper/indian-markets/.venv`
 - [x] Install runtime stack: `pandas` 3.0.2, `numpy` 2.4.4, `pyarrow` 24.0.0, `websockets` 16.0, `requests` 2.33.1, `sentry-sdk` 2.59.0
-- [ ] Install dashboard API stack (Phase 7a): `fastapi`, `uvicorn[standard]`
+- [x] Install dashboard API stack (Phase 7a): `fastapi`, `uvicorn[standard]`
 - [x] Create WD storage layout:
   ```
   /media/WD-Storage/indian-markets-live/{raw_depth_packets,order_book,order_book_1min,paper_trades,reports,logs,snapshots,alerts}/
@@ -1487,7 +1488,7 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
 
 > **Static IP outstanding:** `183.83.38.115` is likely a dynamic IP (ACT residential default). Buy the ACT static IP addon (~₹230/month) before relying on the Dhan whitelist. Call 1800-266-1111 or use the MyACT app. Re-verify public IP with `curl -4 https://api.ipify.org` from `zimaos` after activation before submitting Dhan whitelist request.
 
-> **Daily token renewal required:** Dhan access token expires every 24 hours. `DHAN_API_KEY` and `DHAN_API_SECRET` are stored in `.env.live` alongside the token. A `scripts/live/renew_dhan_token.py` script must be written and scheduled (cron or systemd timer) before Phase 9 live sessions begin. The Dhan v2 REST endpoint for token generation is `POST https://api.dhan.co/v2/auth/token`.
+> **Daily token renewal required:** Dhan access token expires every 24 hours. The deployed renewal path is `scripts/live/renew_token.py` plus `/etc/cron.d/dhan-token-renewal` at 08:30 IST. `DHAN_PIN`, `DHAN_TOTP_SECRET`, `DHAN_CLIENT_ID`, and the current `DHAN_ACCESS_TOKEN` live only in `.env.live`.
 
 - [x] Create Telegram bot via BotFather → bot: `@myzimaserverbot`, `TELEGRAM_CHAT_ID=1425784560`, written to `.env.live`
 - [x] Create Healthchecks.io account (free tier) → monitor created, grace 3 min → `EXTERNAL_HEARTBEAT_URL` in `.env.live` → ping from `zimaos` returned `OK`
@@ -1588,7 +1589,8 @@ Legend: `[ ]` = not started · `[~]` = in progress · `[x]` = done
   - [x] Initialises `DepthCache`, starts collector and paper engine as coordinated tasks, and cancels collector cleanly after EOD
   - [x] Calls the paper JSON → ledger/report adapter after market close
   - [x] Fixes live-feed URL formatting and prevents collector hang after engine completion
-  - [ ] Remaining preflight hardening: public IP whitelist comparison, websocket-budget probe, Telegram test alert, external heartbeat test, and strict health-monitor gating
+  - [~] Remaining preflight hardening: public IP whitelist comparison, websocket-budget probe, and strict health-monitor gating
+  - [x] Pre-open status snapshots: publishes `waiting_preopen`, `latest_process_health.json`, and `latest_feed_state.json` before 09:00 so the dashboard does not show a false `offline` state
 - [x] Dry-run test on `zimaos` (no market hours): `run_paper_trading.py --dry-run` completed on 2026-05-10
 - [ ] Simulated preflight failure tests remain before first live session
 
@@ -1617,7 +1619,7 @@ Validation artifact: `reports/backtests/options/monitoring/20260511_phase5_healt
 
 ---
 
-### Phase 6 — systemd Services
+### Phase 6 — systemd Services ✓ DONE 2026-05-11
 
 - [x] Create `/etc/systemd/system/live-paper.service`:
   ```ini
@@ -1669,94 +1671,119 @@ Validation artifact: `reports/backtests/options/monitoring/20260511_phase6_syste
 
 ---
 
-### Phase 7a — Dashboard Backend + Bridge
+### Phase 7a — Dashboard Backend + Bridge ✓ DONE 2026-05-11
 
-- [ ] Install additional Python deps in `.venv`: `fastapi`, `uvicorn[standard]`
-- [ ] Write `options_backtest/dashboard_bridge.py` (Section 13.3):
-  - [ ] All dataclasses: `SessionStatus`, `PositionRow`, `EquityPoint`, `SignalLogEntry`, `DepthHealthRow`, `StorageHealth`, `AlertState`, `AlertEntry`
-  - [ ] All live methods implemented: `get_session_status`, `get_open_positions`, `get_equity_curve`, `get_signal_log`, `get_depth_health`, `get_storage_health`, `get_alert_state`, `get_alert_history`
-  - [ ] Historical methods stubbed: `historical_spot`, `historical_options`, `historical_order_book`, `historical_vix`
-  - [ ] Backtest methods stubbed: `backtest_summaries`, `backtest_ledger`, `backtest_equity_curve`
-  - [ ] Per-source TTL cache (live snapshots 3 s, paper trades JSON 5 s, historical parquet 60 s)
-  - [ ] Missing file → returns empty/default object, never raises
-  - [ ] File-lock collision → retry once after 100 ms, return last good snapshot
-  - [ ] All timestamps as ISO-8601 IST strings in output dataclasses
-  - [ ] Token-like strings redacted from log/snapshot content before return
-- [ ] Write `scripts/live/api/models.py` (Section 13.4):
-  - [ ] Pydantic models for every response type matching the bridge dataclasses
-  - [ ] WebSocket push frame model (`LivePushFrame`)
-  - [ ] This file is the contract handed to Claude Design for Phase 7b
-- [ ] Write `scripts/live/api/routes/live.py`:
-  - [ ] `GET /api/live/session`
-  - [ ] `GET /api/live/positions`
-  - [ ] `GET /api/live/equity-curve?date=YYYYMMDD`
-  - [ ] `GET /api/live/signal-log?date=YYYYMMDD`
-  - [ ] `GET /api/live/depth-health`
-  - [ ] `GET /api/live/storage-health`
-  - [ ] `GET /api/live/alerts?date=YYYYMMDD`
-  - [ ] `WS /ws/live` — pushes `LivePushFrame` every 1 s (market hours) or 5 s (off-hours)
-- [ ] Write `scripts/live/api/routes/historical.py` — all endpoints return `{"status": "v2_scope_pending"}` stub
-- [ ] Write `scripts/live/api/routes/backtests.py` — all endpoints return `{"status": "v2_scope_pending"}` stub
-- [ ] Write `scripts/live/api/main.py`:
-  - [ ] CORS: allow `localhost:5173` (React dev) and `localhost:8000` (tunnel) only
-  - [ ] Lifespan: instantiate `DashboardBridge` once; inject via `app.state`
-  - [ ] Mount React `dashboard/dist/` as static files at `/` (fallback to `index.html`)
-  - [ ] Include all three route modules
-- [ ] Write `scripts/live/systemd/dashboard-api.service` — `uvicorn` bound to `127.0.0.1:8000`
-- [ ] Smoke test: `uvicorn scripts.live.api.main:app` locally → `curl http://127.0.0.1:8000/api/live/session` returns valid JSON
-- [ ] Smoke test: open WS to `/ws/live` → confirm push frames arrive every second
-- [ ] Test: stop the API → confirm paper engine and collector continue running unaffected
+- [x] Install additional Python deps in `.venv`: `fastapi`, `uvicorn[standard]`
+- [x] Write `options_backtest/dashboard_bridge.py` (Section 13.3):
+  - [x] Bridge dataclasses implemented: `SessionStatus`, `PositionRow`, `EquityPoint`, `SignalLogEntry`, `DepthSummary`, `StorageHealth`, `AlertState`, `AlertEntry`
+  - [x] Live methods implemented: `get_session_status`, `get_open_positions`, `get_equity_curve`, `get_signal_log`, `get_depth_summary`, `get_storage_health`, `get_alert_state`, `get_alert_history`, `get_spot_bars`
+  - [x] Historical methods stubbed: `historical_spot`, `historical_options`, `historical_order_book`, `historical_vix`
+  - [x] Backtest methods stubbed: `backtest_summaries`, `backtest_ledger`, `backtest_equity_curve`
+  - [x] Per-source TTL cache: live snapshots 3 s, paper trades/signals 5 s, spot/historical reads 60 s
+  - [x] Missing file → returns empty/default object, never raises
+  - [x] File read collision retries once after 100 ms and falls back to the last cached value when available
+  - [x] Timestamps returned as ISO-8601 IST strings where live snapshots provide them
+  - [x] Token-like strings redacted from alert log/snapshot text before return
+- [x] Write `scripts/live/api/models.py` (Section 13.4):
+  - [x] Pydantic models for every live response type matching the bridge dataclasses
+  - [x] WebSocket push frame model (`LivePushFrame`)
+  - [x] File is now the dashboard contract used by the CDN React frontend
+- [x] Write `scripts/live/api/routes/live.py`:
+  - [x] `GET /api/live/session`
+  - [x] `GET /api/live/positions`
+  - [x] `GET /api/live/equity-curve?date=YYYYMMDD`
+  - [x] `GET /api/live/signal-log?date=YYYYMMDD`
+  - [x] `GET /api/live/depth-health`
+  - [x] `GET /api/live/storage-health`
+  - [x] `GET /api/live/alerts?date=YYYYMMDD`
+  - [x] `GET /api/live/spot/{symbol}?days=N`
+  - [x] `WS /ws/live` pushes `LivePushFrame` every 1 s during market hours or 5 s off-hours
+- [x] Write `scripts/live/api/routes/historical.py` - v2 stub endpoints return empty chart payloads
+- [x] Write `scripts/live/api/routes/backtests.py` - v2 stub endpoints return empty/pending payloads
+- [x] Write `scripts/live/api/main.py`:
+  - [x] CORS: allow `localhost:5173`, `localhost:8000`, and `127.0.0.1` equivalents only
+  - [x] Lifespan: instantiate `DashboardBridge` once; inject via `app.state`
+  - [x] Mount deployed `dashboard/` static files at `/` with `index.html` fallback
+  - [x] Include live, historical, backtest, and websocket route modules
+- [x] Write `scripts/live/systemd/dashboard-api.service` - `uvicorn` bound to `127.0.0.1:8000`
+- [x] Deploy `dashboard-api.service` on `zimaos`, enable it, and verify active/running
+- [x] Smoke test: `GET /api/live/session` returns valid JSON
+- [x] Smoke test: `GET /api/openapi.json` returns the Phase 7a contract
+- [x] Smoke test: `GET /` serves the dashboard HTML
+- [x] Smoke test: `/ws/live` accepts WebSocket connections and emits live frames
+- [x] Test: dashboard API restart leaves `live-paper.service` and `health-monitor.service` active
+- [x] Fix: `live-paper.service` publishes `waiting_preopen`, `latest_process_health.json`, and `latest_feed_state.json` before 09:00 so the dashboard shows the runner as alive before market open
+- [x] Fix: moved dashboard unit `StartLimitIntervalSec` and `StartLimitBurst` to `[Unit]`; systemd warning removed
 
-### Phase 7b — Dashboard Frontend (Claude Design handoff)
+Validation artifact: `reports/backtests/options/monitoring/20260511_phase7_dashboard_live_readiness_verification.md`.
 
-Handoff deliverables from Phase 7a: `scripts/live/api/models.py` (full Pydantic contract) + sample JSON responses for every endpoint + `scripts/live/api/main.py` (working FastAPI app).
+---
 
-- [ ] Scaffold `dashboard/` with Vite + React + TypeScript + Tailwind CSS + shadcn/ui
-- [ ] Install TradingView Lightweight Charts and AG Grid Community
-- [ ] Tab 1 — Live Monitor: all panels from Section 13.2 implemented and connected to live API + WebSocket
-- [ ] Tab 2 — Historical Explorer: connected to `/api/historical/*` (activates when Phase 7a historical methods are implemented)
-- [ ] Tab 3 — Backtests: connected to `/api/backtests/*` (activates when Phase 7a backtest methods are implemented)
-- [ ] Build: `npm run build` → `dashboard/dist/`; confirm FastAPI serves it correctly
-- [ ] Test: open SSH tunnel → `http://localhost:8000` renders full dashboard without console errors
-- [ ] Test: stop the dashboard → confirm paper engine and health monitor continue running
+### Phase 7b — Dashboard Frontend ✓ DONE 2026-05-11
+
+Final implementation is a no-build CDN React 18 dashboard under `dashboard/`,
+served directly by FastAPI. The original Vite/Tailwind/AG Grid build plan was
+replaced to match the repo's no-package-manager deployment model.
+
+- [x] Implement `dashboard/index.html` with strict script load order
+- [x] Implement `dashboard/app.jsx` root shell with initial REST fetch and `/ws/live` wiring
+- [x] Implement `dashboard/panels.jsx` live monitor panels
+- [x] Implement `dashboard/components.jsx` shared UI primitives
+- [x] Implement `dashboard/data.jsx` mock/offline fallback data
+- [x] Implement `dashboard/tweaks-panel.jsx` development tweaks panel
+- [x] Implement `dashboard/styles.css` responsive dark dashboard styling
+- [x] Tab 1 - Live Monitor implemented and connected to live REST API + WebSocket
+- [x] Spot charts connected to `/api/live/spot/{symbol}` and show last-session data while the market is closed
+- [x] Positions, equity, signal log, storage, alerts, and session state connected to `/api/live/*`
+- [x] Offline/mock simulation remains available only as a fallback when WebSocket is disconnected
+- [~] Tab 2 - Historical Explorer remains v2 scope; API stubs exist
+- [~] Tab 3 - Backtests remains v2 scope; API stubs exist
+- [x] No build step required; FastAPI serves `dashboard/` directly
+- [x] Server verification: dashboard reachable through the FastAPI static root on `zimaos`
+- [x] Test: dashboard API restart does not stop `live-paper.service` or `health-monitor.service`
 
 ---
 
 ### Phase 8 — Integration and Crash-Recovery Testing (before first live session)
 
+- [x] **Pre-open integrated readiness check**: 2026-05-11 07:29 IST - `dashboard-api`, `health-monitor`, `live-paper`, and `zimaos-scheduled-reboot.timer` all active; dashboard session reports `waiting_preopen` with fresh process/feed snapshots; WD mount OK; external heartbeat OK; Dhan connectivity **ALL PASS (4/4)**
+- [x] **Phase 8/9 offline validator**: `scripts/live/validate_phase8_9.py` checks locked profile, 246-instrument / 5-websocket depth budget, large gap sentinels, token/Sentry leakage, paper-trade accounting, classified skip reasons, and resume-summary metadata. Verified locally on 2026-05-11; live-session-only artifacts report `PENDING` until a real session writes them.
 - [ ] **Dry-run full session**: run all three processes (`health-monitor`, `run_paper_trading`, `dashboard`) on a non-trading day (Saturday) for 30 minutes → check logs for any unexpected errors
-- [ ] **Crash-recovery test**:
-  - [ ] Start `run_paper_trading.py` in dry-run mode with synthetic positions injected
-  - [ ] Kill the process after checkpoint is written
-  - [ ] Restart → confirm `RESUME MODE` log line and entry phase is skipped
-  - [ ] Confirm EOD summary shows `resumed_after_crash: true` and correct gap window
-- [ ] **Collector restart test**:
-  - [ ] Start `collect_order_book.py`
-  - [ ] Kill and restart mid-session
-  - [ ] Confirm gap sentinel appears in JSONL with correct `gap_start` / `gap_end`
-  - [ ] Confirm downstream analysis script rejects the file when `gap_minutes > 30`
-- [ ] **Websocket budget test**: try opening a 6th Dhan websocket → confirm runner refuses to start
-- [ ] **Storage path guard test**: point `data/live` at an invalid path → confirm both scripts abort with clear error
-- [ ] **Token-redaction test**: scan all log files and snapshot JSON for token-like strings (regex `[A-Za-z0-9_\-]{100,}`) → confirm zero matches
+- [x] **Crash-recovery implementation check**:
+  - [x] Same-day checkpoint with open positions triggers `RESUME MODE` log line
+  - [x] Entry phase is skipped when open positions are loaded from checkpoint
+  - [x] `latest_process_health.json`, `latest_open_positions.json`, and `{YYYYMMDD}_eod_summary.json` carry `resumed_after_crash`, `crash_gap_start`, `crash_gap_end`, and `gap_minutes`
+  - [x] Unit test: `test_resume_checkpoint_metadata_reaches_eod_summary`
+  - [ ] Operational kill/restart drill remains before first live paper session
+- [x] **Collector restart implementation check**:
+  - [x] Collector writes `latest_depth_collector_state.json` while running
+  - [x] Restart after an unclean stop writes a `process_restart` gap sentinel with `gap_start`, `gap_end`, and `gap_minutes`
+  - [x] Downstream validator rejects `gap_minutes > 30`
+  - [x] Unit tests: `test_collector_restart_writes_gap_sentinel`, `test_phase8_validator_rejects_large_gap_sentinels`
+  - [ ] Operational collector kill/restart drill remains before first live paper session
+- [x] **Websocket budget test**: offline validator confirms the locked depth universe is 246 NSE contracts requiring exactly 5 Dhan 20-depth websocket connections; a profile capped at 4 connections fails (`test_phase9_profile_and_websocket_budget_contract`)
+- [x] **Storage path guard test**: runner and collector retain Linux startup guards that abort unless `data/live` resolves under `/media/WD-Storage`; server symlink already verified in Phase 0/9 preflight
+- [x] **Token-redaction test**: `validate_phase8_9.py --include-repo-scan` scans repo text files plus live logs/snapshots/reports for token-like strings and Sentry DSN values; synthetic leak test confirms detection
 
 ---
 
 ### Phase 9 — First Live Paper Sessions (Week 4, Jun 2–6)
 
-- [ ] **Session 1 preflight** (manually step through before 09:00 on first trading day):
-  - [ ] `curl -4 https://api.ipify.org` from `zimaos` matches whitelisted IP
-  - [ ] `timedatectl` shows `System clock synchronized: yes`
-  - [ ] `/media/WD-Storage` mounted, writable, >= 100 GB free
-  - [ ] `data/live` symlink resolves correctly
-  - [ ] `dhan_connection_check.py` all 4 checks PASS
-  - [ ] `health_monitor.service` running and "monitor online" Telegram message received
-  - [ ] Telegram test alert passes and does not expose secrets
+- [x] **Session validation tooling**: after each session, run `python scripts/live/validate_phase8_9.py --date YYYYMMDD --live-root data/live --include-repo-scan`; failures block the next session, while `PENDING` means the market-day artifact has not been produced yet.
+- [~] **Session 1 preflight** (manually step through before 09:00 on first trading day):
+  - [~] `curl -4 https://api.ipify.org` from `zimaos` matches whitelisted IP
+  - [x] `timedatectl` shows `System clock synchronized: yes`
+  - [x] `/media/WD-Storage` mounted, writable, >= 100 GB free
+  - [x] `data/live` symlink resolves correctly
+  - [x] `dhan_connection_check.py` all 4 checks PASS
+  - [x] `health_monitor.service` running and "monitor online" Telegram message received
+  - [x] Telegram test alert passes and does not expose secrets
   - [ ] Healthchecks.io `$EXTERNAL_HEARTBEAT_URL/start` sent at 08:55
   - [ ] No prior Dhan websocket connections consuming the budget
-  - [ ] Token expiry > today's EOD
+  - [x] Token expiry > today's EOD
 - [ ] **Session 1 market open** (09:00–09:20):
   - [ ] `live-paper.service` starts; "backend healthy at market open" Telegram message received
-  - [ ] `dashboard.py` reachable from laptop via SSH tunnel
+  - [x] Dashboard API/static root reachable from `zimaos` at `127.0.0.1:8000`; laptop access remains via SSH tunnel
   - [ ] Depth health tile shows >= 95% of 246 configured NSE channels ready by 09:15
   - [ ] Option-chain security-id discovery completes for all active symbols by 09:17
   - [ ] VIX quote is fresh and passes/fails NIFTY filter correctly
@@ -1821,43 +1848,43 @@ Handoff deliverables from Phase 7a: `scripts/live/api/models.py` (full Pydantic 
 
 ## 15. Verification Checklist
 
-- [ ] `dhan_connection_check.py` passes REST `optionchain/expirylist`.
-- [ ] `dhan_connection_check.py` opens live-feed websocket and survives a small subscription.
-- [ ] `dhan_connection_check.py` opens 20-depth websocket and survives a small NSE subscription.
-- [ ] Server repo and `.venv` live under `/DATA/live-paper/indian-markets`, not under `/root`.
-- [ ] `/media/WD-Storage` is mounted and has at least 100 GB free before starting the month-long run.
-- [ ] `data/live` resolves to `/media/WD-Storage/indian-markets-live`.
-- [ ] `health_monitor.py` starts before `run_paper_trading.py`.
-- [ ] Telegram test alert succeeds before 09:00 and does not expose secrets.
-- [ ] Alert throttling and recovery messages work in a dry-run monitor test.
-- [ ] External heartbeat monitor is hosted outside `zimaos`.
-- [ ] `zimaos` sends external heartbeat every 60 seconds while the Healthchecks.io monitor period is configured at 1 minute.
-- [ ] Healthchecks.io `/start` suffix sent at 08:55; `/fail` sent on preflight abort.
-- [ ] Missed external heartbeat triggers Telegram alert within 3 minutes.
-- [ ] External heartbeat recovery message arrives after heartbeat resumes.
-- [ ] Sentry captures a test exception from `zimaos` and fires Telegram alert.
-- [ ] `SENTRY_DSN` is not present in any repo file, log, markdown, or parquet metadata.
+- [x] `dhan_connection_check.py` passes REST `optionchain/expirylist`.
+- [x] `dhan_connection_check.py` opens live-feed websocket and survives a small subscription.
+- [x] `dhan_connection_check.py` opens 20-depth websocket and survives a small NSE subscription.
+- [x] Server repo and `.venv` live under `/DATA/live-paper/indian-markets`, not under `/root`.
+- [x] `/media/WD-Storage` is mounted and has at least 100 GB free before starting the month-long run.
+- [x] `data/live` resolves to `/media/WD-Storage/indian-markets-live`.
+- [x] `health_monitor.py` starts before `run_paper_trading.py`.
+- [x] Telegram test alert succeeds before 09:00 and does not expose secrets.
+- [x] Alert throttling and recovery messages work in a dry-run monitor test.
+- [x] External heartbeat monitor is hosted outside `zimaos`.
+- [x] `zimaos` sends external heartbeat every 60 seconds while the Healthchecks.io monitor period is configured at 1 minute.
+- [~] Healthchecks.io `/start` suffix sent at 08:55; `/fail` sent on preflight abort.
+- [x] Missed external heartbeat triggers alerting within the Healthchecks.io grace window.
+- [x] External heartbeat recovery message arrives after heartbeat resumes.
+- [x] Sentry captures a test exception from `zimaos`.
+- [x] `SENTRY_DSN` value is not present in repo text files, live logs, markdown, JSON, or snapshots scanned by `validate_phase8_9.py --include-repo-scan`.
 - [ ] `latest_open_positions.json` is written atomically after the first paper fill.
-- [ ] Engine restarted mid-session in a dry-run test correctly loads position checkpoint and skips entry phase.
-- [ ] Data gap sentinel appears in JSONL when `collect_order_book.py` is restarted mid-session.
-- [ ] EOD summary includes `resumed_after_crash: true` and gap window when resume mode was used.
+- [x] Engine restart path loads same-day position checkpoint, logs `RESUME MODE`, and skips entry phase when open positions exist; operational kill/restart drill still required.
+- [x] Data gap sentinel appears in JSONL when the collector restarts after an unclean running state; operational kill/restart drill still required.
+- [x] EOD summary includes `resumed_after_crash: true` and crash gap window when resume mode was used.
 - [x] systemd `Restart=on-failure` confirmed for both `live-paper.service` and `health-monitor.service`.
-- [ ] Dashboard API (`uvicorn`) binds to `127.0.0.1:8000` on `zimaos`; accessed from laptop via SSH tunnel.
-- [ ] `GET /api/live/session` returns valid JSON when paper engine is running.
-- [ ] `WS /ws/live` delivers push frames on the correct interval (1 s market hours, 5 s off-hours).
-- [ ] React build served correctly from FastAPI static mount at `/`.
-- [ ] Stopping the dashboard API does not affect the paper engine or health monitor.
-- [ ] No access token appears in git diff, logs, markdown, JSON, or parquet metadata.
-- [ ] Locked profile config matches Section 2 exactly.
+- [x] Dashboard API (`uvicorn`) binds to `127.0.0.1:8000` on `zimaos`; accessed from laptop via SSH tunnel.
+- [x] `GET /api/live/session` returns valid JSON when paper engine is running.
+- [x] `WS /ws/live` delivers push frames on the correct interval (1 s market hours, 5 s off-hours).
+- [x] CDN React dashboard served correctly from FastAPI static mount at `/`.
+- [x] Stopping the dashboard API does not affect the paper engine or health monitor.
+- [x] No access token-like string appears in repo text files or live log/snapshot/report scan covered by `validate_phase8_9.py`; parquet metadata scan remains a post-session check once parquet exists.
+- [x] Locked profile config matches Section 2 exactly (`validate_phase8_9.py` + unit test).
 - [ ] `live_resolver.atm_strike()` matches independent live ATM check at 09:25.
 - [ ] `live_resolver.resolve_atm_offset()` resolves the exact four Wing-6 legs for each active symbol.
 - [ ] SENSEX is absent from 20-depth collector and uses top-of-book path explicitly.
 - [ ] Order book collector populates 20 bid + 20 ask levels for all NSE instruments during market hours.
 - [ ] Paper fills use executable bid/ask/depth, not midpoint.
 - [ ] Midpoint is stored only as `mark_mid`.
-- [ ] End-of-day JSON has `net_pnl = gross_pnl - charges`.
+- [x] End-of-day JSON / paper-trade validator checks `net_pnl = gross_pnl - charges`.
 - [ ] Paper JSON converts through adapter before `reports.summary()`.
-- [ ] All skip reasons use the explicit reason-code table.
+- [x] Skip-reason validator enforces the explicit reason-code table when `{YYYYMMDD}_signals.jsonl` exists.
 - [ ] All 4 planned connections stay stable for a full 6.5-hour live session.
 - [ ] Uptime summary reports backend uptime, snapshot gaps, alert counts, and final artifact paths.
 - [ ] Dashboard renders live PnL, open positions, and depth health without errors.

@@ -14,10 +14,24 @@ import pandas as pd
 
 from options_backtest.depth_cache import DepthCache, DepthLevel
 from options_backtest.live_resolver import LiveDhanContractResolver
+from options_backtest.paper_engine import PaperTradingEngine
 from options_backtest.paper_engine import _FEED_URL
-from scripts.live.collect_order_book import _depth_collection_settings, _iter_packets, _parse_packet, _write_depth_cache_snapshot
+from scripts.live.collect_order_book import (
+    _depth_collection_settings,
+    _iter_packets,
+    _parse_packet,
+    _write_depth_cache_snapshot,
+    _write_collector_state,
+    _write_restart_gap_if_needed,
+)
 from scripts.live.health_monitor import HealthMonitor, _jwt_expiry, _parse_timesync_offset
 from scripts.live.paper_json_to_ledger import paper_trades_to_ledger, write_paper_reports
+from scripts.live.validate_phase8_9 import (
+    large_gap_records,
+    secret_leaks,
+    validate_depth_budget,
+    validate_profile,
+)
 
 
 class _Resp:
@@ -170,6 +184,88 @@ class LivePaperTests(unittest.TestCase):
         self.assertEqual(payload["ready"], 1)
         self.assertEqual(payload["total"], 1)
         self.assertEqual(payload["ready_pct"], 100.0)
+
+    def test_collector_restart_writes_gap_sentinel(self) -> None:
+        root = Path("tmp_live_tests") / "collector_restart_case"
+        (root / "snapshots").mkdir(parents=True, exist_ok=True)
+        _write_collector_state(root, "20260512", "running", ["1", "2"])
+
+        wrote = _write_restart_gap_if_needed(root, "20260512")
+        self.assertTrue(wrote)
+        gap_path = root / "alerts" / "20260512_gaps.jsonl"
+        record = json.loads(gap_path.read_text().splitlines()[-1])
+        self.assertEqual(record["reason"], "process_restart")
+        self.assertEqual(record["symbol"], "NSE_MAJOR_INDICES")
+
+    def test_phase8_validator_rejects_large_gap_sentinels(self) -> None:
+        root = Path("tmp_live_tests") / "gap_validator_case"
+        (root / "alerts").mkdir(parents=True, exist_ok=True)
+        (root / "alerts" / "20260512_gaps.jsonl").write_text(
+            json.dumps({
+                "type": "data_gap",
+                "symbol": "NIFTY",
+                "gap_start": "2026-05-12T10:00:00+05:30",
+                "gap_end": "2026-05-12T10:45:00+05:30",
+                "reason": "process_restart",
+                "gap_minutes": 45.0,
+            }) + "\n"
+        )
+        bad = large_gap_records(root, "20260512")
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0]["gap_minutes"], 45.0)
+
+    def test_phase8_validator_flags_secret_like_strings(self) -> None:
+        root = Path("tmp_live_tests") / "secret_scan_case"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "sample.log").write_text("token=" + ("A" * 120))
+        leaks = secret_leaks([root])
+        self.assertEqual(len(leaks), 1)
+        self.assertEqual(leaks[0][1], "token_like_string")
+
+    def test_phase9_profile_and_websocket_budget_contract(self) -> None:
+        profile = json.loads(Path("configs/live/wing6_4x1_all_vix_filtered.json").read_text())
+        self.assertEqual(validate_profile(profile).status, "PASS")
+        budget = validate_depth_budget(profile)
+        self.assertEqual(budget.status, "PASS")
+        self.assertIn("246 instruments", budget.detail)
+
+        too_small = json.loads(json.dumps(profile))
+        too_small["depth_collection"]["max_depth_connections"] = 4
+        self.assertEqual(validate_depth_budget(too_small).status, "FAIL")
+
+    def test_resume_checkpoint_metadata_reaches_eod_summary(self) -> None:
+        root = Path("tmp_live_tests") / "resume_summary_case"
+        engine = PaperTradingEngine(
+            profile={"profile_name": "test", "symbols": {}, "vix": {}},
+            session_date=date(2026, 5, 12),
+            depth_cache=DepthCache(),
+            access_token="token",
+            client_id="client",
+            live_root=root,
+        )
+        checkpoint = {
+            "session_date": "2026-05-12",
+            "written_at": "2026-05-12T10:00:00+05:30",
+            "open_positions": [
+                {
+                    "symbol": "NIFTY",
+                    "expiry": "2026-05-12",
+                    "lots": 1,
+                    "lot_size": 65,
+                    "entry_time": "2026-05-12T09:20:00+05:30",
+                    "legs": [],
+                    "entry_credit": 0.0,
+                    "entry_charges": 0.0,
+                }
+            ],
+        }
+        engine.resume_from_checkpoint(checkpoint)
+        engine._generate_eod_report()
+
+        summary = json.loads((root / "reports" / "20260512_eod_summary.json").read_text())
+        self.assertTrue(summary["resumed_after_crash"])
+        self.assertEqual(summary["crash_gap_start"], "2026-05-12T10:00:00+05:30")
+        self.assertIsNotNone(summary["gap_minutes"])
 
     def test_health_monitor_alerts_after_two_bad_freshness_checks(self) -> None:
         async def run_case() -> dict:
