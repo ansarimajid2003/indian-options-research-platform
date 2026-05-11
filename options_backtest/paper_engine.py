@@ -50,6 +50,11 @@ _SEG_IDX = "IDX_I"
 _SEG_NSE_FNO = "NSE_FNO"
 _SEG_BSE_FNO = "BSE_FNO"
 
+# Spot index security IDs (IDX_I segment) → symbol name
+_SPOT_SID_TO_SYMBOL: dict[str, str] = {
+    "13": "NIFTY", "27": "FINNIFTY", "442": "MIDCPNIFTY", "51": "SENSEX",
+}
+
 # Freshness limits (seconds)
 _VIX_MAX_AGE = 300
 _SPOT_MAX_AGE = 5
@@ -250,6 +255,10 @@ class PaperTradingEngine:
 
         # Last parsed type-8 top-of-book per security_id (for SENSEX fallback)
         self._last_tob: dict[str, dict] = {}
+
+        # Live spot bar builder: closed bars + currently-open bar per symbol
+        self._spot_bars: dict[str, list[dict]] = {sym: [] for sym in _SPOT_SID_TO_SYMBOL.values()}
+        self._spot_open_bar: dict[str, dict | None] = {sym: None for sym in _SPOT_SID_TO_SYMBOL.values()}
 
         # Open positions list (grows during entry, shrinks during exit)
         self._open_positions: list[_OpenPosition] = []
@@ -478,6 +487,10 @@ class PaperTradingEngine:
                 "best_ask": parsed["asks"][0]["price"] if parsed["asks"] else 0.0,
                 "ts": received_at,
             }
+            # Capture spot index tick for live bar building
+            spot_sym = _SPOT_SID_TO_SYMBOL.get(sid)
+            if spot_sym:
+                self._update_spot_bar(spot_sym, parsed["ltp"], received_at)
             return
 
         if ptype == _TYPE_TICKER:
@@ -488,6 +501,10 @@ class PaperTradingEngine:
             received_at = pd.Timestamp.now(tz="Asia/Kolkata")
             for resolver in self._resolvers.values():
                 resolver.update_quote(sid, ltp=parsed["ltp"], received_at=received_at)
+            # Capture spot index tick for live bar building
+            spot_sym = _SPOT_SID_TO_SYMBOL.get(sid)
+            if spot_sym:
+                self._update_spot_bar(spot_sym, parsed["ltp"], received_at)
 
     async def _subscribe_instruments(self, ws, instruments: list[dict]) -> None:
         """Send RequestCode=21 (Full) subscription for all instruments in batches of 100."""
@@ -1041,6 +1058,7 @@ class PaperTradingEngine:
         while not self._stop_event.is_set():
             try:
                 await asyncio.to_thread(self._write_feed_state)
+                await asyncio.to_thread(self._write_spot_bars)
                 await asyncio.to_thread(self._write_process_health)
             except Exception as exc:
                 _log.warning("snapshot_loop: error — %r", exc)
@@ -1077,6 +1095,56 @@ class PaperTradingEngine:
                 quotes[sid]["theta"] = (meta.get("greeks") or {}).get("theta")
         if quotes:
             _write_atomic(self._snapshot_dir / "latest_quotes.json", {"written_at": _ts_str(), "quotes": quotes})
+
+    def _update_spot_bar(self, symbol: str, ltp: float, ts: pd.Timestamp) -> None:
+        """Accumulate spot LTP ticks into 1-min OHLCV bars (called from async feed handler)."""
+        minute = ts.floor("min")
+        bar = self._spot_open_bar[symbol]
+        if bar is None or bar["_minute"] != minute:
+            if bar is not None:
+                # Close the completed bar — compute display epoch (treat IST naive as UTC)
+                m = bar["_minute"]
+                epoch = int(
+                    (pd.Timestamp(m.year, m.month, m.day, m.hour, m.minute)
+                     - pd.Timestamp("1970-01-01"))
+                    / pd.Timedelta("1s")
+                )
+                self._spot_bars[symbol].append(
+                    {"time": epoch, "open": bar["open"], "high": bar["high"],
+                     "low": bar["low"], "close": bar["close"]}
+                )
+            self._spot_open_bar[symbol] = {
+                "_minute": minute, "open": ltp, "high": ltp, "low": ltp, "close": ltp,
+            }
+        else:
+            bar["high"] = max(bar["high"], ltp)
+            bar["low"]  = min(bar["low"],  ltp)
+            bar["close"] = ltp
+
+    def _write_spot_bars(self) -> None:
+        """Write latest_spot_bars.json — closed bars + current open bar for all spot symbols."""
+        bars_out: dict[str, list[dict]] = {}
+        for sym in _SPOT_SID_TO_SYMBOL.values():
+            closed = list(self._spot_bars[sym])
+            open_bar = self._spot_open_bar[sym]
+            if open_bar is not None:
+                m = open_bar["_minute"]
+                epoch = int(
+                    (pd.Timestamp(m.year, m.month, m.day, m.hour, m.minute)
+                     - pd.Timestamp("1970-01-01"))
+                    / pd.Timedelta("1s")
+                )
+                closed = closed + [
+                    {"time": epoch, "open": open_bar["open"], "high": open_bar["high"],
+                     "low": open_bar["low"], "close": open_bar["close"]}
+                ]
+            bars_out[sym] = closed
+        if any(bars_out.values()):
+            _write_atomic(self._snapshot_dir / "latest_spot_bars.json", {
+                "written_at": _ts_str(),
+                "session_date": self._session_date.isoformat(),
+                "bars": bars_out,
+            })
 
     def _write_instrument_map(self) -> None:
         imap: dict[str, dict] = {}

@@ -550,31 +550,37 @@ function OptionChainPanel({ chainData, chainLoaded, marketClosed, session }) {
         )}
       </div>
 
-      {/* Overlays */}
-      {(marketClosed || engineOffline || noData) && (
+      {/* Blocking overlays only for engine-offline / no-data — NOT for market closed */}
+      {!marketClosed && (engineOffline || noData) && (
         <div style={{
           background:'rgba(10,10,10,0.82)', position:'absolute', inset:0,
           zIndex:10, display:'flex', flexDirection:'column',
           alignItems:'center', justifyContent:'center', gap:8,
           backdropFilter:'blur(2px)', borderRadius:4,
-          top: 96,  // below header + tabs
+          top: 96,
         }}>
-          {marketClosed
+          {engineOffline
             ? <>
-                <span style={{fontSize:13, fontWeight:600, color:'var(--text-2)', letterSpacing:'0.08em'}}>MARKET CLOSED</span>
-                <span style={{fontSize:10, color:'var(--text-4)'}}>Live quotes unavailable · opens 09:15 IST on next trading day</span>
+                <span style={{fontSize:13, fontWeight:600, color:'var(--text-2)', letterSpacing:'0.08em'}}>ENGINE OFFLINE</span>
+                <span style={{fontSize:10, color:'var(--text-4)'}}>Option chain data written by paper engine · starts 09:00 IST</span>
               </>
-            : (engineOffline
-              ? <>
-                  <span style={{fontSize:13, fontWeight:600, color:'var(--text-2)', letterSpacing:'0.08em'}}>ENGINE OFFLINE</span>
-                  <span style={{fontSize:10, color:'var(--text-4)'}}>Option chain data written by paper engine · starts 09:00 IST</span>
-                </>
-              : <>
-                  <span style={{fontSize:13, fontWeight:600, color:'var(--text-2)', letterSpacing:'0.08em'}}>NO CHAIN DATA</span>
-                  <span style={{fontSize:10, color:'var(--text-4)'}}>Engine has not fetched chains yet · available after 09:15 IST</span>
-                </>
-            )
+            : <>
+                <span style={{fontSize:13, fontWeight:600, color:'var(--text-2)', letterSpacing:'0.08em'}}>NO CHAIN DATA</span>
+                <span style={{fontSize:10, color:'var(--text-4)'}}>Engine has not fetched chains yet · available after 09:15 IST</span>
+              </>
           }
+        </div>
+      )}
+      {/* When market is closed show EOD snapshot banner inline (no blocking overlay) */}
+      {marketClosed && rows.length > 0 && (
+        <div style={{
+          margin:'0 14px 8px', padding:'6px 12px', borderRadius:3,
+          background:'rgba(255,255,255,0.04)', border:'1px solid rgba(255,255,255,0.07)',
+          display:'flex', alignItems:'center', gap:8, fontSize:10, color:'var(--text-3)',
+        }}>
+          <span style={{fontWeight:600, letterSpacing:'0.06em', color:'var(--text-2)'}}>EOD SNAPSHOT</span>
+          <span>·</span>
+          <span>End-of-day quotes · live feed resumes 09:15 IST next trading day</span>
         </div>
       )}
 

@@ -591,18 +591,37 @@ class DashboardBridge:
         """
         Return 1-min OHLCV bars for the last `days` trading sessions.
 
-        Timestamps are "display epoch": the IST naive datetime is treated as UTC
-        so that LightweightCharts (which renders UTC) shows the correct IST labels
-        (09:15 appears as 09:15 on the chart).
+        During market hours, today's bars come from latest_spot_bars.json (written every
+        10 s by the engine) so the chart is live.  Prior sessions always come from the
+        static CSV.  Timestamps are "display epoch": IST naive treated as UTC so that
+        LightweightCharts shows 09:15 not 03:45.
         """
         path = _SPOT_FILES.get(symbol.upper())
         if not path or not path.exists():
             return []
 
+        # Live JSON uses _TTL_LIVE; historical CSV uses _TTL_HIST.
+        # Use a short TTL whenever live data might be present.
+        from datetime import date as _date
+        today = _date.today()
+        live_path = self._snap("latest_spot_bars.json")
+        live_data = self._read_json(live_path) or {}
+        has_live = (
+            live_data.get("session_date") == today.isoformat()
+            and bool(live_data.get("bars", {}).get(symbol.upper()))
+        )
+        ttl = _TTL_LIVE if has_live else _TTL_HIST
         cache_key = f"spot_{symbol}_{days}"
 
         def _load() -> list[dict]:
-            # Detect timestamp column name (NIFTY canonical uses "datetime", Dhan files use "timestamp")
+            # ── Live bars from today's engine snapshot ─────────────────────
+            sym_up = symbol.upper()
+            _live = self._read_json(self._snap("latest_spot_bars.json")) or {}
+            _live_bars: list[dict] = []
+            if _live.get("session_date") == today.isoformat():
+                _live_bars = _live.get("bars", {}).get(sym_up, [])
+
+            # ── CSV for prior sessions ─────────────────────────────────────
             with open(path, encoding="utf-8") as _f:
                 _hdr = _f.readline().strip().split(",")
             ts_col = "datetime" if "datetime" in _hdr else "timestamp"
@@ -615,18 +634,25 @@ class DashboardBridge:
             df.rename(columns={ts_col: "datetime"}, inplace=True)
             df["datetime"] = pd.to_datetime(df["datetime"])
             df.sort_values("datetime", inplace=True)
+
+            # Exclude today from CSV when live JSON has today's bars
+            if _live_bars:
+                df = df[df["datetime"].dt.date != today]
+
             session_dates = sorted(df["datetime"].dt.date.unique())
-            if not session_dates:
-                return []
-            target = set(session_dates[-max(days, 1):])
-            df = df[df["datetime"].dt.date.isin(target)]
-            # "Display epoch": treat IST naive timestamps as UTC so the chart
-            # shows IST times (09:15) instead of UTC times (03:45).
+            csv_sessions_needed = max(days - (1 if _live_bars else 0), 0)
+
+            if csv_sessions_needed > 0 and session_dates:
+                target = set(session_dates[-csv_sessions_needed:])
+                df = df[df["datetime"].dt.date.isin(target)]
+            else:
+                df = df.iloc[0:0]
+
             df["time"] = (
                 (df["datetime"] - pd.Timestamp("1970-01-01"))
                 // pd.Timedelta("1s")
             )
-            return [
+            hist_bars = [
                 {
                     "time":  int(r.time),
                     "open":  round(float(r.open),  2),
@@ -636,8 +662,9 @@ class DashboardBridge:
                 }
                 for r in df.itertuples(index=False)
             ]
+            return hist_bars + _live_bars
 
-        result = self._cached(cache_key, _TTL_HIST, _load)
+        result = self._cached(cache_key, ttl, _load)
         return result if result is not None else []
 
     # ── Historical data (v2 scope — stubs) ──────────────────────────────────
