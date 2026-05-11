@@ -500,15 +500,11 @@ function OptionChainPanel({ chainData, chainLoaded, marketClosed, session }) {
   const engineOffline = !session || session.engine_phase === 'offline' || !session.feed_connected;
   const noData = chainLoaded && rows.length === 0;
 
-  // Derive spot and ATM from rows
+  // ATM filtering is done in the bridge (all 4 symbols); rows are already ATM ± 15
   const spot = rows.length ? _chainSpot(rows) : null;
   const step = rows.length > 1 ? rows[1].strike - rows[0].strike : 100;
   const atmStrike = spot != null ? Math.round(spot / step) * step : null;
-
-  // Only show ATM ± 15 strikes so far-OTM dead rows don't dominate the view
-  const visibleRows = atmStrike != null
-    ? rows.filter(r => Math.abs(r.strike - atmStrike) <= 15 * step)
-    : rows;
+  const visibleRows = rows;  // bridge pre-filters; keep for isAtm highlight only
 
   return (
     <div className="panel span-alerts" style={{position:'relative'}}>

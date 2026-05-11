@@ -403,42 +403,25 @@ class DashboardBridge:
 
     # ── Option chain ─────────────────────────────────────────────────────────
 
-    def get_option_chain(self, symbol: str) -> list[dict]:
-        """
-        Build a per-strike option chain row list for `symbol` using three snapshot files:
-          - latest_instrument_map.json  (security_id → symbol/strike/expiry/option_type)
-          - latest_quotes.json          (security_id → ltp/iv/delta/theta/oi/ts)
-          - latest_depth_cache.json     (security_id → bid/ask/qty/age)
-
-        Returns rows sorted by strike ascending, each row:
-          {strike, expiry, ce: {ltp,bid,ask,bid_qty,ask_qty,iv,delta,theta,oi,age_ms},
-                            pe: {same}}
-        Returns [] if instrument_map file is missing.
-        """
-        imap_data = self._read_json(self._snap("latest_instrument_map.json"))
-        if not imap_data:
-            return []
-        quotes_data = self._read_json(self._snap("latest_quotes.json")) or {}
-        depth_data = self._read_json(self._snap("latest_depth_cache.json")) or {}
-
-        instruments: dict[str, dict] = imap_data.get("instruments", {})
-        quotes: dict[str, dict] = quotes_data.get("quotes", {})
-        tob: dict[str, dict] = depth_data.get("tob", {})
-
-        # Filter to requested symbol, group by (expiry, strike)
+    def _build_chain_rows(
+        self,
+        instruments: dict[str, dict],
+        quotes: dict[str, dict],
+        tob: dict[str, dict],
+        symbol: str,
+    ) -> list[dict]:
+        """Assemble per-strike rows for `symbol` from pre-read snapshot dicts."""
         by_strike: dict[tuple, dict] = {}
         for sid, info in instruments.items():
             if info.get("symbol") != symbol:
                 continue
             expiry = info.get("expiry", "")
             strike = info.get("strike", 0)
-            otype = info.get("option_type", "").upper()  # "CE" or "PE"
+            otype = info.get("option_type", "").upper()
             if otype not in ("CE", "PE"):
                 continue
-
             q = quotes.get(sid, {})
             d = tob.get(sid, {})
-
             leg = {
                 "ltp":     q.get("ltp", 0.0),
                 "iv":      q.get("iv"),
@@ -452,14 +435,90 @@ class DashboardBridge:
                 "age_ms":  max(d.get("bid_age_ms", 0), d.get("ask_age_ms", 0)),
                 "sid":     sid,
             }
-
             key = (expiry, strike)
             if key not in by_strike:
                 by_strike[key] = {"strike": strike, "expiry": expiry}
             by_strike[key][otype.lower()] = leg
+        return sorted(by_strike.values(), key=lambda r: (r["expiry"], r["strike"]))
 
-        rows = sorted(by_strike.values(), key=lambda r: (r["expiry"], r["strike"]))
-        return rows
+    @staticmethod
+    def _filter_chain_atm(rows: list[dict], spot: float | None, n: int = 15) -> list[dict]:
+        """
+        Filter rows to the nearest expiry and ATM ± n strikes.
+        spot is derived from live spot bars — falls back to put-call parity on rows.
+        """
+        if not rows:
+            return rows
+
+        # Nearest expiry only
+        nearest = rows[0]["expiry"]
+        rows = [r for r in rows if r["expiry"] == nearest]
+
+        # Derive spot: prefer caller-supplied value, then put-call parity on non-zero rows
+        if spot is None:
+            for r in rows:
+                ce = (r.get("ce") or {}).get("ltp") or 0
+                pe = (r.get("pe") or {}).get("ltp") or 0
+                if ce > 0 and pe > 0:
+                    spot = r["strike"] + ce - pe
+                    break
+
+        if spot is None:
+            return rows
+
+        # Compute strike step from sorted unique strikes
+        strikes = sorted({r["strike"] for r in rows})
+        step = 50
+        if len(strikes) > 1:
+            diffs = [strikes[i + 1] - strikes[i] for i in range(len(strikes) - 1)]
+            step = min(diffs) if diffs else 50
+
+        atm = round(spot / step) * step
+        return [r for r in rows if abs(r["strike"] - atm) <= n * step]
+
+    def get_option_chain(self, symbol: str) -> list[dict]:
+        """
+        Build a per-strike option chain for `symbol`.
+
+        Source priority:
+          - When market is closed and latest_eod_snapshot.json exists for today:
+            use that (true closing quotes written at 15:31).
+          - Otherwise use latest_instrument_map.json + latest_quotes.json (rolling 10s snapshot).
+
+        Rows are filtered to the nearest expiry and ATM ± 15 strikes so all
+        four symbols show liquid strikes only, regardless of how many far-OTM
+        contracts are in the instrument map.
+        """
+        from datetime import date as _date
+        today = _date.today()
+
+        # Prefer EOD snapshot when market closed
+        eod_data = self._read_json(self._snap("latest_eod_snapshot.json")) or {}
+        use_eod = eod_data.get("session_date") == today.isoformat() and bool(eod_data.get("instruments"))
+
+        if use_eod:
+            instruments = eod_data.get("instruments", {})
+            quotes = eod_data.get("quotes", {})
+            tob: dict[str, dict] = {}  # depth not included in EOD snapshot
+        else:
+            imap_data = self._read_json(self._snap("latest_instrument_map.json"))
+            if not imap_data:
+                return []
+            instruments = imap_data.get("instruments", {})
+            quotes = (self._read_json(self._snap("latest_quotes.json")) or {}).get("quotes", {})
+            tob = (self._read_json(self._snap("latest_depth_cache.json")) or {}).get("tob", {})
+
+        rows = self._build_chain_rows(instruments, quotes, tob, symbol.upper())
+
+        # Get spot from live spot bars for accurate ATM (avoids put-call parity failure on sparse chains)
+        spot: float | None = None
+        live_bars = self._read_json(self._snap("latest_spot_bars.json")) or {}
+        if live_bars.get("session_date") == today.isoformat():
+            sym_bars = live_bars.get("bars", {}).get(symbol.upper(), [])
+            if sym_bars:
+                spot = float(sym_bars[-1].get("close", 0)) or None
+
+        return self._filter_chain_atm(rows, spot)
 
     # ── Depth health ─────────────────────────────────────────────────────────
 

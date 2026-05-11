@@ -406,6 +406,11 @@ class PaperTradingEngine:
         await _sleep_until(_T_EOD, self._session_date)
         self._phase = "eod"
         self._generate_eod_report()
+        # Write final EOD snapshots — these persist as the definitive closing chain
+        # until the engine restarts next morning.
+        await asyncio.to_thread(self._write_feed_state)
+        await asyncio.to_thread(self._write_spot_bars)
+        await asyncio.to_thread(self._write_eod_snapshot)
 
         self._stop_event.set()
         await asyncio.gather(feed_task, snapshot_task, return_exceptions=True)
@@ -1145,6 +1150,33 @@ class PaperTradingEngine:
                 "session_date": self._session_date.isoformat(),
                 "bars": bars_out,
             })
+
+    def _write_eod_snapshot(self) -> None:
+        """Write latest_eod_snapshot.json at 15:31 — preserves true closing quotes."""
+        imap: dict[str, dict] = {}
+        for symbol, resolver in self._resolvers.items():
+            for sid, info in resolver.instrument_map().items():
+                imap[sid] = {"symbol": symbol, **info}
+        quotes: dict[str, dict] = {}
+        for resolver in self._resolvers.values():
+            for sid, q in resolver.quote_snapshot().items():
+                quotes[sid] = q
+        for sid, tob in self._last_tob.items():
+            if sid not in quotes:
+                quotes[sid] = {"ltp": tob.get("ltp", 0.0), "oi": 0, "volume": 0, "ts": tob.get("ts", pd.Timestamp.now(tz="Asia/Kolkata")).isoformat()}
+        for sid, meta in self._chain_greeks.items():
+            if sid in quotes:
+                quotes[sid]["iv"] = meta.get("iv")
+                quotes[sid]["delta"] = (meta.get("greeks") or {}).get("delta")
+                quotes[sid]["theta"] = (meta.get("greeks") or {}).get("theta")
+        if imap and quotes:
+            _write_atomic(self._snapshot_dir / "latest_eod_snapshot.json", {
+                "written_at": _ts_str(),
+                "session_date": self._session_date.isoformat(),
+                "instruments": imap,
+                "quotes": quotes,
+            })
+            _log.info("eod_snapshot: written %d instruments, %d quotes", len(imap), len(quotes))
 
     def _write_instrument_map(self) -> None:
         imap: dict[str, dict] = {}
