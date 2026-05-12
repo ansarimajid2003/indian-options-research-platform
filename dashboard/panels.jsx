@@ -412,7 +412,7 @@ function SpotChartCard({ symbol, bars, marketClosed }) {
   const chgPct = first.open ? (chg / first.open) * 100 : 0;
 
   return (
-    <div className="panel" style={{gridColumn: 'span 3'}}>
+    <div className="panel">
       <div className="spot-header-bar">
         <div style={{display:'flex', alignItems:'center', justifyContent:'space-between'}}>
           <span className="spot-sym">{symbol} <span style={{color:'var(--text-3)', fontWeight:400, fontSize:10}}>SPOT</span></span>
@@ -455,11 +455,11 @@ function SpotChartCard({ symbol, bars, marketClosed }) {
 
 function SpotChartsRow({ spotData, marketClosed }) {
   return (
-    <>
+    <div style={{display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:'12px', gridColumn:'span 12'}}>
       {['NIFTY','FINNIFTY','MIDCPNIFTY','SENSEX'].map(sym => (
         <SpotChartCard key={sym} symbol={sym} bars={spotData[sym] || []} marketClosed={marketClosed} />
       ))}
-    </>
+    </div>
   );
 }
 

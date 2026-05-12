@@ -525,7 +525,7 @@ function App() {
               <SpotChartsRow spotData={spotData} marketClosed={marketClosed} />
               <OptionChainPanel chainData={chainData} chainLoaded={chainLoaded} marketClosed={marketClosed} session={session} />
               <SignalLogPanel entries={signalLog} />
-              <div ref={alertPanelRef}>
+              <div ref={alertPanelRef} className="span-alerts">
                 <AlertsPanel alerts={alerts} />
               </div>
             </div>
