@@ -107,6 +107,11 @@ def _summary_model(raw: dict[str, Any]) -> BacktestSummaryModel:
         created_at=str(raw.get("created_at", "")),
         source_path=str(raw.get("source", raw.get("source_path", ""))),
         source_kind=source_kind,
+        run_key=str(raw.get("run_key", "")),
+        strategy_family=str(raw.get("strategy_family", "")),
+        group_key=str(raw.get("group_key", "")),
+        group_label=str(raw.get("group_label", "")),
+        group_path=str(raw.get("group_path", "")),
         legacy=source_kind.startswith("legacy"),
         compat_version=str(raw.get("compat_version", "v2")),
         has_ledger=bool(raw.get("has_ledger", True)),
@@ -183,8 +188,12 @@ def _ledger_row(row: pd.Series, legacy: bool) -> TradeLedgerRow:
 
 
 @router.get("", response_model=BacktestListResponse, summary="[v2] List available backtest runs")
-async def list_backtests(request: Request) -> BacktestListResponse:
-    rows = await _run_bridge(request, "backtest_list")
+async def list_backtests(
+    request: Request,
+    sort_by: str = Query(default="date"),
+    sort_dir: str = Query(default="desc", pattern="^(asc|desc)$"),
+) -> BacktestListResponse:
+    rows = await _run_bridge(request, "backtest_list", sort_by, sort_dir)
     return BacktestListResponse(backtests=[_summary_model(x) for x in rows])
 
 

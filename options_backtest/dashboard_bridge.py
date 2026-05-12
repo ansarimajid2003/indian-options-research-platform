@@ -19,6 +19,7 @@ import os
 import re
 import hashlib
 import time as _time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as _time_cls
 from pathlib import Path
@@ -46,6 +47,8 @@ _VIX_FILES = [
 _OPTIONS_ROOT = _DATA_ROOT / "processed" / "options" / "dhan"
 _BHAVCOPY_ROOT = _DATA_ROOT / "processed" / "nse" / "bhavcopy" / "fo"
 _BACKTEST_ROOT = _REPORT_ROOT / "dashboard_runs"
+_BACKTEST_INDEX_ROOT = _REPORT_ROOT / "dashboard_index"
+_BACKTEST_INDEX_PATH = _BACKTEST_INDEX_ROOT / "backtest_index.json"
 _LEGACY_BACKTEST_ROOTS = [
     _REPORT_ROOT / "options" / "focused",
     _REPORT_ROOT / "options" / "risk_management",
@@ -69,6 +72,8 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{100,}")
 _TTL_LIVE = 3.0
 _TTL_TRADES = 5.0
 _TTL_HIST = 60.0
+_TTL_BACKTESTS = 120.0
+_BACKTEST_INDEX_VERSION = 2
 
 
 # ── Dataclasses (bridge-internal; mirrored by Pydantic models in api/models.py) ──
@@ -826,6 +831,99 @@ class DashboardBridge:
         return ""
 
     @staticmethod
+    def _run_key_from_path(path: Path) -> str:
+        stem = path.stem
+        match = re.match(r"^(20\d{6}(?:_\d{6})?)", stem)
+        if match:
+            return match.group(1)
+        parts = [p for p in path.parts if p not in {"options", "legacy"}]
+        if len(parts) >= 2:
+            return DashboardBridge._safe_slug(parts[-2])
+        return DashboardBridge._safe_slug(stem)
+
+    @staticmethod
+    def _strategy_family_from_text(*values: Any) -> str:
+        text = " ".join(str(v or "") for v in values).lower().replace("-", "_")
+        checks = [
+            ("iron_condor", ("iron_condor", "ic_", "_ic", "wing")),
+            ("short_strangle", ("short_strangle", "strangle")),
+            ("short_straddle", ("short_straddle", "straddle")),
+            ("three_pm", ("three_pm", "3pm", "three pm")),
+            ("risk_management", ("risk_mgmt", "risk_management", "kelly", "cvar")),
+            ("focused_contributors", ("focused_contributors", "focused")),
+            ("portfolio", ("portfolio", "combined")),
+            ("monitoring", ("monitoring", "phase")),
+            ("validation", ("validation", "audit")),
+        ]
+        for family, needles in checks:
+            if any(needle in text for needle in needles):
+                return family
+        return "misc"
+
+    @staticmethod
+    def _display_family(family: str) -> str:
+        return family.replace("_", " ").title()
+
+    def _attach_backtest_group(self, row: dict, source_path: Path | None = None) -> dict:
+        path = source_path or Path(str(row.get("_path", row.get("source", ""))))
+        run_key = str(row.get("run_key") or self._run_key_from_path(path))
+        family = str(row.get("strategy_family") or self._strategy_family_from_text(
+            row.get("strategy"), row.get("name"), path.as_posix()
+        ))
+        group_key = f"{family}/{run_key}"
+        out = dict(row)
+        out["run_key"] = run_key
+        out["strategy_family"] = family
+        out["group_key"] = group_key
+        out["group_path"] = group_key
+        out["group_label"] = f"{self._display_family(family)} / {run_key}"
+        return out
+
+    @staticmethod
+    def _sort_backtests(rows: list[dict], sort_by: str = "date", sort_dir: str = "desc") -> list[dict]:
+        reverse = sort_dir.lower() != "asc"
+        field_map = {
+            "date": "created_at",
+            "created_at": "created_at",
+            "start_date": "start_date",
+            "end_date": "end_date",
+            "name": "name",
+            "group": "group_path",
+            "strategy": "strategy_family",
+            "symbol": "symbol",
+            "net_pnl": "net_pnl",
+            "sharpe": "sharpe",
+            "sortino": "sortino",
+            "calmar": "calmar",
+            "max_dd_pct": "max_dd_pct",
+            "trades": "trades",
+            "win_rate": "win_rate",
+            "profit_factor": "profit_factor",
+            "t_stat": "t_stat",
+        }
+        field = field_map.get(sort_by, "created_at")
+
+        numeric_fields = {
+            "net_pnl", "sharpe", "sortino", "calmar", "max_dd_pct", "trades",
+            "win_rate", "profit_factor", "t_stat",
+        }
+
+        def _key(row: dict) -> tuple[Any, str]:
+            value = row.get(field)
+            if field in numeric_fields:
+                num = DashboardBridge._numeric(value)
+                return (num if num is not None else 0.0, str(row.get("name", "")))
+            if field in {"created_at", "start_date", "end_date"}:
+                text = str(value or row.get("end_date") or row.get("start_date") or "")
+                return (text, str(row.get("name", "")))
+            text = str(value or "").lower()
+            return (text, str(row.get("name", "")).lower())
+
+        valid = [row for row in rows if row.get(field) not in (None, "")]
+        missing = [row for row in rows if row.get(field) in (None, "")]
+        return sorted(valid, key=_key, reverse=reverse) + sorted(missing, key=lambda r: str(r.get("name", "")).lower())
+
+    @staticmethod
     def _first_date(df: pd.DataFrame, candidates: list[str]) -> str | None:
         for col in candidates:
             if col in df.columns:
@@ -842,6 +940,48 @@ class DashboardBridge:
                 if not s.empty:
                     return pd.Timestamp(s.max()).date().isoformat()
         return None
+
+    @staticmethod
+    def _read_ledger_summary_frame(path: Path) -> pd.DataFrame:
+        keep = {
+            "symbol", "strategy", "entry_date", "entry_time", "exit_date", "exit_time",
+            "gross_pnl", "net_pnl",
+        }
+
+        def _use_column(col: str) -> bool:
+            return str(col).strip().lower() in keep
+
+        try:
+            return pd.read_csv(path, usecols=_use_column)
+        except ValueError:
+            return pd.read_csv(path)
+
+    @staticmethod
+    def _ledger_time_series(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or "net_pnl" not in df.columns:
+            return pd.DataFrame(columns=["ts", "net_pnl"])
+
+        out = df.copy()
+        source_col = None
+        if "exit_time" in out.columns:
+            parsed = pd.to_datetime(out["exit_time"], errors="coerce")
+            if parsed.notna().any():
+                source_col = "exit_time"
+                out["_ts"] = parsed
+        if source_col is None and "exit_date" in out.columns:
+            out["_ts"] = pd.to_datetime(out["exit_date"], errors="coerce")
+        elif source_col is None:
+            return pd.DataFrame(columns=["ts", "net_pnl"])
+
+        out["net_pnl"] = pd.to_numeric(out["net_pnl"], errors="coerce").fillna(0)
+        out = out.dropna(subset=["_ts"])
+        if out.empty:
+            return pd.DataFrame(columns=["ts", "net_pnl"])
+
+        if source_col != "exit_time":
+            out["_ts"] = out["_ts"].dt.normalize()
+        grouped = out.groupby("_ts", as_index=False)["net_pnl"].sum().sort_values("_ts")
+        return grouped.rename(columns={"_ts": "ts"}).reset_index(drop=True)
 
     @staticmethod
     def _as_ist_index(values: Any) -> pd.DatetimeIndex:
@@ -1109,6 +1249,7 @@ class DashboardBridge:
             "max_dd_pct": float(dd.min()) if len(dd) else None,
             "profit_factor": pf,
             "win_rate": float((net > 0).mean() * 100) if len(net) else None,
+            "created_at": datetime.fromtimestamp(source_path.stat().st_mtime, tz=_IST).isoformat(),
             "source_kind": source_kind,
             "source": self._path_source(source_path),
             "has_ledger": True,
@@ -1136,6 +1277,7 @@ class DashboardBridge:
             "profit_factor": self._numeric(row.get("pf", row.get("profit_factor"))),
             "win_rate": self._numeric(row.get("win_rate")),
             "t_stat": self._numeric(row.get("t_stat")),
+            "created_at": datetime.fromtimestamp(source_path.stat().st_mtime, tz=_IST).isoformat(),
             "source_kind": "legacy_summary",
             "source": self._path_source(source_path),
             "has_ledger": False,
@@ -1152,71 +1294,159 @@ class DashboardBridge:
         data.setdefault("name", backtest_id)
         data.setdefault("source_kind", "canonical")
         data.setdefault("source", self._path_source(path))
+        data.setdefault("created_at", datetime.fromtimestamp(path.stat().st_mtime, tz=_IST).isoformat())
         data.setdefault("has_ledger", (_BACKTEST_ROOT / f"{backtest_id}_ledger.csv").exists())
         data.setdefault("has_equity", data["has_ledger"])
         data.setdefault("has_decisions", (_BACKTEST_ROOT / f"{backtest_id}_decisions.csv").exists())
-        return data
+        return self._attach_backtest_group(data, path)
 
-    def _legacy_index(self) -> dict[str, dict]:
-        def _load() -> dict[str, dict]:
-            entries: dict[str, dict] = {}
-            for root in _LEGACY_BACKTEST_ROOTS:
-                if not root.exists():
+    def _backtest_source_manifest(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        if _BACKTEST_ROOT.exists():
+            for path in sorted(_BACKTEST_ROOT.glob("*_summary.json")):
+                try:
+                    stat = path.stat()
+                except OSError:
                     continue
-                for path in sorted(root.rglob("*.csv")):
-                    try:
-                        df = pd.read_csv(path, nrows=500)
-                    except Exception:
-                        continue
-                    df.columns = [str(c).strip() for c in df.columns]
-                    if self._is_ledger_frame(df):
-                        bid = self._legacy_id(path)
-                        full_df = pd.read_csv(path)
-                        summary = self._ledger_summary(full_df, path, bid, "legacy_ledger")
-                        if summary:
-                            entries[bid] = summary
-                        continue
-                    cols = {str(c).lower() for c in df.columns}
-                    if "net_pnl" not in cols and "sharpe" not in cols and "trades" not in cols:
-                        continue
-                    for i, row in df.head(200).iterrows():
-                        bid = self._legacy_id(path, int(i))
-                        entries[bid] = self._row_summary(row, path, bid, int(i))
+                items.append({
+                    "kind": "canonical",
+                    "path": self._path_source(path),
+                    "mtime_ns": stat.st_mtime_ns,
+                    "size": stat.st_size,
+                })
+        for root in _LEGACY_BACKTEST_ROOTS:
+            if not root.exists():
+                continue
+            for path in sorted(root.rglob("*.csv")):
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                items.append({
+                    "kind": "legacy_csv",
+                    "path": self._path_source(path),
+                    "mtime_ns": stat.st_mtime_ns,
+                    "size": stat.st_size,
+                })
+        return items
+
+    def _read_persistent_backtest_index(self, manifest: list[dict[str, Any]]) -> dict[str, dict] | None:
+        if not _BACKTEST_INDEX_PATH.exists():
+            return None
+        try:
+            data = json.loads(_BACKTEST_INDEX_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if data.get("version") != _BACKTEST_INDEX_VERSION:
+            return None
+        if data.get("manifest") != manifest:
+            return None
+        entries = data.get("entries")
+        if not isinstance(entries, dict):
+            return None
+        return {str(k): v for k, v in entries.items() if isinstance(v, dict)}
+
+    def _write_persistent_backtest_index(self, manifest: list[dict[str, Any]], entries: dict[str, dict]) -> None:
+        payload = {
+            "version": _BACKTEST_INDEX_VERSION,
+            "generated_at": datetime.now(tz=_IST).isoformat(),
+            "manifest": manifest,
+            "entries": entries,
+        }
+        try:
+            _BACKTEST_INDEX_ROOT.mkdir(parents=True, exist_ok=True)
+            tmp = _BACKTEST_INDEX_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            tmp.replace(_BACKTEST_INDEX_PATH)
+        except OSError:
+            pass
+
+    def _legacy_entries_from_paths(self, paths: list[Path]) -> dict[str, dict]:
+        entries: dict[str, dict] = {}
+
+        def _read_path(path: Path) -> dict[str, dict]:
+            found: dict[str, dict] = {}
+            try:
+                df = pd.read_csv(path, nrows=500)
+            except Exception:
+                return found
+            df.columns = [str(c).strip() for c in df.columns]
+            if self._is_ledger_frame(df):
+                bid = self._legacy_id(path)
+                try:
+                    full_df = self._read_ledger_summary_frame(path)
+                except Exception:
+                    return found
+                summary = self._ledger_summary(full_df, path, bid, "legacy_ledger")
+                if summary:
+                    found[bid] = self._attach_backtest_group(summary, path)
+                return found
+            cols = {str(c).lower() for c in df.columns}
+            if "net_pnl" not in cols and "sharpe" not in cols and "trades" not in cols:
+                return found
+            for i, row in df.head(200).iterrows():
+                bid = self._legacy_id(path, int(i))
+                found[bid] = self._attach_backtest_group(self._row_summary(row, path, bid, int(i)), path)
+            return found
+
+        if not paths:
             return entries
+        workers = min(8, max(1, len(paths)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_read_path, path) for path in paths]
+            for future in as_completed(futures):
+                try:
+                    entries.update(future.result())
+                except Exception:
+                    continue
+        return entries
 
-        result = self._cached("legacy_backtest_index", 30.0, _load)
-        return result if result is not None else {}
+    def _backtest_index(self) -> dict[str, dict]:
+        def _load() -> dict[str, dict]:
+            manifest = self._backtest_source_manifest()
+            cached = self._read_persistent_backtest_index(manifest)
+            if cached is not None:
+                return cached
 
-    def backtest_list(self) -> list[dict]:
-        def _load() -> list[dict]:
-            rows: list[dict] = []
+            entries: dict[str, dict] = {}
+            legacy_paths: list[Path] = []
             if _BACKTEST_ROOT.exists():
                 for path in sorted(_BACKTEST_ROOT.glob("*_summary.json")):
                     try:
-                        rows.append(self._canonical_summary(path))
+                        summary = self._canonical_summary(path)
                     except Exception:
                         continue
-            rows.extend(self._legacy_index().values())
-            def _mtime(row: dict) -> float:
-                path = Path(row.get("_path", row.get("source", "")))
-                return path.stat().st_mtime if path.exists() else 0.0
-            rows.sort(key=_mtime, reverse=True)
-            return rows
+                    entries[str(summary.get("id", path.stem))] = summary
+            for root in _LEGACY_BACKTEST_ROOTS:
+                if not root.exists():
+                    continue
+                legacy_paths.extend(sorted(root.rglob("*.csv")))
+            entries.update(self._legacy_entries_from_paths(legacy_paths))
+            self._write_persistent_backtest_index(manifest, entries)
+            return entries
 
-        result = self._cached("backtest_list", 30.0, _load)
-        return result if result is not None else []
+        result = self._cached("backtest_index", _TTL_BACKTESTS, _load)
+        return result if result is not None else {}
+
+    def _legacy_index(self) -> dict[str, dict]:
+        return {
+            key: row for key, row in self._backtest_index().items()
+            if str(row.get("source_kind", "")).startswith("legacy")
+        }
+
+    def backtest_list(self, sort_by: str = "date", sort_dir: str = "desc") -> list[dict]:
+        def _load() -> list[dict]:
+            return list(self._backtest_index().values())
+
+        result = self._cached("backtest_list", _TTL_BACKTESTS, _load)
+        rows = result if result is not None else []
+        return self._sort_backtests(list(rows), sort_by, sort_dir)
 
     def backtest_summaries(self, root: Path | None = None) -> list:
         return self.backtest_list()
 
     def backtest_summary(self, backtest_id: str) -> dict:
-        path = _BACKTEST_ROOT / f"{backtest_id}_summary.json"
-        if path.exists():
-            try:
-                return self._canonical_summary(path)
-            except Exception:
-                return {}
-        return self._legacy_index().get(backtest_id, {})
+        return self._backtest_index().get(backtest_id, {})
 
     def _normalise_ledger(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
@@ -1244,36 +1474,36 @@ class DashboardBridge:
         return df[cols]
 
     def backtest_ledger(self, backtest_id: str) -> pd.DataFrame:
-        canonical = _BACKTEST_ROOT / f"{backtest_id}_ledger.csv"
-        if canonical.exists():
+        def _load() -> pd.DataFrame:
+            canonical = _BACKTEST_ROOT / f"{backtest_id}_ledger.csv"
+            if canonical.exists():
+                try:
+                    return self._normalise_ledger(pd.read_csv(canonical))
+                except Exception:
+                    return pd.DataFrame()
+            info = self._legacy_index().get(backtest_id)
+            if not info or not info.get("has_ledger"):
+                df = pd.DataFrame()
+                df.attrs["has_ledger"] = False
+                return df
             try:
-                return self._normalise_ledger(pd.read_csv(canonical))
+                return self._normalise_ledger(pd.read_csv(info["_path"]))
             except Exception:
                 return pd.DataFrame()
-        info = self._legacy_index().get(backtest_id)
-        if not info or not info.get("has_ledger"):
-            df = pd.DataFrame()
-            df.attrs["has_ledger"] = False
-            return df
-        try:
-            return self._normalise_ledger(pd.read_csv(info["_path"]))
-        except Exception:
-            return pd.DataFrame()
+
+        result = self._cached(f"backtest_ledger_{backtest_id}", _TTL_BACKTESTS, _load)
+        return result.copy() if result is not None else pd.DataFrame()
 
     def backtest_equity_curve(self, backtest_id: str) -> pd.DataFrame:
         ledger = self.backtest_ledger(backtest_id)
         if ledger.empty or "net_pnl" not in ledger.columns:
             return pd.DataFrame(columns=["date", "equity", "normalised"])
-        date_col = "exit_date" if "exit_date" in ledger.columns else "exit_time"
-        df = ledger.copy()
-        df["_date"] = pd.to_datetime(df[date_col], errors="coerce")
-        df["net_pnl"] = pd.to_numeric(df["net_pnl"], errors="coerce").fillna(0)
-        df = df.dropna(subset=["_date"]).sort_values("_date")
-        if df.empty:
+        pnl_by_time = self._ledger_time_series(ledger)
+        if pnl_by_time.empty:
             return pd.DataFrame(columns=["date", "equity", "normalised"])
-        equity = 1_000_000 + df["net_pnl"].cumsum()
+        equity = 1_000_000 + pnl_by_time["net_pnl"].cumsum()
         return pd.DataFrame({
-            "date": df["_date"].dt.date.astype(str),
+            "date": pnl_by_time["ts"].map(lambda ts: pd.Timestamp(ts).isoformat()),
             "equity": equity.round(2),
             "normalised": (equity / equity.iloc[0]).round(6),
         }).reset_index(drop=True)
@@ -1282,16 +1512,12 @@ class DashboardBridge:
         ledger = self.backtest_ledger(backtest_id)
         if ledger.empty or "net_pnl" not in ledger.columns:
             return pd.DataFrame(columns=["year", "month", "net_pnl", "return_pct"])
-        date_col = "exit_date" if "exit_date" in ledger.columns else "exit_time"
-        df = ledger.copy()
-        df["_date"] = pd.to_datetime(df[date_col], errors="coerce")
-        df["net_pnl"] = pd.to_numeric(df["net_pnl"], errors="coerce").fillna(0)
-        df = df.dropna(subset=["_date"])
-        if df.empty:
+        pnl_by_time = self._ledger_time_series(ledger)
+        if pnl_by_time.empty:
             return pd.DataFrame(columns=["year", "month", "net_pnl", "return_pct"])
-        df["year"] = df["_date"].dt.year
-        df["month"] = df["_date"].dt.month
-        out = df.groupby(["year", "month"], as_index=False)["net_pnl"].sum()
+        pnl_by_time["year"] = pnl_by_time["ts"].dt.year
+        pnl_by_time["month"] = pnl_by_time["ts"].dt.month
+        out = pnl_by_time.groupby(["year", "month"], as_index=False)["net_pnl"].sum()
         out["return_pct"] = out["net_pnl"] / 1_000_000 * 100
         return out
 

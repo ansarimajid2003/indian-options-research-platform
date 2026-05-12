@@ -11,6 +11,25 @@ const EQUITY_COLORS = [
   '#f87171',
 ];
 
+const SORT_OPTIONS = [
+  ['date', 'DATE'],
+  ['net_pnl', 'NET PNL'],
+  ['sharpe', 'SHARPE'],
+  ['sortino', 'SORTINO'],
+  ['calmar', 'CALMAR'],
+  ['max_dd_pct', 'MAX DD'],
+  ['trades', 'TRADES'],
+  ['name', 'NAME'],
+  ['group', 'GROUP'],
+];
+
+const GROUP_OPTIONS = [
+  ['group', 'VIRTUAL FOLDERS'],
+  ['strategy', 'STRATEGY'],
+  ['run', 'RUN'],
+  ['none', 'FLAT'],
+];
+
 function _metricColor(value, type) {
   if (value == null) return { cls: '', style: {} };
   if (type === 'pnl' || type === 'cagr') {
@@ -46,6 +65,27 @@ function _fmtMetric(v, dp = 2) {
   return fmtNum(v, dp);
 }
 
+function _toEpochSeconds(value) {
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
+
+function _uniqueTimePoints(points) {
+  const byTime = new Map();
+  points.forEach(point => {
+    if (point.time == null || point.value == null || !Number.isFinite(point.value)) return;
+    byTime.set(point.time, point);
+  });
+  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+}
+
+function _groupLabel(bt, groupBy) {
+  if (groupBy === 'strategy') return (bt.strategy_family || 'misc').replace(/_/g, ' ').toUpperCase();
+  if (groupBy === 'run') return bt.run_key || 'UNKNOWN RUN';
+  if (groupBy === 'group') return bt.group_label || bt.group_path || 'UNGROUPED';
+  return 'ALL RUNS';
+}
+
 function BacktestsTab() {
   const [backtests, setBacktests] = useState([]);
   const [checkedIds, setCheckedIds] = useState(new Set());
@@ -64,6 +104,9 @@ function BacktestsTab() {
   const [showDecisions, setShowDecisions] = useState(false);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [sidebarQuery, setSidebarQuery] = useState('');
+  const [sortBy, setSortBy] = useState('date');
+  const [sortDir, setSortDir] = useState('desc');
+  const [groupBy, setGroupBy] = useState('group');
 
   const equityChartRef = useRef(null);
   const drawdownChartRef = useRef(null);
@@ -71,24 +114,38 @@ function BacktestsTab() {
   const drawdownChartInstance = useRef(null);
   const equitySeriesMap = useRef(new Map());
 
-  // Fetch backtest list on mount
+  // Fetch backtest list whenever sort order changes.
   useEffect(() => {
-    fetch('/api/backtests', { headers: { 'Accept': 'application/json' } })
+    const url = `/api/backtests?sort_by=${encodeURIComponent(sortBy)}&sort_dir=${encodeURIComponent(sortDir)}`;
+    fetch(url, { headers: { 'Accept': 'application/json' } })
       .then(r => r.ok ? r.json() : null)
       .then(data => {
         if (data && Array.isArray(data.backtests)) {
           setBacktests(data.backtests);
-          if (data.backtests.length && !focusedId) {
-            setFocusedId(data.backtests[0].id);
+          const focusedStillExists = focusedId && data.backtests.some(b => b.id === focusedId);
+          if (data.backtests.length && !focusedStillExists) {
+            const firstChartable = data.backtests.find(b => b.has_equity || b.has_ledger) || data.backtests[0];
+            setFocusedId(firstChartable.id);
+            if (firstChartable.has_equity) setCheckedIds(new Set([firstChartable.id]));
           }
         }
       })
       .catch(() => {});
-  }, []);
+  }, [sortBy, sortDir]);
 
   // Fetch focused backtest details
   useEffect(() => {
     if (!focusedId) return;
+    const focused = backtests.find(b => b.id === focusedId);
+    if (focused && !focused.has_ledger && !focused.has_equity) {
+      setDrawdown([]);
+      setMonthly([]);
+      setEvents([]);
+      setDecisions(null);
+      setLedger({ total: 0, page: 0, size: ledgerSize, rows: [] });
+      setLoadingDetail(false);
+      return;
+    }
     setLoadingDetail(true);
     setShowDecisions(false);
     setDecisions(null);
@@ -110,7 +167,7 @@ function BacktestsTab() {
 
     // reset page when switching focused backtest; ledger effect will fetch
     setLedgerPage(0);
-  }, [focusedId]);
+  }, [focusedId, backtests]);
 
   // Refetch ledger when pagination/filters change
   useEffect(() => {
@@ -119,6 +176,11 @@ function BacktestsTab() {
   }, [focusedId, ledgerPage, ledgerSize, ledgerFilterSymbol, ledgerFilterReason]);
 
   function _fetchLedger(id, page, size, symFilter, reasonFilter) {
+    const focused = backtests.find(b => b.id === id);
+    if (focused && !focused.has_ledger) {
+      setLedger({ total: 0, page, size, rows: [] });
+      return;
+    }
     let url = `/api/backtests/${encodeURIComponent(id)}/ledger?page=${page}&size=${size}`;
     if (symFilter) url += `&symbol=${encodeURIComponent(symFilter)}`;
     if (reasonFilter) url += `&exit_reason=${encodeURIComponent(reasonFilter)}`;
@@ -206,12 +268,13 @@ function BacktestsTab() {
       const series = chart.addLineSeries({ color, lineWidth: 1.5, priceFormat: { type: 'price', precision: 0, minMove: 1 } });
       const isNorm = equityMode === 'normalised';
       let firstVal = null;
-      const chartData = data.bars.map(b => {
-        const t = Math.floor(new Date(b.ts).getTime() / 1000);
+      const chartData = _uniqueTimePoints(data.bars.map(b => {
+        const t = _toEpochSeconds(b.ts);
         const v = b.close;
         if (firstVal == null) firstVal = v || 1;
         return { time: t, value: isNorm ? (v / firstVal) * 100 : v };
-      });
+      }));
+      if (!chartData.length) return;
       series.setData(chartData);
       equitySeriesMap.current.set(id, series);
     });
@@ -224,12 +287,12 @@ function BacktestsTab() {
     if (!events.length || !focusedId || !equitySeriesMap.current.has(focusedId)) return;
     const series = equitySeriesMap.current.get(focusedId);
     const markers = events.map(ev => ({
-      time: Math.floor(new Date(ev.ts).getTime() / 1000),
+      time: _toEpochSeconds(ev.ts),
       position: 'aboveBar',
       color: ev.severity === 'critical' ? '#f87171' : ev.severity === 'warning' ? '#fbbf24' : '#38bdf8',
       shape: ev.event_type === 'entry' ? 'arrowDown' : ev.event_type === 'exit' ? 'arrowUp' : 'circle',
       text: ev.label || ev.event_type,
-    }));
+    })).filter(m => m.time != null);
     series.setMarkers(markers);
   }, [events, focusedId]);
 
@@ -251,15 +314,19 @@ function BacktestsTab() {
       priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
     });
     drawdownChartInstance._series = series;
-    series.setData(drawdown.map(d => ({
-      time: Math.floor(new Date(d.date).getTime() / 1000),
+    const chartData = _uniqueTimePoints(drawdown.map(d => ({
+      time: _toEpochSeconds(d.date),
       value: d.drawdown_pct,
     })));
+    if (!chartData.length) return;
+    series.setData(chartData);
 
     setTimeout(() => chart.timeScale().fitContent(), 60);
   }, [drawdown]);
 
   function toggleCheck(id) {
+    const bt = backtests.find(b => b.id === id);
+    if (bt && !bt.has_equity) return;
     setCheckedIds(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -268,16 +335,52 @@ function BacktestsTab() {
     });
   }
 
+  function focusBacktest(bt) {
+    if (!bt) return;
+    setFocusedId(bt.id);
+    if (bt.has_equity) {
+      setCheckedIds(prev => {
+        if (prev.has(bt.id)) return prev;
+        return new Set([...prev, bt.id]);
+      });
+    }
+  }
+
   const focusedBt = backtests.find(b => b.id === focusedId) || null;
   const isSummaryOnly = focusedBt && (!focusedBt.has_ledger && !focusedBt.has_equity);
 
   const filteredBacktests = useMemo(() => {
     const q = sidebarQuery.trim().toLowerCase();
     const filtered = q
-      ? backtests.filter(b => (b.name || b.id).toLowerCase().includes(q) || (b.symbol || '').toLowerCase().includes(q))
+      ? backtests.filter(b =>
+          (b.name || b.id).toLowerCase().includes(q) ||
+          (b.symbol || '').toLowerCase().includes(q) ||
+          (b.group_path || '').toLowerCase().includes(q) ||
+          (b.strategy_family || '').toLowerCase().includes(q)
+        )
       : backtests;
     return filtered.slice(0, 100);
   }, [backtests, sidebarQuery]);
+
+  const groupedBacktests = useMemo(() => {
+    if (groupBy === 'none') return [{ key: 'all', label: 'ALL RUNS', items: filteredBacktests }];
+    const groups = [];
+    const byKey = new Map();
+    filteredBacktests.forEach(bt => {
+      const key = groupBy === 'strategy'
+        ? (bt.strategy_family || 'misc')
+        : groupBy === 'run'
+        ? (bt.run_key || 'unknown')
+        : (bt.group_path || 'ungrouped');
+      if (!byKey.has(key)) {
+        const group = { key, label: _groupLabel(bt, groupBy), items: [] };
+        byKey.set(key, group);
+        groups.push(group);
+      }
+      byKey.get(key).items.push(bt);
+    });
+    return groups;
+  }, [filteredBacktests, groupBy]);
 
   // Ledger exit reasons for filter dropdown
   const exitReasons = useMemo(() => {
@@ -352,21 +455,40 @@ function BacktestsTab() {
           <input
             className="cmd-input"
             style={{ width: '100%', boxSizing: 'border-box' }}
-            placeholder="FILTER BY NAME / SYMBOL"
+            placeholder="FILTER BY NAME / SYMBOL / GROUP"
             value={sidebarQuery}
             onChange={e => setSidebarQuery(e.target.value)}
           />
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 72px', gap: 6, marginTop: 6 }}>
+            <select className="ctrl-select" value={sortBy} onChange={e => setSortBy(e.target.value)} style={{ width: '100%' }}>
+              {SORT_OPTIONS.map(([key, label]) => <option key={key} value={key}>SORT {label}</option>)}
+            </select>
+            <button className="ctrl-btn" onClick={() => setSortDir(d => d === 'desc' ? 'asc' : 'desc')}>
+              {sortDir === 'desc' ? 'DESC' : 'ASC'}
+            </button>
+          </div>
+          <select className="ctrl-select" value={groupBy} onChange={e => setGroupBy(e.target.value)} style={{ width: '100%', marginTop: 6 }}>
+            {GROUP_OPTIONS.map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+          </select>
         </div>
         <div style={{ flex: 1, overflowY: 'auto' }}>
-          {filteredBacktests.map(bt => (
-            <div key={bt.id} className={`bt-item ${focusedId === bt.id ? 'focused' : ''}`} onClick={() => setFocusedId(bt.id)}>
+          {groupedBacktests.map(group => (
+            <React.Fragment key={group.key}>
+              <div style={{ padding: '7px 14px 5px', borderBottom: '1px solid var(--border)', color: 'var(--text-3)', fontSize: 10, fontFamily: 'JetBrains Mono, monospace', letterSpacing: '0.06em', background: 'rgba(255,255,255,0.018)', display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{group.label}</span>
+                <span>{group.items.length}</span>
+              </div>
+              {group.items.map(bt => (
+            <div key={bt.id} className={`bt-item ${focusedId === bt.id ? 'focused' : ''}`} onClick={() => focusBacktest(bt)}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 11.5, fontWeight: 600, color: 'var(--text)' }}>{bt.name || bt.id}</span>
                 <input
                   type="checkbox"
                   checked={checkedIds.has(bt.id)}
+                  disabled={!bt.has_equity}
+                  title={bt.has_equity ? 'Compare equity curve' : 'No equity curve for summary-only run'}
                   onClick={e => { e.stopPropagation(); toggleCheck(bt.id); }}
-                  style={{ cursor: 'pointer' }}
+                  style={{ cursor: bt.has_equity ? 'pointer' : 'not-allowed', opacity: bt.has_equity ? 1 : 0.35 }}
                 />
               </div>
               <div style={{ display: 'flex', gap: 8, fontSize: 10, color: 'var(--text-3)', fontFamily: 'JetBrains Mono, monospace' }}>
@@ -375,9 +497,12 @@ function BacktestsTab() {
               </div>
               <div style={{ display: 'flex', gap: 6, marginTop: 2, flexWrap: 'wrap' }}>
                 {bt.legacy && <span className="badge ghost">LEGACY</span>}
+                {bt.group_path && <span className="badge ghost">{bt.group_path}</span>}
                 {!bt.has_ledger && !bt.has_equity && <span className="badge warning">SUMMARY ONLY</span>}
               </div>
             </div>
+              ))}
+            </React.Fragment>
           ))}
           {filteredBacktests.length === 100 && (
             <div style={{ padding: '8px 14px', fontSize: 10, color: 'var(--text-4)', fontFamily: 'JetBrains Mono, monospace' }}>
@@ -395,10 +520,11 @@ function BacktestsTab() {
             <div className="panel-title">Metrics <span className="count">{filteredBacktests.length} SHOWN · {backtests.length} TOTAL</span></div>
           </div>
           <div style={{ overflowX: 'auto' }}>
-            <table className="tbl" style={{ minWidth: 1050 }}>
+            <table className="tbl" style={{ minWidth: 1180 }}>
               <thead>
                 <tr>
                   <th className="l">NAME</th>
+                  <th className="l">GROUP</th>
                   <th>SYMBOL</th>
                   <th>PERIOD</th>
                   <th>TRADES</th>
@@ -425,11 +551,12 @@ function BacktestsTab() {
                   const tstatCol = _metricColor(bt.t_stat, 'tstat');
                   const pfCol = _metricColor(bt.profit_factor, 'pf');
                   return (
-                    <tr key={bt.id} onClick={() => setFocusedId(bt.id)} style={{ cursor: 'pointer', borderLeft: focusedId === bt.id ? '2px solid var(--cyan)' : '2px solid transparent' }}>
+                    <tr key={bt.id} onClick={() => focusBacktest(bt)} style={{ cursor: 'pointer', borderLeft: focusedId === bt.id ? '2px solid var(--cyan)' : '2px solid transparent' }}>
                       <td className="l" style={{ fontWeight: focusedId === bt.id ? 600 : 400 }}>
                         {bt.name || bt.id}
                         {bt.legacy && <span className="badge ghost" style={{ marginLeft: 6, fontSize: 9 }}>LEGACY</span>}
                       </td>
+                      <td className="l">{bt.group_path || '---'}</td>
                       <td>{bt.symbol || '—'}</td>
                       <td>{bt.start_date || ''} → {bt.end_date || ''}</td>
                       <td>{bt.trades}</td>

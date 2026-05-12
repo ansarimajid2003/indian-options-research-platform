@@ -416,21 +416,26 @@ function App() {
         getJson(`/api/live/option-chain/${sym}`)
       )
     ).then(([n, f, m, s]) => {
-      setChainData({
-        NIFTY:      Array.isArray(n) ? n : [],
-        FINNIFTY:   Array.isArray(f) ? f : [],
-        MIDCPNIFTY: Array.isArray(m) ? m : [],
-        SENSEX:     Array.isArray(s) ? s : [],
+      const responses = { NIFTY: n, FINNIFTY: f, MIDCPNIFTY: m, SENSEX: s };
+      setChainData(prev => {
+        const next = { ...prev };
+        Object.entries(responses).forEach(([sym, rows]) => {
+          if (Array.isArray(rows)) next[sym] = rows;
+        });
+        return next;
       });
-      setChainLoaded(true);
+      if (Object.values(responses).some(rows => Array.isArray(rows))) {
+        setChainLoaded(true);
+      }
     });
   }
 
-  // Poll option chain every 5s (live quotes refresh)
+  // Poll option chain only while the live tab is visible.
   useEffect(() => {
-    const id = setInterval(() => fetchChainData(), 5000);
+    if (activeTab !== 'live') return;
+    const id = setInterval(() => fetchChainData(), 10000);
     return () => clearInterval(id);
-  }, []);
+  }, [activeTab]);
 
   // ── WebSocket ──────────────────────────────────────────────────────────
   useEffect(() => {

@@ -249,6 +249,11 @@ class BacktestSummaryModel(BaseModel):
     created_at: str = ""
     source_path: str = ""
     source_kind: str = "canonical"
+    run_key: str = ""
+    strategy_family: str = ""
+    group_key: str = ""
+    group_label: str = ""
+    group_path: str = ""
     legacy: bool = False
     compat_version: str = "v2"
     has_ledger: bool = True

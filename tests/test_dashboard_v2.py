@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import unittest
 import shutil
+import json
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from options_backtest.dashboard_bridge import DashboardBridge
+import options_backtest.dashboard_bridge as dashboard_bridge
 from scripts.live.api.routes.backtests import router as backtests_router
 from scripts.live.api.routes.historical import router as historical_router
 from scripts.save_backtest import write_canonical_run
@@ -61,7 +65,7 @@ class FakeDashboardBridge:
         df["settle_price"] = 100.4
         return df
 
-    def backtest_list(self) -> list[dict]:
+    def backtest_list(self, sort_by: str = "date", sort_dir: str = "desc") -> list[dict]:
         return [self.backtest_summary("canon")]
 
     def backtest_summary(self, backtest_id: str) -> dict:
@@ -201,6 +205,86 @@ class SaveBacktestTests(unittest.TestCase):
             self.assertTrue(paths["decisions"].exists())
             with self.assertRaises(FileExistsError):
                 write_canonical_run(root, "unit_run", {}, ledger, {})
+        finally:
+            shutil.rmtree(root)
+
+
+class DashboardBridgeBacktestTests(unittest.TestCase):
+    def test_backtest_list_writes_persistent_index_with_groups_and_sort(self) -> None:
+        root = Path.cwd() / "tmp_dashboard_v2_index"
+        if root.exists():
+            shutil.rmtree(root)
+        runs = root / "dashboard_runs"
+        index_root = root / "dashboard_index"
+        index_path = index_root / "backtest_index.json"
+        runs.mkdir(parents=True)
+        try:
+            (runs / "20260501_short_strangle_summary.json").write_text(
+                json.dumps({
+                    "id": "20260501_short_strangle",
+                    "name": "20260501 short strangle",
+                    "strategy": "short-strangle",
+                    "net_pnl": 100.0,
+                    "sharpe": 1.2,
+                    "trades": 2,
+                }),
+                encoding="utf-8",
+            )
+            (runs / "20260502_ic_wing6_summary.json").write_text(
+                json.dumps({
+                    "id": "20260502_ic_wing6",
+                    "name": "20260502 ic wing6",
+                    "strategy": "iron-condor",
+                    "net_pnl": 250.0,
+                    "sharpe": 2.4,
+                    "trades": 3,
+                }),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(dashboard_bridge, "_BACKTEST_ROOT", runs),
+                patch.object(dashboard_bridge, "_LEGACY_BACKTEST_ROOTS", []),
+                patch.object(dashboard_bridge, "_BACKTEST_INDEX_ROOT", index_root),
+                patch.object(dashboard_bridge, "_BACKTEST_INDEX_PATH", index_path),
+            ):
+                bridge = DashboardBridge(root / "live")
+                rows = bridge.backtest_list("net_pnl", "desc")
+                self.assertTrue(index_path.exists())
+                self.assertEqual([r["id"] for r in rows], ["20260502_ic_wing6", "20260501_short_strangle"])
+                self.assertEqual(rows[0]["strategy_family"], "iron_condor")
+                self.assertIn("/", rows[0]["group_path"])
+
+                second_bridge = DashboardBridge(root / "live")
+                cached = second_bridge.backtest_list("sharpe", "desc")
+                self.assertEqual(cached[0]["id"], "20260502_ic_wing6")
+        finally:
+            shutil.rmtree(root)
+
+    def test_equity_curve_aggregates_duplicate_exit_dates_for_charting(self) -> None:
+        root = Path.cwd() / "tmp_dashboard_v2_bridge"
+        if root.exists():
+            shutil.rmtree(root)
+        runs = root / "dashboard_runs"
+        runs.mkdir(parents=True)
+        try:
+            (runs / "dupe_summary.json").write_text(
+                json.dumps({"id": "dupe", "name": "Duplicate Dates", "has_ledger": True}),
+                encoding="utf-8",
+            )
+            pd.DataFrame([
+                {"exit_date": "2026-05-01", "entry_date": "2026-05-01", "net_pnl": 100.0},
+                {"exit_date": "2026-05-01", "entry_date": "2026-05-01", "net_pnl": -25.0},
+                {"exit_date": "2026-05-02", "entry_date": "2026-05-02", "net_pnl": 50.0},
+            ]).to_csv(runs / "dupe_ledger.csv", index=False)
+
+            with patch.object(dashboard_bridge, "_BACKTEST_ROOT", runs):
+                bridge = DashboardBridge(root / "live")
+                equity = bridge.backtest_equity_curve("dupe")
+
+            self.assertEqual(len(equity), 2)
+            self.assertEqual(equity.iloc[0]["equity"], 1_000_075.0)
+            self.assertFalse(equity["date"].duplicated().any())
         finally:
             shutil.rmtree(root)
 

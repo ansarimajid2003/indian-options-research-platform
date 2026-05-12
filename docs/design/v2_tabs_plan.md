@@ -58,6 +58,14 @@ The backend stubs have been replaced through the bridge, models, and route layer
 ### Still Pending
 
 - **Step 7:** Add full `dashboard/historical.jsx`, full `dashboard/backtests.jsx`, final `dashboard/index.html` script tags, and required CSS.
+
+### 2026-05-12 follow-up: Backtest report index
+
+- Added a persistent generated index at `reports/backtests/dashboard_index/backtest_index.json`.
+- The index stores canonical dashboard runs plus read-only legacy report rows with virtual grouping fields: `strategy_family`, `run_key`, `group_key`, `group_label`, and `group_path`.
+- The API rebuilds the index automatically when the report file manifest changes; unchanged cold starts read the JSON cache instead of re-parsing every legacy CSV.
+- `/api/backtests` accepts `sort_by` and `sort_dir` for server-side ordering. Supported sort fields include `date`, `name`, `group`, `strategy`, `symbol`, `net_pnl`, `sharpe`, `sortino`, `calmar`, `max_dd_pct`, `trades`, `win_rate`, `profit_factor`, and `t_stat`.
+- The Backtests tab exposes virtual folder grouping and sort controls without moving legacy report files.
 - **Step 8:** Browser/server verification after frontend components land, including zimaos tunnel checks.
 
 ---
