@@ -174,6 +174,21 @@ class DashboardV2RouteTests(unittest.TestCase):
         self.assertEqual(ledger["total"], 1)
         self.assertEqual(ledger["rows"][0]["symbol"], "NIFTY")
 
+        sorted_ledger = client.get("/api/backtests/canon/ledger?size=1&sort_by=net_pnl&sort_dir=asc").json()
+        self.assertEqual(sorted_ledger["total"], 2)
+        self.assertEqual(sorted_ledger["rows"][0]["net_pnl"], 500.0)
+
+        stats = client.get("/api/backtests/canon/ledger-stats").json()
+        self.assertEqual(stats["total"], 2)
+        self.assertEqual(len(stats["pnl_distribution"]), 12)
+        self.assertEqual([item["reason"] for item in stats["exit_breakdown"]], ["time_exit", "target"])
+        self.assertEqual(stats["available_symbols"], ["NIFTY", "SENSEX"])
+
+        filtered_stats = client.get("/api/backtests/canon/ledger-stats?symbol=SENSEX").json()
+        self.assertEqual(filtered_stats["total"], 1)
+        self.assertEqual(filtered_stats["exit_breakdown"][0]["reason"], "target")
+        self.assertEqual(filtered_stats["available_exit_reasons"], ["target"])
+
         self.assertEqual(client.get("/api/backtests/canon/drawdown").json()[0]["drawdown_pct"], -0.1)
         self.assertEqual(client.get("/api/backtests/canon/monthly").json()[0]["month"], 5)
         self.assertEqual(client.get("/api/backtests/canon/decisions").json()["warnings"], ["no_decision_log"])

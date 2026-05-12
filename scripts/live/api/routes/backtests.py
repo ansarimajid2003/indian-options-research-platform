@@ -24,9 +24,12 @@ from ..models import (
     DecisionLogRow,
     DrawdownPoint,
     EventOverlayPoint,
+    ExitReasonBreakdown,
     LedgerResponse,
+    LedgerStatsResponse,
     MonthlyReturn,
     OHLCVResponse,
+    PnLDistributionBin,
     TradeLedgerRow,
 )
 
@@ -187,6 +190,137 @@ def _ledger_row(row: pd.Series, legacy: bool) -> TradeLedgerRow:
     )
 
 
+def _filter_ledger(df: pd.DataFrame, symbol: str | None, exit_reason: str | None) -> pd.DataFrame:
+    if symbol and "symbol" in df.columns:
+        df = df[df["symbol"].astype(str).str.upper() == symbol.upper()]
+    if exit_reason and "exit_reason" in df.columns:
+        df = df[df["exit_reason"].astype(str) == exit_reason]
+    return df
+
+
+def _available_symbols(df: pd.DataFrame) -> list[str]:
+    if df.empty or "symbol" not in df.columns:
+        return []
+    values = df["symbol"].dropna().astype(str).str.upper()
+    return sorted(v for v in values.unique().tolist() if v)
+
+
+def _available_exit_reasons(df: pd.DataFrame) -> list[str]:
+    if df.empty or "exit_reason" not in df.columns:
+        return []
+    values = df["exit_reason"].dropna().astype(str)
+    return sorted(v for v in values.unique().tolist() if v)
+
+
+def _sort_ledger(df: pd.DataFrame, sort_by: str, sort_dir: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    key = sort_by.lower()
+    date_col = "entry_date" if "entry_date" in df.columns else "exit_date"
+    column_map = {
+        "date": date_col,
+        "entry_date": "entry_date",
+        "exit_date": "exit_date",
+        "symbol": "symbol",
+        "expiry": "expiry",
+        "dte": "dte",
+        "vix": "vix",
+        "entry_credit": "entry_premium" if "entry_premium" in df.columns else "entry_credit",
+        "gross_pnl": "gross_pnl",
+        "net_pnl": "net_pnl",
+        "exit_reason": "exit_reason",
+    }
+    column = column_map.get(key, date_col)
+    if column not in df.columns:
+        return df
+    out = df.copy()
+    sort_column = "__sort_key"
+    if column in {"entry_date", "exit_date", "expiry", date_col}:
+        out[sort_column] = pd.to_datetime(out[column], errors="coerce")
+    elif column in {"dte", "vix", "entry_credit", "entry_premium", "gross_pnl", "net_pnl"}:
+        out[sort_column] = pd.to_numeric(out[column], errors="coerce")
+    else:
+        out[sort_column] = out[column].fillna("").astype(str).str.upper()
+    out = out.sort_values(
+        sort_column,
+        ascending=(sort_dir == "asc"),
+        na_position="last",
+        kind="mergesort",
+    )
+    return out.drop(columns=[sort_column])
+
+
+def _ledger_stats_response(
+    df: pd.DataFrame,
+    source_kind: str,
+    available_symbols: list[str],
+    available_exit_reasons: list[str],
+    warnings: list[str] | None = None,
+) -> LedgerStatsResponse:
+    if df.empty:
+        return LedgerStatsResponse(
+            total=0,
+            pnl_distribution=[],
+            exit_breakdown=[],
+            available_symbols=available_symbols,
+            available_exit_reasons=available_exit_reasons,
+            source_kind=source_kind,
+            warnings=warnings or [],
+        )
+
+    pnl_values = pd.to_numeric(df.get("net_pnl", pd.Series(dtype="float64")), errors="coerce").dropna()
+    pnl_distribution: list[PnLDistributionBin] = []
+    if not pnl_values.empty:
+        min_pnl = float(pnl_values.min())
+        max_pnl = float(pnl_values.max())
+        bins = 12
+        step = (max_pnl - min_pnl) / bins or 1.0
+        counts = [0] * bins
+        for value in pnl_values:
+            idx = min(bins - 1, max(0, int((float(value) - min_pnl) // step)))
+            counts[idx] += 1
+        max_count = max(counts) or 1
+        total_values = int(len(pnl_values))
+        pnl_distribution = [
+            PnLDistributionBin(
+                low=min_pnl + i * step,
+                high=min_pnl + (i + 1) * step,
+                count=int(count),
+                pct=(count / total_values) * 100,
+                height=(count / max_count) * 100,
+            )
+            for i, count in enumerate(counts)
+        ]
+
+    reason_map: dict[str, dict[str, float]] = {}
+    for _, row in df.iterrows():
+        reason = str(_clean(row.get("exit_reason")) or "UNKNOWN")
+        bucket = reason_map.setdefault(reason, {"count": 0.0, "pnl": 0.0})
+        bucket["count"] += 1
+        bucket["pnl"] += float(_float(row.get("net_pnl")) or 0.0)
+    total_rows = len(df)
+    exit_breakdown = [
+        ExitReasonBreakdown(
+            reason=reason,
+            count=int(values["count"]),
+            pct=(values["count"] / total_rows) * 100,
+            pnl=round(float(values["pnl"]), 2),
+        )
+        for reason, values in reason_map.items()
+    ]
+    exit_breakdown.sort(key=lambda item: item.count, reverse=True)
+
+    return LedgerStatsResponse(
+        total=total_rows,
+        pnl_distribution=pnl_distribution,
+        exit_breakdown=exit_breakdown,
+        available_symbols=available_symbols,
+        available_exit_reasons=available_exit_reasons,
+        source_kind=source_kind,
+        warnings=warnings or [],
+    )
+
+
 @router.get("", response_model=BacktestListResponse, summary="[v2] List available backtest runs")
 async def list_backtests(
     request: Request,
@@ -246,6 +380,8 @@ async def get_backtest_ledger(
     size: int = Query(default=25, ge=1, le=500),
     symbol: str | None = Query(default=None),
     exit_reason: str | None = Query(default=None),
+    sort_by: str = Query(default="date"),
+    sort_dir: str = Query(default="desc", pattern="^(asc|desc)$"),
 ) -> LedgerResponse:
     summary = await _run_bridge(request, "backtest_summary", backtest_id)
     source_kind = str(summary.get("source_kind", "canonical")) if summary else "canonical"
@@ -262,14 +398,42 @@ async def get_backtest_ledger(
     df = await _run_bridge(request, "backtest_ledger", backtest_id)
     if df.empty:
         return LedgerResponse(total=0, page=page, size=size, rows=[], source_kind=source_kind)
-    if symbol and "symbol" in df.columns:
-        df = df[df["symbol"].astype(str).str.upper() == symbol.upper()]
-    if exit_reason and "exit_reason" in df.columns:
-        df = df[df["exit_reason"].astype(str) == exit_reason]
+    df = _filter_ledger(df, symbol, exit_reason)
+    df = _sort_ledger(df, sort_by, sort_dir)
     total = len(df)
     start = page * size
     rows = [_ledger_row(row, legacy) for _, row in df.iloc[start:start + size].iterrows()]
     return LedgerResponse(total=total, page=page, size=size, rows=rows, source_kind=source_kind)
+
+
+@router.get("/{backtest_id}/ledger-stats", response_model=LedgerStatsResponse, summary="[v2] Full-filter ledger analytics")
+async def get_backtest_ledger_stats(
+    backtest_id: str,
+    request: Request,
+    symbol: str | None = Query(default=None),
+    exit_reason: str | None = Query(default=None),
+) -> LedgerStatsResponse:
+    summary = await _run_bridge(request, "backtest_summary", backtest_id)
+    source_kind = str(summary.get("source_kind", "canonical")) if summary else "canonical"
+    if summary and not summary.get("has_ledger", True):
+        return LedgerStatsResponse(
+            total=0,
+            pnl_distribution=[],
+            exit_breakdown=[],
+            available_symbols=[],
+            available_exit_reasons=[],
+            source_kind=source_kind,
+            warnings=["summary_only_no_ledger"],
+        )
+    df = await _run_bridge(request, "backtest_ledger", backtest_id)
+    if df.empty:
+        return LedgerStatsResponse(total=0, source_kind=source_kind)
+
+    available_symbols = _available_symbols(df)
+    symbol_filtered = _filter_ledger(df, symbol, None)
+    available_exit_reasons = _available_exit_reasons(symbol_filtered)
+    filtered = _filter_ledger(symbol_filtered, None, exit_reason)
+    return _ledger_stats_response(filtered, source_kind, available_symbols, available_exit_reasons)
 
 
 @router.get("/{backtest_id}/events", response_model=list[EventOverlayPoint], summary="[v2] Chart event overlay")

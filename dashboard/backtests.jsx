@@ -30,6 +30,18 @@ const GROUP_OPTIONS = [
   ['none', 'FLAT'],
 ];
 
+const LEDGER_SORT_OPTIONS = [
+  ['date', 'ENTRY DATE'],
+  ['exit_date', 'EXIT DATE'],
+  ['net_pnl', 'NET PNL'],
+  ['gross_pnl', 'GROSS PNL'],
+  ['entry_credit', 'ENTRY CREDIT'],
+  ['dte', 'DTE'],
+  ['vix', 'VIX'],
+  ['symbol', 'SYMBOL'],
+  ['exit_reason', 'EXIT REASON'],
+];
+
 function _metricColor(value, type) {
   if (value == null) return { cls: '', style: {} };
   if (type === 'pnl' || type === 'cagr') {
@@ -94,6 +106,7 @@ function BacktestsTab() {
   const [drawdown, setDrawdown] = useState([]);
   const [monthly, setMonthly] = useState([]);
   const [ledger, setLedger] = useState(null);
+  const [ledgerStats, setLedgerStats] = useState(null);
   const [events, setEvents] = useState([]);
   const [decisions, setDecisions] = useState(null);
   const [equityMode, setEquityMode] = useState('absolute');
@@ -101,6 +114,8 @@ function BacktestsTab() {
   const [ledgerFilterReason, setLedgerFilterReason] = useState('');
   const [ledgerPage, setLedgerPage] = useState(0);
   const [ledgerSize, setLedgerSize] = useState(25);
+  const [ledgerSortBy, setLedgerSortBy] = useState('date');
+  const [ledgerSortDir, setLedgerSortDir] = useState('desc');
   const [showDecisions, setShowDecisions] = useState(false);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [sidebarQuery, setSidebarQuery] = useState('');
@@ -143,6 +158,7 @@ function BacktestsTab() {
       setEvents([]);
       setDecisions(null);
       setLedger({ total: 0, page: 0, size: ledgerSize, rows: [] });
+      setLedgerStats({ total: 0, pnl_distribution: [], exit_breakdown: [], available_symbols: [], available_exit_reasons: [] });
       setLoadingDetail(false);
       return;
     }
@@ -169,25 +185,48 @@ function BacktestsTab() {
     setLedgerPage(0);
   }, [focusedId, backtests]);
 
-  // Refetch ledger when pagination/filters change
+  // Refetch visible ledger page when pagination, filters, or sort order changes.
   useEffect(() => {
     if (!focusedId) return;
-    _fetchLedger(focusedId, ledgerPage, ledgerSize, ledgerFilterSymbol, ledgerFilterReason);
-  }, [focusedId, ledgerPage, ledgerSize, ledgerFilterSymbol, ledgerFilterReason]);
+    _fetchLedger(focusedId, ledgerPage, ledgerSize, ledgerFilterSymbol, ledgerFilterReason, ledgerSortBy, ledgerSortDir);
+  }, [focusedId, ledgerPage, ledgerSize, ledgerFilterSymbol, ledgerFilterReason, ledgerSortBy, ledgerSortDir]);
 
-  function _fetchLedger(id, page, size, symFilter, reasonFilter) {
+  // Refetch full-filter analytics independently from the paged ledger slice.
+  useEffect(() => {
+    if (!focusedId) return;
+    _fetchLedgerStats(focusedId, ledgerFilterSymbol, ledgerFilterReason);
+  }, [focusedId, ledgerFilterSymbol, ledgerFilterReason]);
+
+  function _fetchLedger(id, page, size, symFilter, reasonFilter, sortKey, sortDirection) {
     const focused = backtests.find(b => b.id === id);
     if (focused && !focused.has_ledger) {
       setLedger({ total: 0, page, size, rows: [] });
       return;
     }
-    let url = `/api/backtests/${encodeURIComponent(id)}/ledger?page=${page}&size=${size}`;
+    let url = `/api/backtests/${encodeURIComponent(id)}/ledger?page=${page}&size=${size}&sort_by=${encodeURIComponent(sortKey)}&sort_dir=${encodeURIComponent(sortDirection)}`;
     if (symFilter) url += `&symbol=${encodeURIComponent(symFilter)}`;
     if (reasonFilter) url += `&exit_reason=${encodeURIComponent(reasonFilter)}`;
     fetch(url, { headers: { 'Accept': 'application/json' } })
       .then(r => r.ok ? r.json() : null)
       .then(data => setLedger(data || { total: 0, page: 0, size: 25, rows: [] }))
       .catch(() => setLedger({ total: 0, page: 0, size: 25, rows: [] }));
+  }
+
+  function _fetchLedgerStats(id, symFilter, reasonFilter) {
+    const focused = backtests.find(b => b.id === id);
+    if (focused && !focused.has_ledger) {
+      setLedgerStats({ total: 0, pnl_distribution: [], exit_breakdown: [], available_symbols: [], available_exit_reasons: [] });
+      return;
+    }
+    let url = `/api/backtests/${encodeURIComponent(id)}/ledger-stats`;
+    const params = [];
+    if (symFilter) params.push(`symbol=${encodeURIComponent(symFilter)}`);
+    if (reasonFilter) params.push(`exit_reason=${encodeURIComponent(reasonFilter)}`);
+    if (params.length) url += `?${params.join('&')}`;
+    fetch(url, { headers: { 'Accept': 'application/json' } })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => setLedgerStats(data || { total: 0, pnl_distribution: [], exit_breakdown: [], available_symbols: [], available_exit_reasons: [] }))
+      .catch(() => setLedgerStats({ total: 0, pnl_distribution: [], exit_breakdown: [], available_symbols: [], available_exit_reasons: [] }));
   }
 
   // Fetch equity curves for checked backtests
@@ -347,6 +386,12 @@ function BacktestsTab() {
 
   const focusedBt = backtests.find(b => b.id === focusedId) || null;
   const isSummaryOnly = focusedBt && (!focusedBt.has_ledger && !focusedBt.has_equity);
+  const ledgerAnalyticsTotal = ledgerStats?.total ?? 0;
+  const ledgerDirLabel = ledgerSortBy === 'date' || ledgerSortBy === 'entry_date' || ledgerSortBy === 'exit_date'
+    ? (ledgerSortDir === 'desc' ? 'NEWEST' : 'OLDEST')
+    : (ledgerSortBy === 'net_pnl' || ledgerSortBy === 'gross_pnl')
+    ? (ledgerSortDir === 'desc' ? 'BEST' : 'WORST')
+    : (ledgerSortDir === 'desc' ? 'DESC' : 'ASC');
 
   const filteredBacktests = useMemo(() => {
     const q = sidebarQuery.trim().toLowerCase();
@@ -383,11 +428,16 @@ function BacktestsTab() {
 
   // Ledger exit reasons for filter dropdown
   const exitReasons = useMemo(() => {
-    if (!ledger || !ledger.rows) return [];
-    const set = new Set();
-    ledger.rows.forEach(r => { if (r.exit_reason) set.add(r.exit_reason); });
-    return Array.from(set).sort();
-  }, [ledger]);
+    if (!ledgerStats || !Array.isArray(ledgerStats.available_exit_reasons)) return [];
+    return ledgerStats.available_exit_reasons;
+  }, [ledgerStats]);
+
+  const ledgerSymbols = useMemo(() => {
+    if (ledgerStats && Array.isArray(ledgerStats.available_symbols) && ledgerStats.available_symbols.length) {
+      return ledgerStats.available_symbols;
+    }
+    return ['NIFTY','FINNIFTY','MIDCPNIFTY','SENSEX','BANKNIFTY'];
+  }, [ledgerStats]);
 
   // Monthly heatmap data
   const heatmapYears = useMemo(() => {
@@ -404,44 +454,18 @@ function BacktestsTab() {
 
   // PNL distribution from ledger
   const pnlDist = useMemo(() => {
-    if (!ledger || !ledger.rows.length) return [];
-    const values = ledger.rows.map(r => r.net_pnl || 0);
-    if (!values.length) return [];
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const bins = 12;
-    const step = (max - min) / bins || 1;
-    const counts = new Array(bins).fill(0);
-    values.forEach(v => {
-      const idx = Math.min(bins - 1, Math.max(0, Math.floor((v - min) / step)));
-      counts[idx]++;
-    });
-    const maxCount = Math.max(...counts, 1);
-    return counts.map((c, i) => ({
-      low: min + i * step,
-      high: min + (i + 1) * step,
-      count: c,
-      pct: (c / values.length) * 100,
-      height: (c / maxCount) * 100,
-      color: (min + i * step) >= 0 ? 'var(--green)' : 'var(--red)',
+    if (!ledgerStats || !Array.isArray(ledgerStats.pnl_distribution)) return [];
+    return ledgerStats.pnl_distribution.map(bin => ({
+      ...bin,
+      color: bin.low >= 0 ? 'var(--green)' : 'var(--red)',
     }));
-  }, [ledger]);
+  }, [ledgerStats]);
 
   // Exit reason breakdown
   const exitBreakdown = useMemo(() => {
-    if (!ledger || !ledger.rows.length) return [];
-    const map = {};
-    ledger.rows.forEach(r => {
-      const reason = r.exit_reason || 'UNKNOWN';
-      map[reason] = (map[reason] || 0) + 1;
-    });
-    const total = ledger.rows.length;
-    const items = Object.entries(map).map(([reason, count]) => ({
-      reason, count, pct: (count / total) * 100,
-      pnl: ledger.rows.filter(r => r.exit_reason === reason).reduce((s, r) => s + (r.net_pnl || 0), 0),
-    }));
-    return items.sort((a, b) => b.count - a.count);
-  }, [ledger]);
+    if (!ledgerStats || !Array.isArray(ledgerStats.exit_breakdown)) return [];
+    return ledgerStats.exit_breakdown;
+  }, [ledgerStats]);
 
   return (
     <div className="bt-wrap">
@@ -662,7 +686,7 @@ function BacktestsTab() {
           {/* PNL Distribution */}
           <div className="panel">
             <div className="panel-header">
-              <div className="panel-title">PNL Distribution <span className="count">{ledger?.rows?.length || 0} TRADES</span></div>
+              <div className="panel-title">PNL Distribution <span className="count">{ledgerAnalyticsTotal} TRADES</span></div>
             </div>
             <div style={{ padding: '12px 14px', height: 220, display: 'flex', alignItems: 'flex-end', gap: 2 }}>
               {!pnlDist.length ? (
@@ -681,7 +705,7 @@ function BacktestsTab() {
           {/* Exit reason breakdown */}
           <div className="panel">
             <div className="panel-header">
-              <div className="panel-title">Exit Reasons <span className="count">{ledger?.rows?.length || 0} TRADES</span></div>
+              <div className="panel-title">Exit Reasons <span className="count">{ledgerAnalyticsTotal} TRADES</span></div>
             </div>
             <div style={{ padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 220, overflow: 'auto' }}>
               {!exitBreakdown.length ? (
@@ -715,12 +739,18 @@ function BacktestsTab() {
                 )}
                 <select className="ctrl-select" value={ledgerFilterSymbol} onChange={e => { setLedgerFilterSymbol(e.target.value); setLedgerPage(0); }} style={{ width: 100 }}>
                   <option value="">ALL SYM</option>
-                  {['NIFTY','FINNIFTY','MIDCPNIFTY','SENSEX','BANKNIFTY'].map(s => <option key={s} value={s}>{s}</option>)}
+                  {ledgerSymbols.map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
                 <select className="ctrl-select" value={ledgerFilterReason} onChange={e => { setLedgerFilterReason(e.target.value); setLedgerPage(0); }} style={{ width: 120 }}>
                   <option value="">ALL REASONS</option>
                   {exitReasons.map(r => <option key={r} value={r}>{r}</option>)}
                 </select>
+                <select className="ctrl-select" value={ledgerSortBy} onChange={e => { setLedgerSortBy(e.target.value); setLedgerPage(0); }} style={{ width: 130 }}>
+                  {LEDGER_SORT_OPTIONS.map(([key, label]) => <option key={key} value={key}>SORT {label}</option>)}
+                </select>
+                <button className="ctrl-btn" onClick={() => { setLedgerSortDir(d => d === 'desc' ? 'asc' : 'desc'); setLedgerPage(0); }}>
+                  {ledgerDirLabel}
+                </button>
               </div>
             )}
           </div>

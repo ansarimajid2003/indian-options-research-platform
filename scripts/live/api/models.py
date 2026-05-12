@@ -343,11 +343,36 @@ class TradeLedgerRow(BaseModel):
     symbol_inferred: bool = False
 
 
+class PnLDistributionBin(BaseModel):
+    low: float
+    high: float
+    count: int
+    pct: float
+    height: float
+
+
+class ExitReasonBreakdown(BaseModel):
+    reason: str
+    count: int
+    pct: float
+    pnl: float
+
+
 class LedgerResponse(BaseModel):
     total: int
     page: int
     size: int
     rows: list[TradeLedgerRow]
+    source_kind: str = "canonical"
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LedgerStatsResponse(BaseModel):
+    total: int
+    pnl_distribution: list[PnLDistributionBin] = Field(default_factory=list)
+    exit_breakdown: list[ExitReasonBreakdown] = Field(default_factory=list)
+    available_symbols: list[str] = Field(default_factory=list)
+    available_exit_reasons: list[str] = Field(default_factory=list)
     source_kind: str = "canonical"
     warnings: list[str] = Field(default_factory=list)
 
