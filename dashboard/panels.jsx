@@ -17,7 +17,7 @@ function EmptyState({ icon, title, sub }) {
 }
 
 // ── Positions panel ────────────────────────────────────────────────────
-function PositionsPanel({ positions }) {
+const PositionsPanel = React.memo(function PositionsPanel({ positions }) {
   return (
     <div className="panel span-positions">
       <div className="panel-header">
@@ -101,10 +101,10 @@ function PositionsPanel({ positions }) {
       </div>
     </div>
   );
-}
+});
 
 // ── Equity curve ───────────────────────────────────────────────────────
-function EquityCurvePanel({ seriesRef, equityState, accentColor = '#4ade80' }) {
+const EquityCurvePanel = React.memo(function EquityCurvePanel({ seriesRef, equityState, accentColor = '#4ade80' }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const netSeriesRef = useRef(null);
@@ -185,10 +185,10 @@ function EquityCurvePanel({ seriesRef, equityState, accentColor = '#4ade80' }) {
       </div>
     </div>
   );
-}
+});
 
 // ── Signal log ─────────────────────────────────────────────────────────
-function SignalLogPanel({ entries }) {
+const SignalLogPanel = React.memo(function SignalLogPanel({ entries }) {
   return (
     <div className="panel span-alerts">
       <div className="panel-header">
@@ -203,7 +203,7 @@ function SignalLogPanel({ entries }) {
         {entries.length === 0
           ? <EmptyState icon="⊘" title="NO SIGNALS YET" sub="Entry/skip events appear here at 09:20 IST" />
           : entries.map((e, i) => (
-            <div className="sig-row" key={i}>
+            <div className="sig-row" key={`${e.ts}-${e.symbol}-${i}`}>
               <span className="ts">{e.ts}</span>
               <span className={`ev ${e.event}`}>{e.event === 'entry' ? 'E' : e.event === 'exit' ? 'X' : 'S'}</span>
               <span className="sym">{e.symbol}</span>
@@ -219,10 +219,10 @@ function SignalLogPanel({ entries }) {
       </div>
     </div>
   );
-}
+});
 
 // ── Depth Health (aggregate summary) ──────────────────────────────────
-function DepthHealthPanel({ depthSummary }) {
+const DepthHealthPanel = React.memo(function DepthHealthPanel({ depthSummary }) {
   const ds = depthSummary;
   const ready    = ds?.ready ?? 0;
   const total    = ds?.total ?? 0;
@@ -271,7 +271,7 @@ function DepthHealthPanel({ depthSummary }) {
 }
 
 // ── Storage / writer health ────────────────────────────────────────────
-function StoragePanel({ wdHistory, storage }) {
+const StoragePanel = React.memo(function StoragePanel({ wdHistory, storage }) {
   const live = storage != null;
   const rawAge     = live && storage.raw_packet_flush_age_s != null
     ? `${storage.raw_packet_flush_age_s.toFixed(2)}s` : '—';
@@ -320,10 +320,10 @@ function StoragePanel({ wdHistory, storage }) {
       </div>
     </div>
   );
-}
+});
 
 // ── Alerts timeline ────────────────────────────────────────────────────
-function AlertsPanel({ alerts }) {
+const AlertsPanel = React.memo(function AlertsPanel({ alerts }) {
   const counts = alerts.reduce((acc, a) => { acc[a.severity] = (acc[a.severity] || 0) + 1; return acc; }, {});
   return (
     <div className="panel span-alerts">
@@ -345,7 +345,7 @@ function AlertsPanel({ alerts }) {
           : (
             <div className="timeline">
               {alerts.map((a, i) => (
-                <div className="alert-row" key={i}>
+                <div className="alert-row" key={`${a.ts}-${a.severity}-${a.component}-${i}`}>
                   <span className="ts">{a.ts}</span>
                   <span className={`badge ${a.severity}`}>{a.severity.toUpperCase()}</span>
                   <span className="comp">{a.component}</span>
@@ -358,7 +358,7 @@ function AlertsPanel({ alerts }) {
       </div>
     </div>
   );
-}
+});
 
 // ── Spot charts ────────────────────────────────────────────────────────
 const TF_OPTIONS = [
@@ -453,7 +453,7 @@ function SpotChartCard({ symbol, bars, marketClosed }) {
   );
 }
 
-function SpotChartsRow({ spotData, marketClosed }) {
+const SpotChartsRow = React.memo(function SpotChartsRow({ spotData, marketClosed }) {
   return (
     <div style={{display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:'12px', gridColumn:'span 12'}}>
       {['NIFTY','FINNIFTY','MIDCPNIFTY','SENSEX'].map(sym => (
@@ -461,7 +461,7 @@ function SpotChartsRow({ spotData, marketClosed }) {
       ))}
     </div>
   );
-}
+});
 
 // ── Option chain panel ─────────────────────────────────────────────────
 const OI_MAX = 900000;
@@ -492,7 +492,7 @@ function _chainSpot(rows) {
   return bestRow.strike + ce - pe;
 }
 
-function OptionChainPanel({ chainData, chainLoaded, marketClosed, session }) {
+const OptionChainPanel = React.memo(function OptionChainPanel({ chainData, chainLoaded, marketClosed, session }) {
   const symbols = ['NIFTY','FINNIFTY','MIDCPNIFTY','SENSEX'];
   const [active, setActive] = useState('NIFTY');
   const rows = chainData[active] || [];
@@ -654,6 +654,6 @@ function OptionChainPanel({ chainData, chainLoaded, marketClosed, session }) {
       </div>
     </div>
   );
-}
+});
 
 Object.assign(window, { PositionsPanel, EquityCurvePanel, SignalLogPanel, DepthHealthPanel, StoragePanel, AlertsPanel, SpotChartsRow, OptionChainPanel });

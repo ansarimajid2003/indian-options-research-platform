@@ -162,7 +162,7 @@ function BacktestsTabPlaceholder() {
   );
 }
 
-function HeaderStrip({ summary, session }) {
+const HeaderStrip = React.memo(function HeaderStrip({ summary, session }) {
   const sess = session || {};
   const sessionDate  = sess.session_date || '—';
   const dayOfWeek    = sessionDate !== '—'
@@ -222,10 +222,10 @@ function HeaderStrip({ summary, session }) {
       </div>
     </div>
   );
-}
+});
 
 // ── Sidebar ──────────────────────────────────────────────────────────────
-function Sidebar({ audioOn, onToggleAudio, depthSummary, wdHistory, storage, connected, session }) {
+const Sidebar = React.memo(function Sidebar({ audioOn, onToggleAudio, depthSummary, wdHistory, storage, connected, session }) {
   const feedConnected = session?.feed_connected ?? false;
   const subCount      = session?.feed_subscribed_count ?? 0;
   return (
@@ -295,9 +295,11 @@ function Sidebar({ audioOn, onToggleAudio, depthSummary, wdHistory, storage, con
       <StoragePanel wdHistory={wdHistory} storage={storage} />
     </aside>
   );
-}
+});
 
 // ── App ───────────────────────────────────────────────────────────────────
+const { useCallback, useMemo } = React;
+
 function App() {
   const [tweaks, setTweak] = useTweaks(/*EDITMODE-BEGIN*/{
     "brandName": "Strategy Monitor",
@@ -469,9 +471,18 @@ function App() {
           }
 
           if (f.storage) {
-            setStorage(f.storage);
+            setStorage(prev => {
+              if (prev &&
+                  prev.wd_free_gb === f.storage.wd_free_gb &&
+                  prev.wd_mount_ok === f.storage.wd_mount_ok &&
+                  prev.raw_packet_flush_age_s === f.storage.raw_packet_flush_age_s) return prev;
+              return f.storage;
+            });
             if (f.storage.wd_free_gb != null) {
-              setWdHistory(prev => [...prev.slice(-80), f.storage.wd_free_gb]);
+              setWdHistory(prev => {
+                if (prev.length && prev[prev.length - 1] === f.storage.wd_free_gb) return prev;
+                return [...prev.slice(-80), f.storage.wd_free_gb];
+              });
             }
           }
 
@@ -489,24 +500,26 @@ function App() {
 
   // ── Summary for HeaderStrip ────────────────────────────────────────────
   const lastEq    = equity[equity.length - 1] || {};
-  const peakGross = equity.reduce((m, p) => Math.max(m, p.cumulative_gross_pnl ?? 0), 0);
-
-  const quoteFreshness = session?.quote_freshness_pct ?? 0;
-  const depthReady     = session?.depth?.ready_pct ?? 0;
-  const marketClosed   = !session || session.market_status === 'CLOSED' || session.market_status === 'HOLIDAY';
-
-  const summary = {
+  const peakGross = useMemo(
+    () => equity.reduce((m, p) => Math.max(m, p.cumulative_gross_pnl ?? 0), 0),
+    [equity]
+  );
+  const marketClosed = useMemo(
+    () => !session || session.market_status === 'CLOSED' || session.market_status === 'HOLIDAY',
+    [session?.market_status]
+  );
+  const depthSummary = useMemo(() => session?.depth ?? null, [session?.depth]);
+  const summary = useMemo(() => ({
     gross:          lastEq.cumulative_gross_pnl ?? 0,
     net:            lastEq.cumulative_net_pnl   ?? 0,
     peakGross,
-    quoteFreshness,
-    depthReady,
+    quoteFreshness: session?.quote_freshness_pct ?? 0,
+    depthReady:     session?.depth?.ready_pct ?? 0,
     wdFreeGb:  storage?.wd_free_gb  ?? null,
     wdMountOk: storage?.wd_mount_ok ?? null,
-  };
+  }), [lastEq, peakGross, session, storage]);
 
-  // DepthSummary from session.depth (aggregate stats only)
-  const depthSummary = session?.depth ?? null;
+  const onToggleAudio = useCallback(() => setAudioOn(v => !v), []);
   const HistoricalComponent = window.HistoricalTab?.HistoricalTab || window.HistoricalTab || HistoricalTabPlaceholder;
   const BacktestsComponent = window.BacktestsTab?.BacktestsTab || window.BacktestsTab || BacktestsTabPlaceholder;
 
@@ -531,7 +544,7 @@ function App() {
             </div>
             <Sidebar
               audioOn={audioOn}
-              onToggleAudio={() => setAudioOn(v => !v)}
+              onToggleAudio={onToggleAudio}
               depthSummary={depthSummary}
               wdHistory={wdHistory}
               storage={storage}
