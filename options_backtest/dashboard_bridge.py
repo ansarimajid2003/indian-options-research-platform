@@ -73,7 +73,7 @@ _TTL_LIVE = 3.0
 _TTL_TRADES = 5.0
 _TTL_HIST = 60.0
 _TTL_BACKTESTS = 120.0
-_BACKTEST_INDEX_VERSION = 2
+_BACKTEST_INDEX_VERSION = 3
 
 
 # ── Dataclasses (bridge-internal; mirrored by Pydantic models in api/models.py) ──
@@ -1258,8 +1258,20 @@ class DashboardBridge:
             "_path": str(source_path),
         }
 
+    @staticmethod
+    def _jsonable(value: Any) -> Any:
+        if value is None:
+            return None
+        if pd.isna(value):
+            return None
+        if hasattr(value, "item"):
+            return value.item()
+        return value
+
     def _row_summary(self, row: pd.Series, source_path: Path, backtest_id: str, row_index: int) -> dict:
         name = str(row.get("name", row.get("label", source_path.stem)))
+        summary_row = {str(k): self._jsonable(v) for k, v in row.to_dict().items()}
+        has_reconstructable_ledger = bool(self._legacy_portfolio_components(summary_row, source_path))
         return {
             "id": backtest_id,
             "name": name,
@@ -1280,11 +1292,12 @@ class DashboardBridge:
             "created_at": datetime.fromtimestamp(source_path.stat().st_mtime, tz=_IST).isoformat(),
             "source_kind": "legacy_summary",
             "source": self._path_source(source_path),
-            "has_ledger": False,
-            "has_equity": False,
+            "has_ledger": has_reconstructable_ledger,
+            "has_equity": has_reconstructable_ledger,
             "has_decisions": False,
             "_path": str(source_path),
             "_row_index": row_index,
+            "_summary_row": summary_row,
         }
 
     def _canonical_summary(self, path: Path) -> dict:
@@ -1473,6 +1486,220 @@ class DashboardBridge:
         cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
         return df[cols]
 
+    @staticmethod
+    def _parse_lot_spec(value: Any) -> dict[str, float]:
+        lots: dict[str, float] = {}
+        for token in str(value or "").replace(",", " ").split():
+            if ":" not in token:
+                continue
+            symbol, raw_lots = token.split(":", 1)
+            symbol = symbol.strip().upper()
+            try:
+                qty = float(raw_lots)
+            except ValueError:
+                continue
+            if symbol and qty > 0:
+                lots[symbol] = qty
+        return lots
+
+    @staticmethod
+    def _portfolio_component_symbol_path(path: Path, symbol: str, pattern: str) -> Path:
+        return path.parent / pattern.format(symbol=symbol.lower())
+
+    def _legacy_portfolio_components(self, row: dict[str, Any], source_path: Path) -> list[dict[str, Any]]:
+        lots = self._parse_lot_spec(row.get("lots"))
+        if not lots:
+            return []
+
+        source = str(row.get("source", "")).strip().lower()
+        stem = source_path.stem
+        components: list[dict[str, Any]] = []
+
+        def _add(symbol: str, path: Path, scale: float) -> None:
+            if path.exists():
+                components.append({"symbol": symbol, "path": str(path), "scale": float(scale)})
+
+        if stem == "20260507_optimized_wing6_portfolio":
+            baseline = {
+                "NIFTY": "20260506_mixed_expiry_ic_wing6_nifty.csv",
+                "BANKNIFTY": "20260506_mixed_expiry_ic_wing6_banknifty.csv",
+                "FINNIFTY": "20260506_mixed_expiry_ic_wing6_finnifty.csv",
+                "MIDCPNIFTY": "20260506_mixed_expiry_ic_wing6_midcpnifty.csv",
+                "SENSEX": "20260506_mixed_expiry_ic_wing6_sensex.csv",
+            }
+            filtered = {
+                "NIFTY": "20260506_vixgt13_ic_wing6_nifty.csv",
+                "FINNIFTY": "20260506_dtelt7_ic_wing6_finnifty.csv",
+                "MIDCPNIFTY": "20260506_dtelt7_ic_wing6_midcpnifty.csv",
+                "SENSEX": "20260506_dtelt2_ic_wing6_sensex.csv",
+            }
+            mapping = baseline if source == "baseline" else filtered if source == "filtered" else {}
+            for symbol, scale in lots.items():
+                if symbol in mapping:
+                    _add(symbol, source_path.parent / mapping[symbol], scale)
+            return components if len(components) == len(lots) else []
+
+        if not stem.endswith("_portfolio_comparison"):
+            return []
+
+        run_prefix = stem.removesuffix("_portfolio_comparison")
+        if source == "strangle":
+            focused_root = _REPORT_ROOT / "options" / "focused"
+            source_stamp = "20260505_024624"
+            for symbol, scale in lots.items():
+                exact = focused_root / f"{source_stamp}_dhan_{symbol.lower()}_x{int(scale)}_short_strangle.csv"
+                if float(scale).is_integer() and exact.exists():
+                    _add(symbol, exact, 1.0)
+                    continue
+                base = focused_root / f"{source_stamp}_dhan_{symbol.lower()}_x1_short_strangle.csv"
+                if not base.exists():
+                    base = focused_root / f"{source_stamp}_dhan_{symbol.lower()}_short_strangle.csv"
+                _add(symbol, base, scale)
+            return components if len(components) == len(lots) else []
+
+        wing = re.match(r"iron_condor_wing(\d+)", source)
+        if wing:
+            pattern = f"{run_prefix}_ic_wing{wing.group(1)}_{{symbol}}.csv"
+            for symbol, scale in lots.items():
+                _add(symbol, self._portfolio_component_symbol_path(source_path, symbol, pattern), scale)
+            return components if len(components) == len(lots) else []
+
+        spread = re.match(r"credit_spread_(put|call)_(\d+)x(\d+)", source)
+        if spread:
+            side, short_offset, long_offset = spread.groups()
+            pattern = f"{run_prefix}_cs_{side}_s{short_offset}_l{long_offset}_{{symbol}}.csv"
+            for symbol, scale in lots.items():
+                _add(symbol, self._portfolio_component_symbol_path(source_path, symbol, pattern), scale)
+            return components if len(components) == len(lots) else []
+
+        return []
+
+    def _vix_filter(self):
+        def _load():
+            chosen = next((p for p in _VIX_FILES if p.exists()), None)
+            if chosen is None:
+                return None
+            try:
+                from .volatility_filter import VixFilter
+                return VixFilter(chosen, missing_policy="allow")
+            except Exception:
+                return None
+
+        return self._cached("backtest_vix_filter", 300.0, _load)
+
+    def _annotate_vix_if_needed(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or "vix_bucket" in df.columns or "entry_time" not in df.columns:
+            return df
+        vix_filter = self._vix_filter()
+        if vix_filter is None:
+            return df
+        out = df.copy()
+        values: list[float | None] = []
+        buckets: list[str | None] = []
+        timestamps: list[Any] = []
+        for ts in pd.to_datetime(out["entry_time"], errors="coerce"):
+            if pd.isna(ts):
+                values.append(None)
+                buckets.append(None)
+                timestamps.append(None)
+                continue
+            obs = vix_filter.observation_at_or_before(pd.Timestamp(ts))
+            if obs is None:
+                values.append(None)
+                buckets.append(None)
+                timestamps.append(None)
+            else:
+                values.append(round(float(obs.value), 4))
+                buckets.append(obs.bucket)
+                timestamps.append(obs.timestamp)
+        out["vix_entry"] = values
+        out["vix_bucket"] = buckets
+        out["vix_timestamp"] = timestamps
+        return out
+
+    @staticmethod
+    def _apply_legacy_bucket_policy(df: pd.DataFrame, policy: str) -> pd.DataFrame:
+        if policy == "all" or df.empty:
+            return df.copy()
+        out = df.copy()
+        if "vix_bucket" not in out.columns:
+            return out
+        if policy == "skip_10_13":
+            return out[out["vix_bucket"] != "10-13"].copy()
+        if policy == "half_10_13":
+            scale = out["vix_bucket"].eq("10-13").map({True: 0.5, False: 1.0}).astype(float)
+            for col in ("gross_pnl", "charges", "net_pnl", "entry_credit", "max_theoretical_loss"):
+                if col in out.columns:
+                    out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0) * scale
+            return out
+        if policy == "smart" and "symbol" in out.columns:
+            symbol = out["symbol"].astype(str).str.upper()
+            return out[
+                ~((symbol == "FINNIFTY") & (out["vix_bucket"] == "10-13"))
+                & ~((symbol == "MIDCPNIFTY") & (out["vix_bucket"] == "22-30"))
+            ].copy()
+        return out
+
+    @staticmethod
+    def _scale_legacy_lots(df: pd.DataFrame, lots: float) -> pd.DataFrame:
+        out = df.copy()
+        out["portfolio_lots"] = float(lots)
+        if lots == 1:
+            return out
+        for col in ("gross_pnl", "charges", "net_pnl", "entry_credit", "max_theoretical_loss"):
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0) * lots
+        return out
+
+    def _legacy_summary_ledger(self, info: dict[str, Any]) -> pd.DataFrame:
+        row = info.get("_summary_row")
+        if not isinstance(row, dict):
+            return pd.DataFrame()
+        source_path = Path(str(info.get("_path", "")))
+        components = self._legacy_portfolio_components(row, source_path)
+        if not components:
+            return pd.DataFrame()
+
+        policy = str(row.get("bucket_policy", "all") or "all")
+        portfolio_name = str(row.get("name", row.get("label", source_path.stem)))
+        frames: list[pd.DataFrame] = []
+        for component in components:
+            path = Path(str(component["path"]))
+            symbol = str(component["symbol"]).upper()
+            try:
+                df = pd.read_csv(path)
+            except Exception:
+                continue
+            if df.empty:
+                continue
+            df.columns = [str(c).strip() for c in df.columns]
+            if "strategy" in df.columns:
+                df = df[df["strategy"].astype(str).str.upper() != "TOTAL"].copy()
+            if "symbol" not in df.columns:
+                df.insert(0, "symbol", symbol)
+            df = self._annotate_vix_if_needed(df)
+            df = self._apply_legacy_bucket_policy(df, policy)
+            if df.empty:
+                continue
+            df = self._scale_legacy_lots(df, float(component["scale"]))
+            df["portfolio_name"] = portfolio_name
+            frames.append(df)
+
+        if not frames:
+            return pd.DataFrame()
+        combined = pd.concat(frames, ignore_index=True, sort=False)
+        if "exit_time" in combined.columns:
+            combined["_sort_ts"] = pd.to_datetime(combined["exit_time"], errors="coerce")
+        elif "exit_date" in combined.columns:
+            combined["_sort_ts"] = pd.to_datetime(combined["exit_date"], errors="coerce")
+        else:
+            combined["_sort_ts"] = pd.NaT
+        sort_cols = ["_sort_ts"] + (["symbol"] if "symbol" in combined.columns else [])
+        combined = combined.sort_values(sort_cols).drop(columns=["_sort_ts"]).reset_index(drop=True)
+        if "net_pnl" in combined.columns:
+            combined["equity"] = 1_000_000 + pd.to_numeric(combined["net_pnl"], errors="coerce").fillna(0).cumsum()
+        return self._normalise_ledger(combined)
+
     def backtest_ledger(self, backtest_id: str) -> pd.DataFrame:
         def _load() -> pd.DataFrame:
             canonical = _BACKTEST_ROOT / f"{backtest_id}_ledger.csv"
@@ -1486,6 +1713,8 @@ class DashboardBridge:
                 df = pd.DataFrame()
                 df.attrs["has_ledger"] = False
                 return df
+            if str(info.get("source_kind", "")) == "legacy_summary":
+                return self._legacy_summary_ledger(info)
             try:
                 return self._normalise_ledger(pd.read_csv(info["_path"]))
             except Exception:
@@ -1553,7 +1782,7 @@ class DashboardBridge:
                 events.append({
                     "ts": str(exit_ts),
                     "symbol": symbol,
-                    "event_type": reason or "exit",
+                    "event_type": "exit",
                     "severity": severity,
                     "label": reason.upper() if reason else "EXIT",
                     "details": f"net_pnl={row.get('net_pnl', '')}",

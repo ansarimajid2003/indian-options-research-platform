@@ -288,6 +288,61 @@ class DashboardBridgeBacktestTests(unittest.TestCase):
         finally:
             shutil.rmtree(root)
 
+    def test_portfolio_summary_rows_reconstruct_component_ledgers(self) -> None:
+        root = Path.cwd() / "tmp_dashboard_v2_portfolio"
+        if root.exists():
+            shutil.rmtree(root)
+        report_root = root / "reports" / "backtests"
+        risk_root = report_root / "options" / "risk_management"
+        focused_root = report_root / "options" / "focused"
+        index_root = report_root / "dashboard_index"
+        risk_root.mkdir(parents=True)
+        focused_root.mkdir(parents=True)
+        try:
+            pd.DataFrame([{
+                "name": "naked_port_b",
+                "label": "Naked old Port B",
+                "source": "strangle",
+                "bucket_policy": "all",
+                "lots": "BANKNIFTY:2 MIDCPNIFTY:5",
+                "trades": 2,
+                "net_pnl": 500.0,
+                "sharpe": 1.5,
+            }]).to_csv(risk_root / "20260506_mixed_expiry_portfolio_comparison.csv", index=False)
+            for symbol, pnl in (("banknifty", 200.0), ("midcpnifty", 300.0)):
+                lot = 2 if symbol == "banknifty" else 5
+                pd.DataFrame([{
+                    "strategy": "ShortStrangle",
+                    "entry_date": "2026-05-01",
+                    "entry_time": "2026-05-01 09:20:00",
+                    "exit_date": "2026-05-01",
+                    "exit_time": "2026-05-01 15:20:00",
+                    "exit_reason": "time_exit",
+                    "gross_pnl": pnl,
+                    "charges": 0.0,
+                    "net_pnl": pnl,
+                }]).to_csv(focused_root / f"20260505_024624_dhan_{symbol}_x{lot}_short_strangle.csv", index=False)
+
+            with (
+                patch.object(dashboard_bridge, "_REPORT_ROOT", report_root),
+                patch.object(dashboard_bridge, "_BACKTEST_ROOT", report_root / "dashboard_runs"),
+                patch.object(dashboard_bridge, "_LEGACY_BACKTEST_ROOTS", [risk_root]),
+                patch.object(dashboard_bridge, "_BACKTEST_INDEX_ROOT", index_root),
+                patch.object(dashboard_bridge, "_BACKTEST_INDEX_PATH", index_root / "backtest_index.json"),
+            ):
+                bridge = DashboardBridge(root / "live")
+                row = next(r for r in bridge.backtest_list() if r["name"] == "naked_port_b")
+                ledger = bridge.backtest_ledger(row["id"])
+                equity = bridge.backtest_equity_curve(row["id"])
+
+            self.assertTrue(row["has_ledger"])
+            self.assertTrue(row["has_equity"])
+            self.assertEqual(len(ledger), 2)
+            self.assertEqual(float(ledger["net_pnl"].sum()), 500.0)
+            self.assertEqual(equity.iloc[-1]["equity"], 1_000_500.0)
+        finally:
+            shutil.rmtree(root)
+
 
 if __name__ == "__main__":
     unittest.main()
