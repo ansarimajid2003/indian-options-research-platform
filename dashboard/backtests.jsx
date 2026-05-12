@@ -4,11 +4,11 @@ const { useState, useEffect, useRef, useMemo } = React;
 const { fmtINR, fmtNum, fmtPct } = window.WingData;
 
 const EQUITY_COLORS = [
-  'var(--cyan)',
-  'var(--green)',
-  'var(--amber)',
-  'var(--violet)',
-  'var(--red)',
+  '#38bdf8',
+  '#4ade80',
+  '#fbbf24',
+  '#a78bfa',
+  '#f87171',
 ];
 
 function _metricColor(value, type) {
@@ -63,6 +63,7 @@ function BacktestsTab() {
   const [ledgerSize, setLedgerSize] = useState(25);
   const [showDecisions, setShowDecisions] = useState(false);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  const [sidebarQuery, setSidebarQuery] = useState('');
 
   const equityChartRef = useRef(null);
   const drawdownChartRef = useRef(null);
@@ -225,7 +226,7 @@ function BacktestsTab() {
     const markers = events.map(ev => ({
       time: Math.floor(new Date(ev.ts).getTime() / 1000),
       position: 'aboveBar',
-      color: ev.severity === 'critical' ? 'var(--red)' : ev.severity === 'warning' ? 'var(--amber)' : 'var(--cyan)',
+      color: ev.severity === 'critical' ? '#f87171' : ev.severity === 'warning' ? '#fbbf24' : '#38bdf8',
       shape: ev.event_type === 'entry' ? 'arrowDown' : ev.event_type === 'exit' ? 'arrowUp' : 'circle',
       text: ev.label || ev.event_type,
     }));
@@ -243,7 +244,7 @@ function BacktestsTab() {
     if (!drawdown.length) return;
 
     const series = chart.addAreaSeries({
-      lineColor: 'var(--red)',
+      lineColor: '#f87171',
       topColor: 'rgba(248,113,113,0.25)',
       bottomColor: 'rgba(248,113,113,0.0)',
       lineWidth: 1.2,
@@ -269,6 +270,14 @@ function BacktestsTab() {
 
   const focusedBt = backtests.find(b => b.id === focusedId) || null;
   const isSummaryOnly = focusedBt && (!focusedBt.has_ledger && !focusedBt.has_equity);
+
+  const filteredBacktests = useMemo(() => {
+    const q = sidebarQuery.trim().toLowerCase();
+    const filtered = q
+      ? backtests.filter(b => (b.name || b.id).toLowerCase().includes(q) || (b.symbol || '').toLowerCase().includes(q))
+      : backtests;
+    return filtered.slice(0, 100);
+  }, [backtests, sidebarQuery]);
 
   // Ledger exit reasons for filter dropdown
   const exitReasons = useMemo(() => {
@@ -339,8 +348,17 @@ function BacktestsTab() {
         <div className="panel-header" style={{ borderLeft: 'none', borderRight: 'none', borderTop: 'none' }}>
           <div className="panel-title">Runs <span className="count">{backtests.length}</span></div>
         </div>
+        <div style={{ padding: '6px 10px', borderBottom: '1px solid var(--border)' }}>
+          <input
+            className="cmd-input"
+            style={{ width: '100%', boxSizing: 'border-box' }}
+            placeholder="FILTER BY NAME / SYMBOL"
+            value={sidebarQuery}
+            onChange={e => setSidebarQuery(e.target.value)}
+          />
+        </div>
         <div style={{ flex: 1, overflowY: 'auto' }}>
-          {backtests.map(bt => (
+          {filteredBacktests.map(bt => (
             <div key={bt.id} className={`bt-item ${focusedId === bt.id ? 'focused' : ''}`} onClick={() => setFocusedId(bt.id)}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 11.5, fontWeight: 600, color: 'var(--text)' }}>{bt.name || bt.id}</span>
@@ -361,6 +379,11 @@ function BacktestsTab() {
               </div>
             </div>
           ))}
+          {filteredBacktests.length === 100 && (
+            <div style={{ padding: '8px 14px', fontSize: 10, color: 'var(--text-4)', fontFamily: 'JetBrains Mono, monospace' }}>
+              SHOWING 100 OF {backtests.length} — USE FILTER TO NARROW
+            </div>
+          )}
         </div>
       </div>
 
@@ -369,7 +392,7 @@ function BacktestsTab() {
         {/* Metrics table */}
         <div className="panel" style={{ overflowX: 'auto' }}>
           <div className="panel-header">
-            <div className="panel-title">Metrics <span className="count">{backtests.length} RUNS</span></div>
+            <div className="panel-title">Metrics <span className="count">{filteredBacktests.length} SHOWN · {backtests.length} TOTAL</span></div>
           </div>
           <div style={{ overflowX: 'auto' }}>
             <table className="tbl" style={{ minWidth: 1050 }}>
@@ -391,7 +414,7 @@ function BacktestsTab() {
                 </tr>
               </thead>
               <tbody>
-                {backtests.map(bt => {
+                {filteredBacktests.map(bt => {
                   const pnlCol = _metricColor(bt.net_pnl, 'pnl');
                   const cagrCol = _metricColor(bt.cagr, 'cagr');
                   const sharpeCol = _metricColor(bt.sharpe, 'sharpe');

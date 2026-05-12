@@ -222,7 +222,7 @@ function HistoricalTab({ symbol: defaultSymbol }) {
 
     if (isVIX) {
       const series = chart.addLineSeries({
-        color: 'var(--cyan)',
+        color: '#38bdf8',
         lineWidth: 1.5,
         priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
       });
@@ -230,8 +230,8 @@ function HistoricalTab({ symbol: defaultSymbol }) {
       mainSeriesRef.current = series;
     } else {
       const series = chart.addCandlestickSeries({
-        upColor: 'var(--green)', downColor: 'var(--red)',
-        borderUpColor: 'var(--green)', borderDownColor: 'var(--red)',
+        upColor: '#4ade80', downColor: '#f87171',
+        borderUpColor: '#4ade80', borderDownColor: '#f87171',
         wickUpColor: 'rgba(74,222,128,0.5)', wickDownColor: 'rgba(248,113,113,0.5)',
       });
       series.setData(bars.map(_barToCandle));
@@ -247,7 +247,7 @@ function HistoricalTab({ symbol: defaultSymbol }) {
 
       if (isOptions && bars.some(b => b.oi != null)) {
         const oiSeries = chart.addLineSeries({
-          color: 'var(--violet)',
+          color: '#a78bfa',
           lineWidth: 1,
           priceScaleId: 'oi',
         });
