@@ -268,7 +268,7 @@ const DepthHealthPanel = React.memo(function DepthHealthPanel({ depthSummary }) 
       </div>
     </div>
   );
-}
+});
 
 // ── Storage / writer health ────────────────────────────────────────────
 const StoragePanel = React.memo(function StoragePanel({ wdHistory, storage }) {
