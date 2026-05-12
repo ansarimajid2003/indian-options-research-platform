@@ -286,13 +286,17 @@ function BacktestsTab() {
   useEffect(() => {
     if (!events.length || !focusedId || !equitySeriesMap.current.has(focusedId)) return;
     const series = equitySeriesMap.current.get(focusedId);
-    const markers = events.map(ev => ({
-      time: _toEpochSeconds(ev.ts),
-      position: 'aboveBar',
-      color: ev.severity === 'critical' ? '#f87171' : ev.severity === 'warning' ? '#fbbf24' : '#38bdf8',
-      shape: ev.event_type === 'entry' ? 'arrowDown' : ev.event_type === 'exit' ? 'arrowUp' : 'circle',
-      text: ev.label || ev.event_type,
-    })).filter(m => m.time != null);
+    const markers = events.map(ev => {
+      const isTradeMarker = ev.event_type === 'entry' || ev.event_type === 'exit';
+      const marker = {
+        time: _toEpochSeconds(ev.ts),
+        position: 'aboveBar',
+        color: ev.severity === 'critical' ? '#f87171' : ev.severity === 'warning' ? '#fbbf24' : '#38bdf8',
+        shape: ev.event_type === 'entry' ? 'arrowDown' : ev.event_type === 'exit' ? 'arrowUp' : 'circle',
+      };
+      if (!isTradeMarker) marker.text = ev.label || ev.event_type;
+      return marker;
+    }).filter(m => m.time != null);
     series.setMarkers(markers);
   }, [events, focusedId]);
 
@@ -515,11 +519,11 @@ function BacktestsTab() {
       {/* Main */}
       <div className="bt-main">
         {/* Metrics table */}
-        <div className="panel" style={{ overflowX: 'auto' }}>
+        <div className="panel bt-metrics-panel">
           <div className="panel-header">
             <div className="panel-title">Metrics <span className="count">{filteredBacktests.length} SHOWN · {backtests.length} TOTAL</span></div>
           </div>
-          <div style={{ overflowX: 'auto' }}>
+          <div className="bt-metrics-scroll">
             <table className="tbl" style={{ minWidth: 1180 }}>
               <thead>
                 <tr>
