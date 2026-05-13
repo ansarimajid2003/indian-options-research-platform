@@ -666,10 +666,11 @@ async def collect_order_book(
             vix_security_id=str(profile.get("vix", {}).get("dhan_scrip_id", 21)),
         )
         expiries = resolver.fetch_expiry_list(scrip_id, segment)
-        if not expiries:
-            print(f"[collect_order_book] SKIP {symbol} - no active expiries")
+        valid_expiries = [e for e in expiries if e >= session_date]
+        if not valid_expiries:
+            print(f"[collect_order_book] SKIP {symbol} - no valid (non-expired) expiries (got: {expiries[:3]})")
             continue
-        expiry = expiries[0]
+        expiry = valid_expiries[0]
 
         gap_start = _now_ist().isoformat()
         try:

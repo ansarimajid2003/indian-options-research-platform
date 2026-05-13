@@ -50,6 +50,7 @@ _log = logging.getLogger(__name__)
 
 _CRITICAL_INTERVAL = 15.0
 _SLOW_INTERVAL = 60.0
+_JSONL_ALERT_REPEAT_INTERVAL = 600.0  # only re-write a recurring alert every 10 min
 _HEARTBEAT_INTERVAL_MARKET = 60.0
 # Healthchecks.io currently has this check configured with a 1-minute period.
 # Keep off-hours pings comfortably inside that window to avoid UP/DOWN flapping.
@@ -257,6 +258,7 @@ class HealthMonitor:
         self._wd_free_gb = 0.0
         self._alert_counts: dict[str, int] = {"critical": 0, "warning": 0, "info": 0}
         self._active_alerts: dict[str, dict] = {}
+        self._alert_jsonl_write_times: dict[str, float] = {}
         self._consecutive_bad: dict[str, int] = {"quote_freshness": 0, "depth_readiness": 0}
         self._log_scan_offset = 0
         self._backend_open_sent_for: date | None = None
@@ -329,6 +331,7 @@ class HealthMonitor:
         self._uptime_summary_path = self._live_root / "reports" / f"{self._date_str}_uptime_summary.md"
         self._alert_counts = {"critical": 0, "warning": 0, "info": 0}
         self._active_alerts = {}
+        self._alert_jsonl_write_times = {}
         self._consecutive_bad = {"quote_freshness": 0, "depth_readiness": 0}
         self._good_ticks = 0
         self._total_ticks = 0
@@ -421,6 +424,7 @@ class HealthMonitor:
             await self._clear_alert("process", "runner_not_active")
             await self._clear_alert("process", "process_health_missing")
             await self._clear_alert("process", "process_stale")
+            await self._clear_alert("process", "process_wedged")
             return None
 
         systemd_active = False
@@ -444,10 +448,28 @@ class HealthMonitor:
             except Exception as exc:
                 await self._alert("warning", "process", "process_health_parse_error", str(exc))
 
-        if systemd_active or snapshot_active:
+        if systemd_active and snapshot_active:
             await self._clear_alert("process", "runner_not_active")
             await self._clear_alert("process", "process_health_missing")
             await self._clear_alert("process", "process_stale")
+            await self._clear_alert("process", "process_wedged")
+            return True
+
+        if systemd_active and not snapshot_active:
+            # Service alive in systemd but snapshot loop has stopped — engine is wedged
+            await self._clear_alert("process", "runner_not_active")
+            await self._alert(
+                "critical",
+                "process",
+                "process_wedged",
+                "live-paper.service is systemd-active but process_health.json is stale (>30s) — engine wedged",
+            )
+            return False
+
+        if snapshot_active and not systemd_active:
+            # Running without systemd (e.g. manual foreground run)
+            await self._clear_alert("process", "runner_not_active")
+            await self._clear_alert("process", "process_wedged")
             return True
 
         if not health_path.exists():
@@ -992,16 +1014,21 @@ class HealthMonitor:
             "message": message,
             "last_seen": _now_ist().isoformat(),
         }
-        record = {
-            "ts": _now_ist().isoformat(),
-            "severity": severity,
-            "component": component,
-            "reason": reason,
-            "message": message,
-        }
-        self._alerts_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._alerts_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        # Rate-limit JSONL writes — first occurrence then every 10 min per alert key
+        now_mono = _time.monotonic()
+        last_write = self._alert_jsonl_write_times.get(key, 0.0)
+        if now_mono - last_write >= _JSONL_ALERT_REPEAT_INTERVAL:
+            record = {
+                "ts": _now_ist().isoformat(),
+                "severity": severity,
+                "component": component,
+                "reason": reason,
+                "message": message,
+            }
+            self._alerts_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._alerts_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            self._alert_jsonl_write_times[key] = now_mono
 
         level = logging.CRITICAL if severity == "critical" else logging.WARNING if severity == "warning" else logging.INFO
         _log.log(level, "alert: [%s] %s %s - %s", severity.upper(), component, reason, message)
@@ -1016,6 +1043,17 @@ class HealthMonitor:
         matching = [key for key, record in self._active_alerts.items() if record["component"] == component and record["reason"] == reason]
         for key in matching:
             record = self._active_alerts.pop(key)
+            self._alert_jsonl_write_times.pop(key, None)  # reset so next occurrence logs again immediately
+            resolved = {
+                "ts": _now_ist().isoformat(),
+                "severity": "resolved",
+                "component": component,
+                "reason": reason,
+                "message": f"RECOVERED: {record['message']}",
+            }
+            self._alerts_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._alerts_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(resolved) + "\n")
             await self._send_telegram(f"[RECOVERED] {component}/{reason}: {record['message']}", severity="info")
 
     async def _send_telegram(self, text: str, severity: str = "info") -> None:

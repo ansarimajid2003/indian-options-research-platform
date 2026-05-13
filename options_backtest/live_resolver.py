@@ -12,6 +12,7 @@ lightweight fine-grained rwlock equivalents using threading.Lock.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ import requests
 from .calendar import get_instrument_spec
 from .schemas import Contract, OptionType
 
+_log = logging.getLogger(__name__)
 _IST = "Asia/Kolkata"
 _OPTION_CHAIN_URL = "https://api.dhan.co/v2/optionchain"
 _EXPIRY_LIST_URL = "https://api.dhan.co/v2/optionchain/expirylist"
@@ -325,7 +327,14 @@ class LiveDhanContractResolver:
         self, timestamp: pd.Timestamp, offset_steps: int, option_type: OptionType
     ) -> Contract:
         """Resolve Wing-N leg via option-chain security_id. Raises StaleQuoteError if spot stale."""
-        atm = self.atm_strike(timestamp)
+        try:
+            atm = self.atm_strike(timestamp)
+        except StaleQuoteError:
+            # Websocket spot stale — fall back to REST option-chain underlying LTP (populated at 09:15)
+            atm = self.chain_atm_strike()
+            if atm is None:
+                raise StaleQuoteError(f"No websocket spot and no chain ATM for {self.symbol}")
+            _log.debug("resolve_atm_offset: %s using chain_atm_strike=%d (websocket spot stale)", self.symbol, atm)
         target_strike = atm + offset_steps * self._strike_step
 
         if self._active_expiry is None:

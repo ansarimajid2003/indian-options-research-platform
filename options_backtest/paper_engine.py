@@ -22,6 +22,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 
 from .broker_sim import ChargesConfig, FillModel
 from .calendar import expiry_on_or_after, lot_size
@@ -36,9 +37,15 @@ _log = logging.getLogger(__name__)
 # Dhan live feed endpoint
 _FEED_URL = "wss://api-feed.dhan.co?version=2&token={token}&clientId={client_id}&authType=2"
 _REQUEST_CODE_FULL = 21
+_REQUEST_CODE_TICKER = 15
+
+# Dhan REST LTP endpoint — fallback for IDX/VIX that may not stream via websocket
+_DHAN_LTP_URL = "https://api.dhan.co/v2/marketfeed/ltp"
+_VIX_REST_POLL_INTERVAL = 30.0
 
 # Binary packet layout (little-endian)
 _TYPE_TICKER = 2
+_TYPE_QUOTE = 4   # 50-byte Quote packet — Dhan may send this for IDX_I instead of Full
 _TYPE_FULL = 8
 _TYPE_DISCONNECT = 50
 
@@ -160,6 +167,49 @@ def _parse_ticker_packet(raw: bytes) -> dict | None:
     ltp = struct.unpack_from("<f", raw, 8)[0]
     ltt = struct.unpack_from("<I", raw, 12)[0]
     return {"security_id": str(security_id), "ltp": float(ltp), "ltt": ltt}
+
+
+def _parse_quote_packet(raw: bytes) -> dict | None:
+    """Parse a Type-4 (Quote, 50B) packet.
+
+    Dhan sends this for IDX_I instruments (indices have no OI/depth, so Full
+    is downgraded to Quote by the server).
+
+    Layout (<BHBIfHIfIIIffff>, little-endian):
+      offset 0:  B  packet_type (4)
+      offset 1:  H  msg_length
+      offset 3:  B  exchange_segment
+      offset 4:  I  security_id
+      offset 8:  f  LTP
+      offset 12: H  LTQ
+      offset 14: I  LTT
+      offset 18: f  avg_price
+      offset 22: I  volume
+      offset 26: I  total_sell_qty
+      offset 30: I  total_buy_qty
+      offset 34: f  open
+      offset 38: f  close
+      offset 42: f  high
+      offset 46: f  low
+    """
+    if len(raw) < 50 or raw[0] != _TYPE_QUOTE:
+        return None
+    security_id = struct.unpack_from("<I", raw, 4)[0]
+    ltp = struct.unpack_from("<f", raw, 8)[0]
+    volume = struct.unpack_from("<I", raw, 22)[0]
+    open_ = struct.unpack_from("<f", raw, 34)[0]
+    close_ = struct.unpack_from("<f", raw, 38)[0]
+    high = struct.unpack_from("<f", raw, 42)[0]
+    low = struct.unpack_from("<f", raw, 46)[0]
+    return {
+        "security_id": str(security_id),
+        "ltp": float(ltp),
+        "volume": int(volume),
+        "open": float(open_),
+        "close": float(close_),
+        "high": float(high),
+        "low": float(low),
+    }
 
 
 def _parse_disconnect_code(raw: bytes) -> int | None:
@@ -348,6 +398,7 @@ class PaperTradingEngine:
         await _sleep_until(_T_CONNECT, self._session_date)
         self._phase = "connecting"
         feed_task = asyncio.create_task(self._feed_loop())
+        vix_rest_task = asyncio.create_task(self._vix_rest_loop())
 
         # 09:10 — check feed connection; mid-session restarts need extra time
         # because the websocket task starts from cold after systemd restarts.
@@ -418,7 +469,7 @@ class PaperTradingEngine:
         await asyncio.to_thread(self._write_eod_snapshot)
 
         self._stop_event.set()
-        await asyncio.gather(feed_task, snapshot_task, return_exceptions=True)
+        await asyncio.gather(feed_task, snapshot_task, vix_rest_task, return_exceptions=True)
         _log.info("paper_engine: session complete")
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -437,6 +488,7 @@ class PaperTradingEngine:
                     self._feed_connected = True
                     _log.info("live_feed: connected")
                     await self._subscribe_instruments(ws, self._core_subscriptions())
+                    await self._subscribe_idx_as_ticker(ws)
                     if self._subscribed_ids:
                         core_keys = {
                             (inst["ExchangeSegment"], str(inst["SecurityId"]))
@@ -481,6 +533,28 @@ class PaperTradingEngine:
             else:
                 _log.warning("live_feed: disconnect code=%s — retryable", code)
                 self._feed_connected = False
+            return
+
+        if ptype == _TYPE_QUOTE:
+            # Dhan downgrades Full→Quote for IDX_I instruments (no OI/depth on indices)
+            parsed = _parse_quote_packet(raw)
+            if parsed is None:
+                return
+            sid = parsed["security_id"]
+            received_at = pd.Timestamp.now(tz="Asia/Kolkata")
+            for resolver in self._resolvers.values():
+                resolver.update_quote(
+                    sid,
+                    ltp=parsed["ltp"],
+                    open_=parsed["open"],
+                    high=parsed["high"],
+                    low=parsed["low"],
+                    volume=parsed["volume"],
+                    received_at=received_at,
+                )
+            spot_sym = _SPOT_SID_TO_SYMBOL.get(sid)
+            if spot_sym:
+                self._update_spot_bar(spot_sym, parsed["ltp"], received_at)
             return
 
         if ptype == _TYPE_FULL:
@@ -553,6 +627,62 @@ class PaperTradingEngine:
         ]
         instruments.append({"ExchangeSegment": _SEG_IDX, "SecurityId": self._vix_security_id})
         return instruments
+
+    async def _subscribe_idx_as_ticker(self, ws) -> None:
+        """Belt-and-suspenders: subscribe IDX_I as Ticker(15) alongside Full(21).
+        Dhan may send Quote(4) or nothing at all for Full on IDX_I instruments —
+        Ticker guarantees at least an LTP tick."""
+        idx_sids = ["13", "27", "442", "51", "25", self._vix_security_id]
+        sub = {
+            "RequestCode": _REQUEST_CODE_TICKER,
+            "InstrumentCount": len(idx_sids),
+            "InstrumentList": [
+                {"ExchangeSegment": _SEG_IDX, "SecurityId": sid}
+                for sid in idx_sids
+            ],
+        }
+        await ws.send(json.dumps(sub))
+        _log.info("live_feed: subscribed IDX_I as Ticker(15) fallback")
+
+    def _fetch_core_ltp_rest(self) -> None:
+        """Fetch core IDX LTPs via REST — fallback when websocket doesn't deliver for IDX_I/VIX."""
+        try:
+            payload = {
+                "IDX_I": [13, 27, 442, 51, 25, int(self._vix_security_id)],
+                "dhanClientId": self._client_id,
+            }
+            headers = {
+                "access-token": self._access_token,
+                "client-id": self._client_id,
+                "Content-Type": "application/json",
+            }
+            resp = requests.post(_DHAN_LTP_URL, json=payload, headers=headers, timeout=8)
+            if resp.status_code != 200:
+                _log.warning("core_ltp_rest: HTTP %d", resp.status_code)
+                return
+            body = resp.json()
+            idx_data = body.get("data", body).get("IDX_I", {}) if isinstance(body, dict) else {}
+            if not idx_data:
+                _log.warning("core_ltp_rest: empty IDX_I in response: %s", str(body)[:200])
+                return
+            now = pd.Timestamp.now(tz="Asia/Kolkata")
+            for sid_str, quote_dict in idx_data.items():
+                if not isinstance(quote_dict, dict):
+                    continue
+                ltp = float(quote_dict.get("last_price", 0) or 0)
+                if ltp <= 0:
+                    continue
+                for resolver in self._resolvers.values():
+                    resolver.update_quote(str(sid_str), ltp=ltp, received_at=now)
+                _log.debug("core_ltp_rest: sid=%s ltp=%.2f", sid_str, ltp)
+        except Exception as exc:
+            _log.warning("core_ltp_rest: fetch failed — %r", exc)
+
+    async def _vix_rest_loop(self) -> None:
+        """Poll core IDX LTPs via REST every 30s — fallback when websocket misses IDX_I/VIX."""
+        while not self._stop_event.is_set():
+            await asyncio.sleep(_VIX_REST_POLL_INTERVAL)
+            await asyncio.to_thread(self._fetch_core_ltp_rest)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Chain fetch + subscriptions
@@ -693,24 +823,33 @@ class PaperTradingEngine:
         for symbol, resolver in self._resolvers.items():
             sym_cfg = self._profile["symbols"][symbol]
 
-            # VIX filters
-            if vix_val is None:
-                self._log_signal("skip", symbol, "vix_stale", vix=None)
-                _log.info("entry: %s SKIP vix_stale", symbol)
-                continue
-
+            # VIX filters — apply per-symbol logic so symbols without a hard VIX gate
+            # can still trade even when VIX is unavailable.
             vix_filter = sym_cfg.get("vix_filter")
-            if vix_filter and "require_gte" in vix_filter:
-                if vix_val < vix_filter["require_gte"]:
-                    self._log_signal("skip", symbol, "vix_below_threshold", vix=vix_val, bucket=vix_bucket)
-                    _log.info("entry: %s SKIP vix_below_threshold vix=%.2f", symbol, vix_val)
-                    continue
+            has_require_gte = bool(vix_filter and vix_filter.get("require_gte") is not None)
 
-            skip_bucket = sym_cfg.get("vix_bucket_skip")
-            if skip_bucket and vix_bucket == skip_bucket:
-                self._log_signal("skip", symbol, "vix_bucket_skip", vix=vix_val, bucket=vix_bucket)
-                _log.info("entry: %s SKIP vix_bucket_skip bucket=%s", symbol, vix_bucket)
-                continue
+            if vix_val is None:
+                if has_require_gte:
+                    # Hard VIX gate (e.g. NIFTY require_gte=13) — must skip without VIX
+                    self._log_signal("skip", symbol, "vix_stale", vix=None)
+                    _log.info("entry: %s SKIP vix_stale (has require_gte=%s)", symbol, vix_filter["require_gte"])
+                    continue
+                # No hard gate — proceed with unknown bucket (won't match any bucket_skip)
+                effective_vix_bucket = "unknown"
+                _log.info("entry: %s vix_unavailable — proceeding with bucket=unknown (no require_gte gate)", symbol)
+            else:
+                effective_vix_bucket = vix_bucket
+                if has_require_gte:
+                    if vix_val < vix_filter["require_gte"]:
+                        self._log_signal("skip", symbol, "vix_below_threshold", vix=vix_val, bucket=effective_vix_bucket)
+                        _log.info("entry: %s SKIP vix_below_threshold vix=%.2f", symbol, vix_val)
+                        continue
+
+                skip_bucket = sym_cfg.get("vix_bucket_skip")
+                if skip_bucket and effective_vix_bucket == skip_bucket:
+                    self._log_signal("skip", symbol, "vix_bucket_skip", vix=vix_val, bucket=effective_vix_bucket)
+                    _log.info("entry: %s SKIP vix_bucket_skip bucket=%s", symbol, effective_vix_bucket)
+                    continue
 
             # DTE filters
             expiry_type = sym_cfg.get("expiry_type", "week")
@@ -724,13 +863,13 @@ class PaperTradingEngine:
             dte = (expiry - self._session_date).days
             min_dte = sym_cfg.get("min_dte", 1)
             if dte < min_dte:
-                self._log_signal("skip", symbol, "dte_below_min", vix=vix_val, dte=dte, bucket=vix_bucket)
+                self._log_signal("skip", symbol, "dte_below_min", vix=vix_val, dte=dte, bucket=effective_vix_bucket)
                 _log.info("entry: %s SKIP dte_below_min dte=%d", symbol, dte)
                 continue
 
             max_dte = sym_cfg.get("max_dte")
             if max_dte is not None and dte > max_dte:
-                self._log_signal("skip", symbol, "dte_above_max", vix=vix_val, dte=dte, bucket=vix_bucket)
+                self._log_signal("skip", symbol, "dte_above_max", vix=vix_val, dte=dte, bucket=effective_vix_bucket)
                 _log.info("entry: %s SKIP dte_above_max dte=%d max=%d", symbol, dte, max_dte)
                 continue
 
@@ -757,7 +896,7 @@ class PaperTradingEngine:
                     break
 
             if leg_fail:
-                self._log_signal("skip", symbol, "leg_resolution_failed", vix=vix_val, dte=dte, bucket=vix_bucket)
+                self._log_signal("skip", symbol, "leg_resolution_failed", vix=vix_val, dte=dte, bucket=effective_vix_bucket)
                 _log.info("entry: %s SKIP leg_resolution_failed — partial entry blocked", symbol)
                 continue
 
@@ -765,7 +904,7 @@ class PaperTradingEngine:
             try:
                 resolver.spot_ltp()
             except StaleQuoteError:
-                self._log_signal("skip", symbol, "spot_stale", vix=vix_val, dte=dte, bucket=vix_bucket)
+                self._log_signal("skip", symbol, "spot_stale", vix=vix_val, dte=dte, bucket=effective_vix_bucket)
                 _log.info("entry: %s SKIP spot_stale", symbol)
                 continue
 
@@ -809,7 +948,7 @@ class PaperTradingEngine:
                 entry_charges += fill_dict["charges"]
 
             if fill_fail:
-                self._log_signal("skip", symbol, "insufficient_depth", vix=vix_val, dte=dte, bucket=vix_bucket)
+                self._log_signal("skip", symbol, "insufficient_depth", vix=vix_val, dte=dte, bucket=effective_vix_bucket)
                 _log.info("entry: %s SKIP insufficient_depth", symbol)
                 continue
 
@@ -840,7 +979,7 @@ class PaperTradingEngine:
             )
             self._open_positions.append(pos)
             self._write_checkpoint()
-            self._write_signal_record("entry", symbol, vix=vix_val, dte=dte, bucket=vix_bucket)
+            self._write_signal_record("entry", symbol, vix=vix_val, dte=dte, bucket=effective_vix_bucket)
             _log.info("entry: %s ENTERED expiry=%s dte=%d credit=%.2f legs=%d", symbol, expiry, dte, entry_credit, len(legs))
 
     def _get_fill(
