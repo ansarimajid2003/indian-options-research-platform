@@ -257,6 +257,8 @@ class HealthMonitor:
         self._alert_jsonl_write_times: dict[str, float] = {}
         self._consecutive_bad: dict[str, int] = {"quote_freshness": 0, "depth_readiness": 0}
         self._last_wedge_restart_mono: float = 0.0
+        self._service_became_active_mono: float = 0.0
+        self._service_was_active: bool = False
         self._log_scan_offset = 0
         self._backend_open_sent_for: date | None = None
         self._eod_sent_for: date | None = None
@@ -435,6 +437,12 @@ class HealthMonitor:
             )
             systemd_active = result.returncode == 0
 
+        # Track rising edge: service just became active (restart / fresh start)
+        now_mono = _time.monotonic()
+        if systemd_active and not self._service_was_active:
+            self._service_became_active_mono = now_mono
+        self._service_was_active = systemd_active
+
         snapshot_active = False
         health_path = self._live_root / "snapshots" / "latest_process_health.json"
         if health_path.exists():
@@ -454,6 +462,13 @@ class HealthMonitor:
             return True
 
         if systemd_active and not snapshot_active:
+            # Startup grace: new process hasn't written its first snapshot yet.
+            # Accounts for RestartSec=45 + ExecStartPre clock-sync + engine init.
+            _STARTUP_GRACE = 90.0
+            if now_mono - self._service_became_active_mono < _STARTUP_GRACE:
+                _log.debug("process wedge suppressed — service started %.0fs ago (grace %ds)", now_mono - self._service_became_active_mono, _STARTUP_GRACE)
+                return None
+
             # Service alive in systemd but snapshot loop has stopped — engine is wedged
             await self._clear_alert("process", "runner_not_active")
             await self._alert(
@@ -465,7 +480,6 @@ class HealthMonitor:
             # Auto-restart: kill the wedged process so systemd can respawn it cleanly.
             # 300s cooldown prevents restart storms; only runs on Linux where systemctl exists.
             _WEDGE_RESTART_COOLDOWN = 300.0
-            now_mono = _time.monotonic()
             if (
                 sys.platform != "win32"
                 and shutil.which("systemctl")
@@ -1028,11 +1042,13 @@ class HealthMonitor:
         message = _scrub_message(message)
         key = f"{severity}:{component}:{reason}"
         self._alert_counts[severity] = self._alert_counts.get(severity, 0) + 1
+        existing = self._active_alerts.get(key, {})
         self._active_alerts[key] = {
             "severity": severity,
             "component": component,
             "reason": reason,
             "message": message,
+            "first_seen": existing.get("first_seen", _now_ist().isoformat()),
             "last_seen": _now_ist().isoformat(),
         }
         # Rate-limit JSONL writes — first occurrence then every 10 min per alert key
@@ -1075,7 +1091,18 @@ class HealthMonitor:
             self._alerts_path.parent.mkdir(parents=True, exist_ok=True)
             with self._alerts_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(resolved) + "\n")
-            await self._send_telegram(f"[RECOVERED] {component}/{reason}: {record['message']}", severity="info")
+            # Only send RECOVERED telegram if the alert was active long enough to have
+            # generated a real alert telegram in the first place (> 5 min). Startup
+            # bounces and transient glitches (<5 min) are silently resolved in the JSONL.
+            _MIN_ALERT_DURATION_FOR_RECOVERY = 300.0
+            first_seen_str = record.get("first_seen")
+            alert_duration = 0.0
+            if first_seen_str:
+                first_seen_dt = _parse_ts(first_seen_str)
+                if first_seen_dt:
+                    alert_duration = (_now_ist() - first_seen_dt).total_seconds()
+            if alert_duration >= _MIN_ALERT_DURATION_FOR_RECOVERY:
+                await self._send_telegram(f"[RECOVERED] {component}/{reason}: {record['message']}", severity="info")
 
     async def _send_telegram(self, text: str, severity: str = "info") -> None:
         if not self._tg_token or not self._tg_chat or self._session is None:
