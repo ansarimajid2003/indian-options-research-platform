@@ -41,6 +41,11 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from options_backtest.calendar import is_trading_day as _is_trading_day
+from options_backtest.clock_sync import (
+    clock_sync_status as _clock_sync_status,
+    parse_timesync_offset as _parse_timesync_offset,
+    remediate_clock_sync as _remediate_clock_sync,
+)
 from scripts.live.renew_token import renew_token as _do_renew_token, write_token_file as _write_token_file
 
 _DEFAULT_TOKEN_FILE = _repo_root / ".env.live"
@@ -72,6 +77,7 @@ _DEPTH_READY_MIN_PCT = 95.0
 _RAW_FLUSH_MAX_AGE_SECONDS = 90.0
 _PARQUET_FLUSH_MAX_AGE_SECONDS = 180.0
 _CLOCK_BOOT_GRACE_SECONDS = 300.0
+_CLOCK_REMEDIATION_INTERVAL_SECONDS = 1800.0
 
 _ALERT_THROTTLE: dict[tuple[str, str, str], float] = {}
 
@@ -135,14 +141,6 @@ def _scrub_message(text: str) -> str:
     return text
 
 
-def _parse_timesync_offset(val: str) -> float | None:
-    match = re.match(r"^([+-]?\d+\.?\d*)(s|ms|us|ns)$", val.strip())
-    if not match:
-        return None
-    num, unit = float(match.group(1)), match.group(2)
-    return num * {"s": 1.0, "ms": 1e-3, "us": 1e-6, "ns": 1e-9}[unit]
-
-
 def _jwt_expiry(token: str) -> datetime | None:
     try:
         parts = token.split(".")
@@ -164,7 +162,6 @@ def _write_atomic_json(path: Path, data: dict) -> None:
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=str)
         f.flush()
-        os.fsync(f.fileno())
     tmp.replace(path)
 
 
@@ -174,7 +171,6 @@ def _write_atomic_text(path: Path, text: str) -> None:
     with tmp.open("w", encoding="utf-8") as f:
         f.write(text)
         f.flush()
-        os.fsync(f.fileno())
     tmp.replace(path)
 
 
@@ -260,6 +256,7 @@ class HealthMonitor:
         self._active_alerts: dict[str, dict] = {}
         self._alert_jsonl_write_times: dict[str, float] = {}
         self._consecutive_bad: dict[str, int] = {"quote_freshness": 0, "depth_readiness": 0}
+        self._last_wedge_restart_mono: float = 0.0
         self._log_scan_offset = 0
         self._backend_open_sent_for: date | None = None
         self._eod_sent_for: date | None = None
@@ -270,6 +267,7 @@ class HealthMonitor:
         self._token_renewed_for: date | None = None
         self._token_renewal_attempts_today: int = 0
         self._token_renewal_last_attempt_mono: float | None = None
+        self._last_clock_remediation_mono: float = 0.0
 
     async def run(self) -> None:
         self._ensure_dirs()
@@ -464,6 +462,24 @@ class HealthMonitor:
                 "process_wedged",
                 "live-paper.service is systemd-active but process_health.json is stale (>30s) — engine wedged",
             )
+            # Auto-restart: kill the wedged process so systemd can respawn it cleanly.
+            # 300s cooldown prevents restart storms; only runs on Linux where systemctl exists.
+            _WEDGE_RESTART_COOLDOWN = 300.0
+            now_mono = _time.monotonic()
+            if (
+                sys.platform != "win32"
+                and shutil.which("systemctl")
+                and now_mono - self._last_wedge_restart_mono > _WEDGE_RESTART_COOLDOWN
+            ):
+                result = subprocess.run(
+                    ["systemctl", "restart", "live-paper.service"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                self._last_wedge_restart_mono = now_mono
+                _log.warning("process_wedged: auto-restarted live-paper.service (rc=%d)", result.returncode)
+                await self._send_telegram(
+                    "[AUTO-RESTART] live-paper.service restarted due to wedged engine", severity="warning"
+                )
             return False
 
         if snapshot_active and not systemd_active:
@@ -624,10 +640,15 @@ class HealthMonitor:
             return False
         pct = float(data.get("ready_pct", data.get("depth_ready_pct", 0.0)))
         by_symbol = data.get("by_symbol", {})
+        sym_configs = self._profile.get("symbols", {})
+        depth_cfg = self._profile.get("depth_collection", {})
+        aggregate_threshold = float(depth_cfg.get("depth_ready_threshold_pct", _DEPTH_READY_MIN_PCT))
+        all_sym_ok = True
         for symbol, rec in by_symbol.items():
             sym_pct = float(rec.get("ready_pct", 0.0))
             reason = f"depth_ready_low_{str(symbol).lower()}"
-            if sym_pct < _DEPTH_READY_MIN_PCT:
+            sym_threshold = float(sym_configs.get(symbol, {}).get("depth_ready_threshold_pct", _DEPTH_READY_MIN_PCT))
+            if sym_pct < sym_threshold:
                 await self._alert(
                     "critical",
                     "depth_readiness",
@@ -638,16 +659,20 @@ class HealthMonitor:
                         f"tracked {int(rec.get('tracked', 0))})"
                     ),
                 )
+                all_sym_ok = False
             else:
                 await self._clear_alert("depth_readiness", reason)
-        if pct < _DEPTH_READY_MIN_PCT:
+        if pct < aggregate_threshold:
             self._consecutive_bad["depth_readiness"] += 1
             if self._consecutive_bad["depth_readiness"] >= 2:
-                await self._alert("critical", "depth_readiness", "depth_ready_low", f"depth ready {pct:.1f}% (< 95%) for 2 consecutive checks")
+                await self._alert(
+                    "critical", "depth_readiness", "depth_ready_low",
+                    f"depth ready {pct:.1f}% (< {aggregate_threshold:.0f}%) for 2 consecutive checks",
+                )
             return False
         self._consecutive_bad["depth_readiness"] = 0
         await self._clear_alert("depth_readiness", "depth_ready_low")
-        return True
+        return all_sym_ok
 
     async def _check_wd_mount(self) -> bool:
         try:
@@ -672,37 +697,33 @@ class HealthMonitor:
             return False
 
     async def _check_clock_sync(self) -> bool | None:
-        try:
-            result = subprocess.run(["timedatectl", "timesync-status"], capture_output=True, text=True, timeout=5)
-            offset_sec: float | None = None
-            for line in result.stdout.splitlines():
-                if line.strip().startswith("Offset:"):
-                    offset_sec = _parse_timesync_offset(line.split(":", 1)[1].strip())
-                    break
-            if offset_sec is not None:
-                if abs(offset_sec) > 2.0:
-                    await self._alert("critical", "clock", "clock_drift_high", f"clock drift {offset_sec:+.3f}s exceeds 2s")
-                    return False
+        status = _clock_sync_status(max_offset_seconds=2.0)
+        if status.healthy is True:
+            await self._clear_alert("clock", "clock_drift_high")
+            await self._clear_alert("clock", "clock_not_synced")
+            return True
+        if status.healthy is None:
+            _log.debug("clock sync check inconclusive: %s", status.message)
+            return None
+
+        uptime = _boot_uptime_seconds()
+        if status.reason == "clock_not_synced" and uptime is not None and uptime < _CLOCK_BOOT_GRACE_SECONDS:
+            _log.info("clock sync still settling after boot: uptime=%.0fs", uptime)
+            return None
+
+        now_mono = _time.monotonic()
+        if now_mono - self._last_clock_remediation_mono >= _CLOCK_REMEDIATION_INTERVAL_SECONDS:
+            self._last_clock_remediation_mono = now_mono
+            _log.warning("clock unhealthy (%s); restarting systemd-timesyncd", status.message)
+            status = await asyncio.to_thread(_remediate_clock_sync, 2.0, 45.0)
+            if status.healthy is True:
+                _log.info("clock remediation succeeded: %s", status.message)
                 await self._clear_alert("clock", "clock_drift_high")
                 await self._clear_alert("clock", "clock_not_synced")
                 return True
 
-            result = subprocess.run(["timedatectl", "show"], capture_output=True, text=True, timeout=5)
-            synced = any(line.startswith("NTPSynchronized=yes") for line in result.stdout.splitlines())
-            if not synced:
-                uptime = _boot_uptime_seconds()
-                if uptime is not None and uptime < _CLOCK_BOOT_GRACE_SECONDS:
-                    _log.info("clock sync still settling after boot: uptime=%.0fs", uptime)
-                    return None
-                await self._alert("critical", "clock", "clock_not_synced", "timedatectl reports NTPSynchronized=no")
-                return False
-            await self._clear_alert("clock", "clock_not_synced")
-            return True
-        except FileNotFoundError:
-            return None
-        except Exception as exc:
-            _log.debug("clock sync check failed: %r", exc)
-            return None
+        await self._alert("critical", "clock", status.reason, status.message)
+        return False
 
     async def _check_raw_packet_flush(self) -> bool | None:
         if not _is_feed_active():

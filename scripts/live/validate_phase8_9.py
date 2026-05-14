@@ -61,6 +61,8 @@ CLASSIFIED_SKIP_REASONS = {
     "spot_stale",
     "insufficient_depth",
     "partial_entry_blocked",
+    "clock_drift_high",
+    "clock_not_synced",
 }
 
 

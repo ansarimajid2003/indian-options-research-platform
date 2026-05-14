@@ -11,7 +11,8 @@
   "depth_collection": {
     "symbols": ["NIFTY", "FINNIFTY", "MIDCPNIFTY"],
     "atm_offset_range": 8,
-    "max_depth_connections": 3
+    "max_depth_connections": 3,
+    "depth_ready_threshold_pct": 70.0
   },
   "global": {
     "entry_time": "09:20",
@@ -49,7 +50,8 @@
       "lots": 1,
       "depth_source": "dhan_20depth",
       "dhan_segment": "IDX_I",
-      "dhan_scrip_id": 27
+      "dhan_scrip_id": 27,
+      "depth_ready_threshold_pct": 60.0
     },
     "MIDCPNIFTY": {
       "trade": true,

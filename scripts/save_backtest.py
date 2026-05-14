@@ -6,11 +6,16 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from options_backtest.dhan_loader import DhanBacktestEngine
 from options_backtest.schemas import BacktestConfig
@@ -238,7 +243,11 @@ def run_from_config(config_path: Path, output_root: Path, run_id_override: str |
         "source_config": cfg,
     }
 
-    paths = write_canonical_run(output_root, run_id, summary, result.trade_ledger, manifest, decisions, overwrite)
+    ledger = result.trade_ledger.copy()
+    if "symbol" not in ledger.columns:
+        ledger.insert(0, "symbol", backtest_config.symbol)
+
+    paths = write_canonical_run(output_root, run_id, summary, ledger, manifest, decisions, overwrite)
     if decisions_path and decisions is None:
         shutil.copyfile(decisions_path, output_root / f"{run_id}_decisions.csv")
     return paths

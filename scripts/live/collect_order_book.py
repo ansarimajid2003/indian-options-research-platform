@@ -323,7 +323,6 @@ def _write_atomic_json(path: Path, data: dict) -> None:
     with tmp.open("w", encoding="utf-8") as f:
         f.write(json.dumps(data, indent=2, default=str))
         f.flush()
-        os.fsync(f.fileno())
     tmp.replace(path)
 
 

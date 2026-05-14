@@ -726,7 +726,7 @@ Checks:
 | Depth readiness | less than 95% ready channels for 2 consecutive checks after 09:10 | critical |
 | WD mount | `/media/WD-Storage` mounted and writable | critical |
 | WD free space | free space >= 20 GB intraday, >= 100 GB pre-run | critical/warning |
-| Clock sync | `timedatectl` synchronized and drift <= 2 seconds | critical |
+| Clock sync | `timedatectl` synchronized and drift <= 2 seconds; health monitor restarts `systemd-timesyncd` on persistent failure | critical |
 | Public IP | `curl -4 https://api.ipify.org` matches expected whitelisted IP | critical before start, warning intraday |
 | Token expiry | decoded token expiry is after planned EOD plus buffer | critical before start |
 | Error log scan | new unclassified error/traceback lines in live log | warning |
@@ -998,7 +998,7 @@ state and fires a critical Telegram alert.
 | Exit quote stale at 15:20 | Wait for next fresh quote until 15:25 |
 | Exit still stale at 15:25 | Use last executable quote and flag `forced_stale_exit=true` |
 | Websocket reconnect during open position | Continue monitoring; fill only when all legs are fresh |
-| Computer clock drift > 2 seconds | Abort entries until clock is corrected |
+| Computer clock drift > 2 seconds | Abort entries until clock is corrected; `live-paper.service` runs `scripts/live/clock_sync.py --remediate --wait --timeout 180 --max-offset 2.0` before startup, and the paper engine skips all entries with `clock_drift_high` / `clock_not_synced` if the host regresses before 09:20 |
 | WD free space < 20 GB during session | Stop raw collection after flush, keep paper engine running, flag data-quality failure |
 | Health monitor not running by 09:00 | Abort live paper start until monitor is restored |
 | Telegram alert test fails before 09:00 | Abort live paper start unless explicitly waived and logged |
@@ -1666,6 +1666,11 @@ Validation artifact: `reports/backtests/options/monitoring/20260511_phase5_healt
 - [x] `systemctl start health-monitor.service` → confirm `systemctl status` shows active
 - [x] Test: `systemctl kill health-monitor.service` → verify it restarts within 10 s
 - [x] Test: `systemctl kill live-paper.service` → verify it restarts within 45 s
+
+- [x] Install `/etc/systemd/timesyncd.conf.d/zz-live-paper.conf` from
+  `scripts/live/systemd/zz-live-paper-timesyncd.conf`. This overrides stale
+  ZimaOS drop-ins that set 1-day/4-week polling; live-paper requires
+  64-1024 second polling and restart-on-failure remediation.
 
 Validation artifact: `reports/backtests/options/monitoring/20260511_phase6_systemd_validation.md`.
 

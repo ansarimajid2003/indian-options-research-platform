@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import base64
+import subprocess
 import struct
 import unittest
 from datetime import date, datetime, time
@@ -14,6 +15,7 @@ import pandas as pd
 
 from options_backtest.depth_cache import DepthCache, DepthLevel
 from options_backtest.live_resolver import LiveDhanContractResolver
+from options_backtest.clock_sync import clock_sync_status
 from options_backtest.paper_engine import PaperTradingEngine
 from options_backtest.paper_engine import _FEED_URL
 from scripts.live.collect_order_book import (
@@ -170,6 +172,27 @@ class LivePaperTests(unittest.TestCase):
         exp = _jwt_expiry(token)
         self.assertIsNotNone(exp)
         self.assertEqual(exp, datetime.fromtimestamp(1778497200, tz=ZoneInfo("Asia/Kolkata")))
+
+    def test_clock_sync_status_flags_high_drift(self) -> None:
+        def runner(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+            if cmd == ["timedatectl", "timesync-status"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="       Offset: +2246ms\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout="")
+
+        status = clock_sync_status(max_offset_seconds=2.0, runner=runner)
+        self.assertFalse(status.healthy)
+        self.assertEqual(status.reason, "clock_drift_high")
+        self.assertAlmostEqual(status.offset_seconds or 0.0, 2.246)
+
+    def test_clock_sync_status_accepts_small_drift(self) -> None:
+        def runner(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+            if cmd == ["timedatectl", "timesync-status"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="       Offset: -3.5ms\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout="")
+
+        status = clock_sync_status(max_offset_seconds=2.0, runner=runner)
+        self.assertTrue(status.healthy)
+        self.assertEqual(status.reason, "clock_synced")
 
     def test_depth_cache_snapshot_writer_exports_readiness(self) -> None:
         root = Path("tmp_live_tests") / "depth_snapshot_case"

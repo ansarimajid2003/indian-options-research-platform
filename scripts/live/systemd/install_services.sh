@@ -57,6 +57,12 @@ chmod 644 /etc/systemd/system/health-monitor.service
 chmod 644 /etc/systemd/system/live-paper.service
 echo "Systemd units: installed"
 
+mkdir -p /etc/systemd/timesyncd.conf.d
+cp "$SERVICE_DIR/zz-live-paper-timesyncd.conf" /etc/systemd/timesyncd.conf.d/zz-live-paper.conf
+chmod 644 /etc/systemd/timesyncd.conf.d/zz-live-paper.conf
+systemctl restart systemd-timesyncd.service
+echo "Timesyncd: installed live-paper polling override"
+
 # ── Install cron ───────────────────────────────────────────────────────────────
 cp "$SERVICE_DIR/dhan-token-renewal" /etc/cron.d/dhan-token-renewal
 chmod 644 /etc/cron.d/dhan-token-renewal

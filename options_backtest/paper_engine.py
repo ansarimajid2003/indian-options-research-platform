@@ -26,6 +26,7 @@ import requests
 
 from .broker_sim import ChargesConfig, FillModel
 from .calendar import expiry_on_or_after, lot_size
+from .clock_sync import clock_sync_status
 from .depth_cache import DepthCache
 from .live_resolver import LiveDhanContractResolver, StaleQuoteError
 from .schemas import Contract, OptionType, Side
@@ -99,12 +100,13 @@ def _ts_str() -> str:
     return _now_ist().isoformat()
 
 
-def _write_atomic(path: Path, data: dict) -> None:
+def _write_atomic(path: Path, data: dict, sync: bool = True) -> None:
     tmp = path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         f.write(json.dumps(data, indent=2, default=str))
         f.flush()
-        os.fsync(f.fileno())
+        if sync:
+            os.fsync(f.fileno())
     tmp.replace(path)
 
 
@@ -441,6 +443,8 @@ class PaperTradingEngine:
             _log.info("paper_engine: resumed from checkpoint — skipping entry phase")
         elif _late_restart:
             _log.info("paper_engine: mid-session restart past entry window — skipping entry, fetching chains for option chain snapshot")
+        elif not self._entry_clock_is_healthy():
+            _log.error("paper_engine: clock unhealthy at entry — skipping all entries")
         else:
             await self._enter_all_symbols()
 
@@ -800,6 +804,13 @@ class PaperTradingEngine:
                 except (StaleQuoteError, KeyError) as exc:
                     _log.warning("resolve_check: %s %s FAILED — %r", symbol, role, exc)
 
+    def _entry_clock_is_healthy(self) -> bool:
+        status = clock_sync_status(max_offset_seconds=2.0)
+        if status.healthy is not False:
+            return True
+        self._log_signal("skip", "ALL", status.reason)
+        return False
+
     # ──────────────────────────────────────────────────────────────────────────
     # Entry
     # ──────────────────────────────────────────────────────────────────────────
@@ -978,7 +989,7 @@ class PaperTradingEngine:
                 entry_charges=entry_charges,
             )
             self._open_positions.append(pos)
-            self._write_checkpoint()
+            await asyncio.to_thread(self._write_checkpoint)
             self._write_signal_record("entry", symbol, vix=vix_val, dte=dte, bucket=effective_vix_bucket)
             _log.info("entry: %s ENTERED expiry=%s dte=%d credit=%.2f legs=%d", symbol, expiry, dte, entry_credit, len(legs))
 
@@ -1145,7 +1156,7 @@ class PaperTradingEngine:
             _log.info("exit: %s reason=%s net_pnl=%.2f", pos.symbol, reason, trade_dict.get("net_pnl", 0))
 
         self._open_positions = still_open
-        self._write_checkpoint()
+        await asyncio.to_thread(self._write_checkpoint)
         self._flush_trades()
 
     def _stale_fill(
@@ -1275,7 +1286,7 @@ class PaperTradingEngine:
             "core_quotes": self._core_quote_state(quotes),
             "chain_status": dict(self._chain_status),
         }
-        _write_atomic(self._snapshot_dir / "latest_feed_state.json", state)
+        _write_atomic(self._snapshot_dir / "latest_feed_state.json", state, sync=False)
 
         # Per-security quotes: merge last_tob + resolver quote snapshots + chain greeks
         for sid, tob in self._last_tob.items():
@@ -1288,7 +1299,7 @@ class PaperTradingEngine:
                 quotes[sid]["delta"] = (meta.get("greeks") or {}).get("delta")
                 quotes[sid]["theta"] = (meta.get("greeks") or {}).get("theta")
         if quotes:
-            _write_atomic(self._snapshot_dir / "latest_quotes.json", {"written_at": _ts_str(), "quotes": quotes})
+            _write_atomic(self._snapshot_dir / "latest_quotes.json", {"written_at": _ts_str(), "quotes": quotes}, sync=False)
 
     def _merged_quote_snapshot(self) -> dict[str, dict]:
         quotes: dict[str, dict] = {}
@@ -1372,7 +1383,7 @@ class PaperTradingEngine:
                 "written_at": _ts_str(),
                 "session_date": self._session_date.isoformat(),
                 "bars": bars_out,
-            })
+            }, sync=False)
 
     def _write_eod_snapshot(self) -> None:
         """Write latest_eod_snapshot.json at 15:31 — preserves true closing quotes."""
@@ -1407,7 +1418,7 @@ class PaperTradingEngine:
             for sid, info in resolver.instrument_map().items():
                 imap[sid] = {"symbol": symbol, **info}
         if imap:
-            _write_atomic(self._snapshot_dir / "latest_instrument_map.json", {"written_at": _ts_str(), "instruments": imap})
+            _write_atomic(self._snapshot_dir / "latest_instrument_map.json", {"written_at": _ts_str(), "instruments": imap}, sync=False)
 
     def _write_process_health(self) -> None:
         health = {
@@ -1421,7 +1432,7 @@ class PaperTradingEngine:
             "crash_gap_end": self._crash_gap_end,
             "gap_minutes": self._crash_gap_minutes,
         }
-        _write_atomic(self._snapshot_dir / "latest_process_health.json", health)
+        _write_atomic(self._snapshot_dir / "latest_process_health.json", health, sync=False)
 
     def _is_quote_fresh(self, sid: str) -> bool:
         # Check depth cache first (NSE symbols), then last_tob fallback (SENSEX)
