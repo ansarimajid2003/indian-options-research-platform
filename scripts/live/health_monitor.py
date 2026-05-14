@@ -477,10 +477,28 @@ class HealthMonitor:
                 "process_wedged",
                 "live-paper.service is systemd-active but process_health.json is stale (>30s) — engine wedged",
             )
+            # Restart cap: past entry window with no open positions — restarting
+            # just triggers chain fetches, 429s, and depth warm-up for no benefit.
+            _ENTRY_GRACE_MIN = 5
+            entry_time_str = self._profile.get("global", {}).get("entry_time", "09:20")
+            _eh, _em = map(int, entry_time_str.split(":"))
+            past_entry = _now_ist().time() > time(_eh, min(_em + _ENTRY_GRACE_MIN, 59))
+            open_pos_count = 0
+            if past_entry:
+                pos_path = self._live_root / "snapshots" / "latest_open_positions.json"
+                if pos_path.exists():
+                    try:
+                        open_pos_count = len(json.loads(pos_path.read_text(encoding="utf-8")).get("open_positions", []))
+                    except Exception:
+                        pass
+            post_entry_no_pos = past_entry and open_pos_count == 0
+
             # Auto-restart: kill the wedged process so systemd can respawn it cleanly.
             # 300s cooldown prevents restart storms; only runs on Linux where systemctl exists.
             _WEDGE_RESTART_COOLDOWN = 300.0
-            if (
+            if post_entry_no_pos:
+                _log.info("process_wedged: past entry window, no open positions — suppressing auto-restart")
+            elif (
                 sys.platform != "win32"
                 and shutil.which("systemctl")
                 and now_mono - self._last_wedge_restart_mono > _WEDGE_RESTART_COOLDOWN

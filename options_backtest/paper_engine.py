@@ -396,6 +396,7 @@ class PaperTradingEngine:
 
         self._phase = "waiting_preopen"
         snapshot_task = asyncio.create_task(self._snapshot_loop())
+        health_task = asyncio.create_task(self._process_health_loop())
 
         await _sleep_until(_T_CONNECT, self._session_date)
         self._phase = "connecting"
@@ -419,7 +420,7 @@ class PaperTradingEngine:
             self._log_signal("skip", "ALL", "feed_not_connected")
             _log.error("paper_engine: feed not connected after grace period — aborting day")
             self._stop_event.set()
-            await asyncio.gather(feed_task, snapshot_task, return_exceptions=True)
+            await asyncio.gather(feed_task, snapshot_task, health_task, return_exceptions=True)
             return
 
         # 09:15 — fetch option chains and subscribe
@@ -473,7 +474,7 @@ class PaperTradingEngine:
         await asyncio.to_thread(self._write_eod_snapshot)
 
         self._stop_event.set()
-        await asyncio.gather(feed_task, snapshot_task, vix_rest_task, return_exceptions=True)
+        await asyncio.gather(feed_task, snapshot_task, health_task, vix_rest_task, return_exceptions=True)
         _log.info("paper_engine: session complete")
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -1263,11 +1264,26 @@ class PaperTradingEngine:
     async def _snapshot_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                await asyncio.to_thread(self._write_feed_state)
-                await asyncio.to_thread(self._write_spot_bars)
-                await asyncio.to_thread(self._write_process_health)
+                await asyncio.gather(
+                    asyncio.to_thread(self._write_feed_state),
+                    asyncio.to_thread(self._write_spot_bars),
+                    return_exceptions=True,
+                )
             except Exception as exc:
                 _log.warning("snapshot_loop: error — %r", exc)
+            await asyncio.sleep(_SNAPSHOT_INTERVAL)
+
+    async def _process_health_loop(self) -> None:
+        """Write process_health.json on its own cadence, independent of slower snapshot writes.
+
+        Keeping this isolated ensures the wedge watchdog stays fresh even when
+        _write_feed_state or _write_spot_bars block on WD drive I/O stalls.
+        """
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.to_thread(self._write_process_health)
+            except Exception as exc:
+                _log.warning("process_health_loop: error — %r", exc)
             await asyncio.sleep(_SNAPSHOT_INTERVAL)
 
     def _write_feed_state(self) -> None:
