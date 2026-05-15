@@ -32,6 +32,7 @@ if str(_repo_root) not in sys.path:
 
 from options_backtest.calendar import is_trading_day
 from options_backtest.depth_cache import DepthCache
+from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
 from options_backtest.paper_engine import PaperTradingEngine
 from scripts.live.collect_order_book import collect_order_book
 from scripts.live.paper_json_to_ledger import write_paper_reports
@@ -67,7 +68,7 @@ def _load_profile(profile_name: str) -> dict:
 
 def _load_checkpoint(live_root: Path, today: date) -> dict | None:
     """Return checkpoint dict if today's file has open positions, else None."""
-    ckpt_path = live_root / "snapshots" / "latest_open_positions.json"
+    ckpt_path = resolve_durable_dir(live_root) / "latest_open_positions.json"
     if not ckpt_path.exists():
         return None
     try:
@@ -83,8 +84,8 @@ def _load_checkpoint(live_root: Path, today: date) -> dict | None:
 
 
 def _check_health_monitor_running(live_root: Path) -> bool:
-    """Best-effort check: did health monitor write a recent health file?"""
-    health_path = live_root / "snapshots" / "latest_alert_state.json"
+    """Best-effort check: did health monitor write a recent alert-state file?"""
+    health_path = resolve_snapshot_dir(live_root) / "latest_alert_state.json"
     return health_path.exists()
 
 

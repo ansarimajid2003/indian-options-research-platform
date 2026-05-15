@@ -40,6 +40,7 @@ import websockets
 # Adjust import path when running as module vs standalone
 try:
     from options_backtest.depth_cache import DepthCache, DepthLevel
+    from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
     from options_backtest.live_resolver import LiveDhanContractResolver
     from options_backtest.schemas import OptionType
     from options_backtest.calendar import get_instrument_spec, expiry_on_or_after
@@ -47,6 +48,7 @@ except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).parents[2]))
     from options_backtest.depth_cache import DepthCache, DepthLevel
+    from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
     from options_backtest.live_resolver import LiveDhanContractResolver
     from options_backtest.schemas import OptionType
     from options_backtest.calendar import get_instrument_spec, expiry_on_or_after
@@ -381,7 +383,7 @@ def _write_depth_cache_snapshot(
         "by_symbol": by_symbol,
         "tob": tob_rows,
     }
-    _write_atomic_json(live_root / "snapshots" / "latest_depth_cache.json", payload)
+    _write_atomic_json(resolve_snapshot_dir(live_root) / "latest_depth_cache.json", payload)
 
 
 def _write_collector_state(
@@ -397,12 +399,12 @@ def _write_collector_state(
         "status": status,
         "configured_security_ids": len(security_ids),
     }
-    _write_atomic_json(live_root / "snapshots" / "latest_depth_collector_state.json", payload)
+    _write_atomic_json(resolve_durable_dir(live_root) / "latest_depth_collector_state.json", payload)
 
 
 def _write_restart_gap_if_needed(live_root: Path, date_str: str) -> bool:
     """Record a restart gap if the previous collector died while marked running."""
-    state_path = live_root / "snapshots" / "latest_depth_collector_state.json"
+    state_path = resolve_durable_dir(live_root) / "latest_depth_collector_state.json"
     if not state_path.exists():
         return False
     try:

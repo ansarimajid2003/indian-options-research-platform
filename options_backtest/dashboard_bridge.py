@@ -28,6 +28,7 @@ from typing import Any
 import pandas as pd
 
 from .calendar import is_trading_day as _is_trading_day
+from .live_paths import resolve_durable_dir, resolve_snapshot_dir
 
 _REPO_ROOT = Path(__file__).parents[1]
 _DATA_ROOT = Path(os.environ.get("MARKET_DATA_ROOT", _REPO_ROOT / "data"))
@@ -233,6 +234,8 @@ class DashboardBridge:
 
     def __init__(self, live_root: Path) -> None:
         self._root = live_root
+        self._snapshot_dir = resolve_snapshot_dir(live_root)
+        self._durable_dir = resolve_durable_dir(live_root)
         # {cache_key: (expiry_monotonic, value)}
         self._cache: dict[str, tuple[float, Any]] = {}
 
@@ -271,8 +274,17 @@ class DashboardBridge:
     def _scrub(text: str) -> str:
         return _TOKEN_RE.sub("[REDACTED]", str(text))
 
+    # Files that must survive reboot — read from WD live_root/snapshots.
+    _DURABLE_SNAPS = frozenset({
+        "latest_open_positions.json",
+        "latest_eod_snapshot.json",
+        "latest_depth_collector_state.json",
+    })
+
     def _snap(self, name: str) -> Path:
-        return self._root / "snapshots" / name
+        if name in self._DURABLE_SNAPS:
+            return self._durable_dir / name
+        return self._snapshot_dir / name
 
     # ── Session status ───────────────────────────────────────────────────────
 

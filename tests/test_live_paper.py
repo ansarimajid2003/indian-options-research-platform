@@ -403,5 +403,301 @@ class LivePaperTests(unittest.TestCase):
         self.assertEqual(state["full_readiness_uptime_pct"], 0.0)
 
 
+# ── Snapshot directory routing (IM_SNAPSHOT_DIR) ──────────────────────────────
+
+
+class LivePathsTests(unittest.TestCase):
+    """Verify tmpfs/durable snapshot routing fixes WD-fsync false-positives."""
+
+    def setUp(self) -> None:
+        import os
+        self._old_env = os.environ.pop("IM_SNAPSHOT_DIR", None)
+
+    def tearDown(self) -> None:
+        import os
+        if self._old_env is None:
+            os.environ.pop("IM_SNAPSHOT_DIR", None)
+        else:
+            os.environ["IM_SNAPSHOT_DIR"] = self._old_env
+
+    def test_default_resolver_returns_live_root_snapshots(self) -> None:
+        from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
+        root = Path("tmp_live_tests") / "live_paths_default"
+        self.assertEqual(resolve_snapshot_dir(root), root / "snapshots")
+        self.assertEqual(resolve_durable_dir(root), root / "snapshots")
+
+    def test_env_override_routes_liveness_but_not_durable(self) -> None:
+        import os
+        from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
+        root = Path("tmp_live_tests") / "live_paths_override"
+        override = Path("tmp_live_tests") / "im_snapshots_tmpfs"
+        os.environ["IM_SNAPSHOT_DIR"] = str(override)
+        self.assertEqual(resolve_snapshot_dir(root), override)
+        # durable_dir must remain on the configured live_root regardless of env.
+        self.assertEqual(resolve_durable_dir(root), root / "snapshots")
+
+    def test_paper_engine_routes_durable_checkpoint_separately(self) -> None:
+        import os
+        from options_backtest.depth_cache import DepthCache
+        from options_backtest.paper_engine import PaperTradingEngine
+        root = Path("tmp_live_tests") / "engine_split_dirs"
+        override = Path("tmp_live_tests") / "engine_split_dirs_tmpfs"
+        # Wipe both so we observe writes cleanly.
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(override, ignore_errors=True)
+        os.environ["IM_SNAPSHOT_DIR"] = str(override)
+        engine = PaperTradingEngine(
+            profile={"profile_name": "test", "symbols": {}, "vix": {}},
+            session_date=date(2026, 5, 16),
+            depth_cache=DepthCache(),
+            access_token="token",
+            client_id="client",
+            live_root=root,
+        )
+        engine._ensure_dirs()
+        engine._write_process_health()
+        engine._write_checkpoint()
+        # process_health is a liveness snapshot → tmpfs.
+        self.assertTrue((override / "latest_process_health.json").exists())
+        self.assertFalse((root / "snapshots" / "latest_process_health.json").exists())
+        # checkpoint is durable → WD (live_root/snapshots).
+        self.assertTrue((root / "snapshots" / "latest_open_positions.json").exists())
+        self.assertFalse((override / "latest_open_positions.json").exists())
+
+    def test_dashboard_bridge_reads_durable_snaps_from_live_root(self) -> None:
+        import os
+        from options_backtest.dashboard_bridge import DashboardBridge
+        root = Path("tmp_live_tests") / "bridge_split_dirs"
+        override = Path("tmp_live_tests") / "bridge_split_dirs_tmpfs"
+        os.environ["IM_SNAPSHOT_DIR"] = str(override)
+        bridge = DashboardBridge(live_root=root)
+        # Liveness file resolves to override (tmpfs).
+        self.assertEqual(bridge._snap("latest_feed_state.json"), override / "latest_feed_state.json")
+        # Durable files resolve to live_root/snapshots, ignoring the override.
+        self.assertEqual(
+            bridge._snap("latest_open_positions.json"),
+            root / "snapshots" / "latest_open_positions.json",
+        )
+        self.assertEqual(
+            bridge._snap("latest_eod_snapshot.json"),
+            root / "snapshots" / "latest_eod_snapshot.json",
+        )
+        self.assertEqual(
+            bridge._snap("latest_depth_collector_state.json"),
+            root / "snapshots" / "latest_depth_collector_state.json",
+        )
+
+
+# ── Health monitor: engine_stall grouping & no auto-restart ───────────────────
+
+
+class EngineStallTests(unittest.TestCase):
+    """The four staleness symptoms collapse to one engine_stall incident, and
+    the monitor never restarts live-paper.service itself."""
+
+    def setUp(self) -> None:
+        import os
+        import shutil
+        self._old_env = os.environ.pop("IM_SNAPSHOT_DIR", None)
+        # Each test gets a clean root so we can assert exact JSONL contents.
+        shutil.rmtree(Path("tmp_live_tests") / "engine_stall_grouped", ignore_errors=True)
+        shutil.rmtree(Path("tmp_live_tests") / "engine_stall_fresh", ignore_errors=True)
+        shutil.rmtree(Path("tmp_live_tests") / "engine_stall_no_restart", ignore_errors=True)
+
+    def tearDown(self) -> None:
+        import os
+        if self._old_env is None:
+            os.environ.pop("IM_SNAPSHOT_DIR", None)
+        else:
+            os.environ["IM_SNAPSHOT_DIR"] = self._old_env
+
+    def _stale_iso(self, seconds: float) -> str:
+        now = datetime.now(tz=ZoneInfo("Asia/Kolkata"))
+        return (now - pd.Timedelta(seconds=seconds)).isoformat()
+
+    def _fresh_iso(self) -> str:
+        return datetime.now(tz=ZoneInfo("Asia/Kolkata")).isoformat()
+
+    def _write_snaps(self, root: Path, process_age: float, feed_age: float, depth_age: float) -> None:
+        snap = root / "snapshots"
+        snap.mkdir(parents=True, exist_ok=True)
+        (snap / "latest_process_health.json").write_text(json.dumps({
+            "written_at": self._stale_iso(process_age) if process_age > 0 else self._fresh_iso(),
+            "pid": 1234, "phase": "monitoring", "open_positions": 0,
+            "session_date": date.today().isoformat(),
+        }))
+        (snap / "latest_feed_state.json").write_text(json.dumps({
+            "written_at": self._stale_iso(feed_age) if feed_age > 0 else self._fresh_iso(),
+            "connected": True, "quote_freshness_pct": 99.0,
+            "core_quotes": {"INDIA_VIX": {"seen": True, "fresh": True}},
+        }))
+        (snap / "latest_depth_cache.json").write_text(json.dumps({
+            "written_at": self._stale_iso(depth_age) if depth_age > 0 else self._fresh_iso(),
+            "ready_pct": 99.0, "ready": 100, "total": 100, "tracked_security_ids": 100,
+            "configured_security_ids": 100, "by_symbol": {},
+        }))
+
+    def test_engine_stall_collapses_four_staleness_alerts_into_one(self) -> None:
+        async def run_case() -> dict:
+            import sys as _sys
+            root = Path("tmp_live_tests") / "engine_stall_grouped"
+            self._write_snaps(root, process_age=120, feed_age=60, depth_age=60)
+            monitor = HealthMonitor(profile={}, live_root=root)
+            monitor._service_became_active_mono = 0.0
+            monitor._service_was_active = True
+
+            def _systemd_active(cmd, *args, **kwargs):
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with patch("scripts.live.health_monitor._is_market_hours", return_value=True), \
+                    patch("scripts.live.health_monitor._is_feed_active", return_value=True), \
+                    patch("scripts.live.health_monitor._is_trading_day", return_value=True), \
+                    patch("scripts.live.health_monitor.shutil.which", return_value="/bin/systemctl"), \
+                    patch("scripts.live.health_monitor.subprocess.run", side_effect=_systemd_active), \
+                    patch.object(_sys, "platform", "linux"):
+                monitor._stall_indicators = {}
+                await monitor._check_runner_process()
+                await monitor._check_feed_state()
+                await monitor._check_depth_snapshot()
+                await monitor._check_collector_heartbeat()
+                await monitor._emit_engine_stall()
+            return {key: rec for key, rec in monitor._active_alerts.items()}
+
+        active = asyncio.run(run_case())
+        stall_keys = [k for k in active if "engine_stall" in k]
+        self.assertEqual(len(stall_keys), 1, f"expected 1 engine_stall alert, got {list(active)}")
+        # Old per-symptom keys must not appear.
+        self.assertFalse(any("process_wedged" in k for k in active))
+        self.assertFalse(any("feed_state_stale" in k for k in active))
+        self.assertFalse(any("depth_snapshot_stale" in k for k in active))
+        self.assertFalse(any("collector_heartbeat_stale" in k for k in active))
+        # Detail should include the indicator names so an operator can diagnose.
+        stall_msg = active[stall_keys[0]]["message"]
+        for indicator in ("process_health", "feed_state", "depth_snapshot", "collector_heartbeat"):
+            self.assertIn(indicator, stall_msg)
+
+    def test_engine_stall_clears_when_all_snaps_fresh(self) -> None:
+        async def run_case() -> dict:
+            root = Path("tmp_live_tests") / "engine_stall_fresh"
+            self._write_snaps(root, process_age=0, feed_age=0, depth_age=0)
+            monitor = HealthMonitor(profile={}, live_root=root)
+            monitor._service_became_active_mono = 0.0
+            monitor._service_was_active = True
+            with patch("scripts.live.health_monitor._is_market_hours", return_value=True), \
+                    patch("scripts.live.health_monitor._is_feed_active", return_value=True), \
+                    patch("scripts.live.health_monitor._is_trading_day", return_value=True), \
+                    patch("shutil.which", return_value=None):
+                monitor._stall_indicators = {}
+                await monitor._check_runner_process()
+                await monitor._check_feed_state()
+                await monitor._check_depth_snapshot()
+                await monitor._check_collector_heartbeat()
+                await monitor._emit_engine_stall()
+            return monitor._active_alerts
+
+        active = asyncio.run(run_case())
+        self.assertFalse(any("engine_stall" in k for k in active),
+                         f"engine_stall should clear when snaps fresh, got {list(active)}")
+
+    def test_alert_storm_simulation_one_alert_zero_restarts(self) -> None:
+        """100 critical-check ticks with persistent stale snapshots — the 5/15
+        scenario at higher density. Verify the storm produces ≤ 2 JSONL rows
+        (one ACTIVE + one RECOVERED after stall clears) and zero restart calls."""
+        async def run_case() -> tuple[int, int, int]:
+            import sys as _sys
+            root = Path("tmp_live_tests") / "engine_stall_storm"
+            import shutil as _shutil
+            _shutil.rmtree(root, ignore_errors=True)
+            self._write_snaps(root, process_age=120, feed_age=120, depth_age=120)
+            monitor = HealthMonitor(profile={}, live_root=root)
+            monitor._service_became_active_mono = 0.0
+            monitor._service_was_active = True
+            restart_calls: list[list[str]] = []
+
+            def _mock_run(cmd, *args, **kwargs):
+                if "systemctl" in cmd[0] and len(cmd) > 1 and cmd[1] == "restart":
+                    restart_calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with patch("scripts.live.health_monitor._is_market_hours", return_value=True), \
+                    patch("scripts.live.health_monitor._is_feed_active", return_value=True), \
+                    patch("scripts.live.health_monitor._is_trading_day", return_value=True), \
+                    patch("scripts.live.health_monitor.shutil.which", return_value="/bin/systemctl"), \
+                    patch("scripts.live.health_monitor.subprocess.run", side_effect=_mock_run), \
+                    patch.object(_sys, "platform", "linux"):
+                # 100 ticks of stale state — simulates ~25 min of bad snapshots
+                # at the 15-second critical-check cadence.
+                for _ in range(100):
+                    monitor._stall_indicators = {}
+                    await monitor._check_runner_process()
+                    await monitor._check_feed_state()
+                    await monitor._check_depth_snapshot()
+                    await monitor._check_collector_heartbeat()
+                    await monitor._emit_engine_stall()
+
+            alerts_path = root / "alerts" / f"{monitor._date_str}_alerts.jsonl"
+            jsonl_rows = (
+                len([ln for ln in alerts_path.read_text().splitlines() if ln.strip()])
+                if alerts_path.exists() else 0
+            )
+            return jsonl_rows, len(restart_calls), len(monitor._active_alerts)
+
+        rows, restarts, active = asyncio.run(run_case())
+        self.assertEqual(restarts, 0, "monitor must never restart live-paper")
+        # JSONL rate-limit is 600s (10 min); 25 min of stall could write 3 rows
+        # at the rate-limit ceiling. Pre-fix was 100+ rows in this window.
+        self.assertLessEqual(rows, 3, f"expected ≤3 JSONL rows under storm, got {rows}")
+        self.assertGreaterEqual(rows, 1, "at least the first ACTIVE engine_stall row must be written")
+        self.assertEqual(active, 1, f"exactly one active engine_stall alert, got {active}")
+
+    def test_monitor_does_not_restart_live_paper_on_wedge(self) -> None:
+        """The 5/15 audit traced 61 restarts to monitor-initiated restarts on
+        snapshot staleness. The monitor must never call systemctl restart."""
+        async def run_case() -> int:
+            root = Path("tmp_live_tests") / "engine_stall_no_restart"
+            self._write_snaps(root, process_age=300, feed_age=300, depth_age=300)
+            monitor = HealthMonitor(profile={}, live_root=root)
+            monitor._service_became_active_mono = 0.0
+            monitor._service_was_active = True
+            restart_calls: list[list[str]] = []
+
+            def _mock_run(cmd, *args, **kwargs):
+                if "systemctl" in cmd[0] and len(cmd) > 1 and cmd[1] == "restart":
+                    restart_calls.append(cmd)
+                # Default: pretend systemd reports the service is active.
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with patch("scripts.live.health_monitor._is_market_hours", return_value=True), \
+                    patch("scripts.live.health_monitor._is_feed_active", return_value=True), \
+                    patch("scripts.live.health_monitor._is_trading_day", return_value=True), \
+                    patch("scripts.live.health_monitor.shutil.which", return_value="/bin/systemctl"), \
+                    patch("scripts.live.health_monitor.subprocess.run", side_effect=_mock_run):
+                # Make platform check think we're on Linux.
+                import sys as _sys
+                with patch.object(_sys, "platform", "linux"):
+                    monitor._stall_indicators = {}
+                    await monitor._check_runner_process()
+                    await monitor._check_feed_state()
+                    await monitor._check_depth_snapshot()
+                    await monitor._check_collector_heartbeat()
+                    await monitor._emit_engine_stall()
+            return len(restart_calls)
+
+        n_restarts = asyncio.run(run_case())
+        self.assertEqual(n_restarts, 0, "monitor must never invoke systemctl restart")
+
+
+# ── WebSocket alert payload bounded ───────────────────────────────────────────
+
+
+class WSAlertBudgetTests(unittest.TestCase):
+    def test_ws_alert_tail_is_bounded(self) -> None:
+        from scripts.live.api.routes.live import _WS_ALERT_TAIL
+        # 5/15 audit: 334 KB frames with full history. 20 rows ≈ a few KB.
+        self.assertGreater(_WS_ALERT_TAIL, 0)
+        self.assertLessEqual(_WS_ALERT_TAIL, 50)
+
+
 if __name__ == "__main__":
     unittest.main()

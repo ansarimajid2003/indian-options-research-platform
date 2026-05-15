@@ -46,6 +46,7 @@ from options_backtest.clock_sync import (
     parse_timesync_offset as _parse_timesync_offset,
     remediate_clock_sync as _remediate_clock_sync,
 )
+from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
 from scripts.live.renew_token import renew_token as _do_renew_token, write_token_file as _write_token_file
 
 _DEFAULT_TOKEN_FILE = _repo_root / ".env.live"
@@ -226,11 +227,13 @@ class HealthMonitor:
     def __init__(self, profile: dict, live_root: Path) -> None:
         self._profile = profile
         self._live_root = live_root
+        self._snapshot_dir = resolve_snapshot_dir(live_root)
+        self._durable_dir = resolve_durable_dir(live_root)
         self._session_date = _today_ist()
         self._date_str = self._session_date.strftime("%Y%m%d")
         self._alerts_path = live_root / "alerts" / f"{self._date_str}_alerts.jsonl"
         self._external_heartbeat_path = live_root / "alerts" / f"{self._date_str}_external_heartbeat.jsonl"
-        self._alert_state_path = live_root / "snapshots" / "latest_alert_state.json"
+        self._alert_state_path = self._snapshot_dir / "latest_alert_state.json"
         self._uptime_summary_path = live_root / "reports" / f"{self._date_str}_uptime_summary.md"
 
         self._tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -256,9 +259,12 @@ class HealthMonitor:
         self._active_alerts: dict[str, dict] = {}
         self._alert_jsonl_write_times: dict[str, float] = {}
         self._consecutive_bad: dict[str, int] = {"quote_freshness": 0, "depth_readiness": 0}
-        self._last_wedge_restart_mono: float = 0.0
         self._service_became_active_mono: float = 0.0
         self._service_was_active: bool = False
+        # Engine-stall incident grouping: indicators collected during a critical
+        # tick. If any are set after all sub-checks ran, one engine_stall alert
+        # is emitted (replacing the prior 4-alert spam family).
+        self._stall_indicators: dict[str, str] = {}
         self._log_scan_offset = 0
         self._backend_open_sent_for: date | None = None
         self._eod_sent_for: date | None = None
@@ -368,6 +374,9 @@ class HealthMonitor:
 
     async def _run_critical_checks(self) -> None:
         try:
+            # Reset stall indicators at start of each tick; sub-checks below will
+            # flag indicators and _emit_engine_stall collapses them into one alert.
+            self._stall_indicators = {}
             runner = await self._check_runner_process()
             collector = await self._check_collector_heartbeat()
             feed = await self._check_feed_state()
@@ -377,6 +386,7 @@ class HealthMonitor:
             chain_fetch = await self._check_chain_fetch()
             depth_readiness = await self._check_depth_readiness()
             storage = await self._check_wd_mount()
+            await self._emit_engine_stall()
             results = [
                 runner,
                 collector,
@@ -402,6 +412,28 @@ class HealthMonitor:
         except Exception as exc:
             _log.error("critical checks failed unexpectedly: %r", exc)
 
+    def _flag_stall(self, name: str, detail: str) -> None:
+        """Record an engine-stall indicator collected during the current tick."""
+        self._stall_indicators[name] = detail
+
+    async def _emit_engine_stall(self) -> None:
+        """
+        Collapse the 4-alert staleness family (process_health, feed_state,
+        depth_snapshot, collector_heartbeat) into a single engine_stall
+        incident. One JSONL row per state transition instead of one row per
+        sub-check per tick.
+        """
+        if self._stall_indicators:
+            reasons = ", ".join(f"{k}({v})" for k, v in sorted(self._stall_indicators.items()))
+            await self._alert(
+                "critical",
+                "engine",
+                "engine_stall",
+                f"engine stall — {reasons}",
+            )
+        else:
+            await self._clear_alert("engine", "engine_stall")
+
     async def _run_slow_checks(self) -> None:
         try:
             await self._check_raw_packet_flush()
@@ -420,11 +452,17 @@ class HealthMonitor:
             _log.error("slow checks failed unexpectedly: %r", exc)
 
     async def _check_runner_process(self) -> bool | None:
+        """
+        Liveness check. Does NOT restart anything — systemd's Restart=on-failure
+        handles real process death. Stale-snapshot symptoms become a single
+        engine_stall indicator (grouped in _emit_engine_stall) instead of a
+        standalone restart trigger. This breaks the restart-cascade that
+        produced 61 restarts on 2026-05-15.
+        """
         if not _is_market_hours():
             await self._clear_alert("process", "runner_not_active")
             await self._clear_alert("process", "process_health_missing")
             await self._clear_alert("process", "process_stale")
-            await self._clear_alert("process", "process_wedged")
             return None
 
         systemd_active = False
@@ -444,13 +482,16 @@ class HealthMonitor:
         self._service_was_active = systemd_active
 
         snapshot_active = False
-        health_path = self._live_root / "snapshots" / "latest_process_health.json"
+        snapshot_age: float | None = None
+        health_path = self._snapshot_dir / "latest_process_health.json"
         if health_path.exists():
             try:
                 data = json.loads(health_path.read_text(encoding="utf-8"))
                 written_at = _parse_ts(data.get("written_at"))
-                if written_at and (_now_ist() - written_at).total_seconds() <= 30:
-                    snapshot_active = True
+                if written_at:
+                    snapshot_age = (_now_ist() - written_at).total_seconds()
+                    if snapshot_age <= 30:
+                        snapshot_active = True
             except Exception as exc:
                 await self._alert("warning", "process", "process_health_parse_error", str(exc))
 
@@ -458,7 +499,6 @@ class HealthMonitor:
             await self._clear_alert("process", "runner_not_active")
             await self._clear_alert("process", "process_health_missing")
             await self._clear_alert("process", "process_stale")
-            await self._clear_alert("process", "process_wedged")
             return True
 
         if systemd_active and not snapshot_active:
@@ -469,57 +509,27 @@ class HealthMonitor:
                 _log.debug("process wedge suppressed — service started %.0fs ago (grace %ds)", now_mono - self._service_became_active_mono, _STARTUP_GRACE)
                 return None
 
-            # Service alive in systemd but snapshot loop has stopped — engine is wedged
-            await self._clear_alert("process", "runner_not_active")
-            await self._alert(
-                "critical",
-                "process",
-                "process_wedged",
-                "live-paper.service is systemd-active but process_health.json is stale (>30s) — engine wedged",
+            # Stale snapshot during feed-active hours: flag for engine_stall
+            # grouping. Do NOT alert or restart. Other stall indicators
+            # (feed_state, depth_snapshot, collector_heartbeat) will join
+            # this in the grouped incident emitted at end of critical tick.
+            self._flag_stall(
+                "process_health",
+                f"age={snapshot_age:.0f}s" if snapshot_age is not None else "stale",
             )
-            # Restart cap: past entry window with no open positions — restarting
-            # just triggers chain fetches, 429s, and depth warm-up for no benefit.
-            _ENTRY_GRACE_MIN = 5
-            entry_time_str = self._profile.get("global", {}).get("entry_time", "09:20")
-            _eh, _em = map(int, entry_time_str.split(":"))
-            past_entry = _now_ist().time() > time(_eh, min(_em + _ENTRY_GRACE_MIN, 59))
-            open_pos_count = 0
-            if past_entry:
-                pos_path = self._live_root / "snapshots" / "latest_open_positions.json"
-                if pos_path.exists():
-                    try:
-                        open_pos_count = len(json.loads(pos_path.read_text(encoding="utf-8")).get("open_positions", []))
-                    except Exception:
-                        pass
-            post_entry_no_pos = past_entry and open_pos_count == 0
-
-            # Auto-restart: kill the wedged process so systemd can respawn it cleanly.
-            # 300s cooldown prevents restart storms; only runs on Linux where systemctl exists.
-            _WEDGE_RESTART_COOLDOWN = 300.0
-            if post_entry_no_pos:
-                _log.info("process_wedged: past entry window, no open positions — suppressing auto-restart")
-            elif (
-                sys.platform != "win32"
-                and shutil.which("systemctl")
-                and now_mono - self._last_wedge_restart_mono > _WEDGE_RESTART_COOLDOWN
-            ):
-                result = subprocess.run(
-                    ["systemctl", "restart", "live-paper.service"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                self._last_wedge_restart_mono = now_mono
-                _log.warning("process_wedged: auto-restarted live-paper.service (rc=%d)", result.returncode)
-                await self._send_telegram(
-                    "[AUTO-RESTART] live-paper.service restarted due to wedged engine", severity="warning"
-                )
+            await self._clear_alert("process", "runner_not_active")
+            await self._clear_alert("process", "process_health_missing")
+            await self._clear_alert("process", "process_stale")
             return False
 
         if snapshot_active and not systemd_active:
             # Running without systemd (e.g. manual foreground run)
             await self._clear_alert("process", "runner_not_active")
-            await self._clear_alert("process", "process_wedged")
             return True
 
+        # systemd is dead (or unavailable) — this is a real process failure,
+        # not a snapshot staleness symptom. Emit standalone alert; systemd's
+        # own Restart=on-failure handles bringing the engine back.
         if not health_path.exists():
             await self._alert(
                 "critical",
@@ -534,9 +544,8 @@ class HealthMonitor:
     async def _check_collector_heartbeat(self) -> bool | None:
         if not _is_feed_active():
             await self._clear_alert("collector", "collector_heartbeat_missing")
-            await self._clear_alert("collector", "collector_heartbeat_stale")
             return None
-        path = self._live_root / "snapshots" / "latest_depth_cache.json"
+        path = self._snapshot_dir / "latest_depth_cache.json"
         if not path.exists():
             await self._alert(
                 "critical",
@@ -550,10 +559,10 @@ class HealthMonitor:
             written_at = _parse_ts(data.get("written_at"))
             age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
             if age > 30:
-                await self._alert("critical", "collector", "collector_heartbeat_stale", f"collector heartbeat stale: {age:.0f}s old")
+                # Flag for engine_stall grouping rather than firing a standalone alert.
+                self._flag_stall("collector_heartbeat", f"age={age:.0f}s")
                 return False
             await self._clear_alert("collector", "collector_heartbeat_missing")
-            await self._clear_alert("collector", "collector_heartbeat_stale")
             return True
         except Exception as exc:
             await self._alert("warning", "collector", "collector_heartbeat_parse_error", str(exc))
@@ -562,7 +571,6 @@ class HealthMonitor:
     async def _check_feed_state(self) -> bool | None:
         if not _is_feed_active():
             await self._clear_alert("feed", "feed_state_missing")
-            await self._clear_alert("feed", "feed_state_stale")
             await self._clear_alert("feed", "feed_disconnected")
             return None
         data = self._load_json_snapshot("latest_feed_state.json")
@@ -572,20 +580,20 @@ class HealthMonitor:
         written_at = _parse_ts(data.get("written_at"))
         age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
         if age > 15:
-            await self._alert("critical", "feed", "feed_state_stale", f"feed state stale: {age:.0f}s old")
+            # Flag for engine_stall grouping rather than firing standalone.
+            self._flag_stall("feed_state", f"age={age:.0f}s")
             return False
         if not data.get("connected", False):
+            # Real connectivity failure (not a wedge): standalone critical alert.
             await self._alert("critical", "feed", "feed_disconnected", "live feed disconnected")
             return False
         await self._clear_alert("feed", "feed_state_missing")
-        await self._clear_alert("feed", "feed_state_stale")
         await self._clear_alert("feed", "feed_disconnected")
         return True
 
     async def _check_depth_snapshot(self) -> bool | None:
         if not _is_feed_active():
             await self._clear_alert("depth", "depth_snapshot_missing")
-            await self._clear_alert("depth", "depth_snapshot_stale")
             return None
         data = self._load_json_snapshot("latest_depth_cache.json")
         if data is None:
@@ -594,10 +602,10 @@ class HealthMonitor:
         written_at = _parse_ts(data.get("written_at"))
         age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
         if age > 15:
-            await self._alert("critical", "depth", "depth_snapshot_stale", f"depth cache snapshot stale: {age:.0f}s old")
+            # Flag for engine_stall grouping rather than firing standalone.
+            self._flag_stall("depth_snapshot", f"age={age:.0f}s")
             return False
         await self._clear_alert("depth", "depth_snapshot_missing")
-        await self._clear_alert("depth", "depth_snapshot_stale")
         return True
 
     async def _check_quote_freshness(self) -> bool | None:
@@ -713,7 +721,7 @@ class HealthMonitor:
                 if not str(resolved).startswith("/media/WD-Storage"):
                     await self._alert("critical", "storage", "wd_mount_invalid", f"data/live resolves to {resolved}")
                     return False
-            probe = self._live_root / "snapshots" / ".health_write_probe"
+            probe = self._durable_dir / ".health_write_probe"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink(missing_ok=True)
             stat = shutil.disk_usage(str(self._live_root))
@@ -942,7 +950,11 @@ class HealthMonitor:
             return None
 
     def _load_json_snapshot(self, name: str) -> dict | None:
-        path = self._live_root / "snapshots" / name
+        # latest_open_positions.json lives in durable dir; everything else in liveness dir.
+        if name == "latest_open_positions.json":
+            path = self._durable_dir / name
+        else:
+            path = self._snapshot_dir / name
         if not path.exists():
             return None
         try:

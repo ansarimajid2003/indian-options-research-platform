@@ -11,6 +11,9 @@ User=root
 WorkingDirectory=/DATA/live-paper/indian-markets
 EnvironmentFile=/DATA/live-paper/indian-markets/.env.live
 Environment=LIVE_ROOT=/media/WD-Storage/indian-markets-live
+# Read liveness snapshots from tmpfs (same dir the engine/monitor write to).
+Environment=IM_SNAPSHOT_DIR=/run/im-snapshots
+ExecStartPre=/bin/mkdir -p /run/im-snapshots
 ExecStart=/DATA/live-paper/indian-markets/.venv/bin/uvicorn \
     scripts.live.api.main:app \
     --host 127.0.0.1 \

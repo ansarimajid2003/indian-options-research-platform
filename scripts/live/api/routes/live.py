@@ -48,6 +48,8 @@ log = logging.getLogger(__name__)
 # Market-hours push interval (seconds)
 _PUSH_INTERVAL_MARKET = 1.0
 _PUSH_INTERVAL_OFF = 5.0
+# Cap alert entries sent on each WS frame. /api/live/alerts serves the full day.
+_WS_ALERT_TAIL = 20
 
 try:
     from zoneinfo import ZoneInfo
@@ -315,9 +317,13 @@ async def ws_live(websocket: WebSocket) -> None:
             depth_summary = session.depth
 
             alerts_model = _alert_state_model(alert_state)
-            # Include full day history (newest first) so timeline stays current.
+            # Frame budget: 5/15 audit showed full alert history pushed every 1 s
+            # produced 334 KB frames during a storm — too heavy for 1-Hz cadence.
+            # Send only the most recent _WS_ALERT_TAIL rows; the dashboard's
+            # /api/live/alerts endpoint still serves the full day on demand.
             if alert_history:
-                alerts_model.active_alerts = [_alert_entry_model(a) for a in reversed(alert_history)]
+                tail = alert_history[-_WS_ALERT_TAIL:]
+                alerts_model.active_alerts = [_alert_entry_model(a) for a in reversed(tail)]
             # else: keep active_alerts from state (already set by _alert_state_model)
 
             frame = LivePushFrame(

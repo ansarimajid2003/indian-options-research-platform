@@ -192,9 +192,11 @@ def secret_leaks(roots: list[Path]) -> list[tuple[Path, str]]:
 
 
 def validate_secret_scan(live_root: Path, include_repo: bool = False) -> ValidationResult:
+    from options_backtest.live_paths import resolve_snapshot_dir
     roots = [
         live_root / "logs",
         live_root / "snapshots",
+        resolve_snapshot_dir(live_root),  # tmpfs liveness dir when configured
         live_root / "paper_trades",
         live_root / "alerts",
         live_root / "reports",

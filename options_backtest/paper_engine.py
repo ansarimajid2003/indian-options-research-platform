@@ -28,6 +28,7 @@ from .broker_sim import ChargesConfig, FillModel
 from .calendar import expiry_on_or_after, lot_size
 from .clock_sync import clock_sync_status
 from .depth_cache import DepthCache
+from .live_paths import resolve_durable_dir, resolve_snapshot_dir
 from .live_resolver import LiveDhanContractResolver, StaleQuoteError
 from .schemas import Contract, OptionType, Side
 from .volatility_filter import VIX_BUCKETS
@@ -321,7 +322,8 @@ class PaperTradingEngine:
         self._signals_path = live_root / "paper_trades" / f"{self._date_str}_signals.jsonl"
         self._trades_path = live_root / "paper_trades" / f"{self._date_str}.json"
         self._report_path = live_root / "reports" / f"{self._date_str}_paper_summary.md"
-        self._snapshot_dir = live_root / "snapshots"
+        self._snapshot_dir = resolve_snapshot_dir(live_root)
+        self._durable_dir = resolve_durable_dir(live_root)
         self._log_dir = live_root / "logs"
 
         self._phase = "init"
@@ -1420,7 +1422,7 @@ class PaperTradingEngine:
                 quotes[sid]["delta"] = (meta.get("greeks") or {}).get("delta")
                 quotes[sid]["theta"] = (meta.get("greeks") or {}).get("theta")
         if imap and quotes:
-            _write_atomic(self._snapshot_dir / "latest_eod_snapshot.json", {
+            _write_atomic(self._durable_dir / "latest_eod_snapshot.json", {
                 "written_at": _ts_str(),
                 "session_date": self._session_date.isoformat(),
                 "instruments": imap,
@@ -1474,7 +1476,7 @@ class PaperTradingEngine:
             "gap_minutes": self._crash_gap_minutes,
             "open_positions": [p.to_dict() for p in self._open_positions],
         }
-        _write_atomic(self._snapshot_dir / "latest_open_positions.json", checkpoint)
+        _write_atomic(self._durable_dir / "latest_open_positions.json", checkpoint)
 
     def _flush_trades(self) -> None:
         self._trades_path.parent.mkdir(parents=True, exist_ok=True)

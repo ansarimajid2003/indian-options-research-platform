@@ -11,6 +11,10 @@ Type=simple
 User=root
 WorkingDirectory=/DATA/live-paper/indian-markets
 EnvironmentFile=/DATA/live-paper/indian-markets/.env.live
+# tmpfs liveness snapshots: avoids WD-Storage fsync hangs falsely tripping
+# stale-snapshot alerts. Durable artifacts (checkpoint, EOD) stay on WD.
+Environment=IM_SNAPSHOT_DIR=/run/im-snapshots
+ExecStartPre=/bin/mkdir -p /run/im-snapshots
 ExecStartPre=/DATA/live-paper/indian-markets/.venv/bin/python scripts/live/clock_sync.py --remediate --wait --timeout 180 --max-offset 2.0
 ExecStart=/DATA/live-paper/indian-markets/.venv/bin/python \
     scripts/live/run_paper_trading.py \
