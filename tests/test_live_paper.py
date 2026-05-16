@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import base64
+import shutil
 import subprocess
 import struct
 import unittest
@@ -172,6 +173,49 @@ class LivePaperTests(unittest.TestCase):
         exp = _jwt_expiry(token)
         self.assertIsNotNone(exp)
         self.assertEqual(exp, datetime.fromtimestamp(1778497200, tz=ZoneInfo("Asia/Kolkata")))
+
+    def test_health_monitor_skips_token_expiry_alerts_on_non_trading_day(self) -> None:
+        async def run_case() -> tuple[bool | None, bool, dict[str, dict]]:
+            root = Path("tmp_live_tests") / "token_non_trading_day"
+            shutil.rmtree(root, ignore_errors=True)
+            monitor = HealthMonitor(profile={}, live_root=root)
+            session_date = date(2026, 5, 16)  # Saturday
+            exp = datetime(2026, 5, 16, 15, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+            body = base64.urlsafe_b64encode(json.dumps({"exp": int(exp.timestamp())}).encode()).decode().rstrip("=")
+            monitor._access_token = f"header.{body}.sig"
+            monitor._session_date = session_date
+            monitor._date_str = session_date.strftime("%Y%m%d")
+            monitor._alerts_path = root / "alerts" / f"{monitor._date_str}_alerts.jsonl"
+            with patch("scripts.live.health_monitor._ist_time", return_value=time(16, 9)), \
+                    patch("scripts.live.health_monitor._now_ist", return_value=datetime(2026, 5, 16, 16, 9, tzinfo=ZoneInfo("Asia/Kolkata"))):
+                result = await monitor._check_token_expiry()
+            return result, monitor._alerts_path.exists(), dict(monitor._active_alerts)
+
+        result, alert_file_exists, active = asyncio.run(run_case())
+        self.assertIsNone(result)
+        self.assertFalse(alert_file_exists)
+        self.assertEqual(active, {})
+
+    def test_health_monitor_flags_token_expiry_before_eod_on_trading_day(self) -> None:
+        async def run_case() -> dict:
+            root = Path("tmp_live_tests") / "token_trading_day"
+            shutil.rmtree(root, ignore_errors=True)
+            monitor = HealthMonitor(profile={}, live_root=root)
+            session_date = date(2026, 5, 15)  # Friday
+            exp = datetime(2026, 5, 15, 15, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+            body = base64.urlsafe_b64encode(json.dumps({"exp": int(exp.timestamp())}).encode()).decode().rstrip("=")
+            monitor._access_token = f"header.{body}.sig"
+            monitor._session_date = session_date
+            monitor._date_str = session_date.strftime("%Y%m%d")
+            monitor._alerts_path = root / "alerts" / f"{monitor._date_str}_alerts.jsonl"
+            with patch("scripts.live.health_monitor._ist_time", return_value=time(9, 1)), \
+                    patch("scripts.live.health_monitor._now_ist", return_value=datetime(2026, 5, 15, 9, 1, tzinfo=ZoneInfo("Asia/Kolkata"))):
+                await monitor._check_token_expiry()
+            return json.loads(monitor._alerts_path.read_text().splitlines()[-1])
+
+        alert = asyncio.run(run_case())
+        self.assertEqual(alert["component"], "token")
+        self.assertEqual(alert["reason"], "token_expires_before_eod")
 
     def test_clock_sync_status_flags_high_drift(self) -> None:
         def runner(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str]:

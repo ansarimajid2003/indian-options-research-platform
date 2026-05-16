@@ -858,6 +858,8 @@ class HealthMonitor:
 
     async def _maybe_renew_token(self) -> None:
         """Renew the Dhan access token at midnight. Two attempts; alert after both fail."""
+        if not _is_trading_day(self._session_date):
+            return
         # Only run in the 15-minute window right after midnight.
         if not (time(0, 0) <= _ist_time() < time(0, 15)):
             return
@@ -908,6 +910,10 @@ class HealthMonitor:
 
     async def _check_token_expiry(self) -> bool | None:
         if not self._access_token:
+            return None
+        if not _is_trading_day(self._session_date):
+            await self._clear_alert("token", "token_expires_before_eod")
+            await self._clear_alert("token", "token_expiring_soon")
             return None
         # Token staleness overnight is expected — only check from preflight window onward.
         if _ist_time() < _HEARTBEAT_START:
