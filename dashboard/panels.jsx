@@ -17,86 +17,167 @@ function EmptyState({ icon, title, sub }) {
 }
 
 // ── Positions panel ────────────────────────────────────────────────────
-const PositionsPanel = React.memo(function PositionsPanel({ positions }) {
+const PositionsPanel = React.memo(function PositionsPanel({ positions, closedTrades }) {
+  const [activeTab, setActiveTab] = useState('open');
+
   return (
     <div className="panel span-positions">
       <div className="panel-header">
         <div className="panel-title">
-          Open Positions
-          <span className="count">{positions.length > 0 ? `${positions.length} · 4×1 IRON CONDOR` : 'NONE TODAY'}</span>
+          {activeTab === 'open' ? 'Open Positions' : 'Closed Positions'}
+          <span className="count">
+            {activeTab === 'open'
+              ? (positions.length > 0 ? `${positions.length} · 4×1 IRON CONDOR` : 'NONE TODAY')
+              : (closedTrades.length > 0 ? `${closedTrades.length} TRADES TODAY` : 'NONE CLOSED YET')
+            }
+          </span>
         </div>
         <div className="panel-actions">
           <span className="badge ghost"><Icon name="dot" size={10} color="oklch(0.78 0.18 150)"/> SYNCED · 1s</span>
-          <div className="icon-btn"><Icon name="filter" size={11}/></div>
-          <div className="icon-btn"><Icon name="export" size={11}/></div>
           <div className="icon-btn"><Icon name="expand" size={11}/></div>
         </div>
       </div>
+      <div style={{display:'flex', borderBottom:'1px solid var(--border)', padding:'0 14px', gap:0}}>
+        {['open','closed'].map(tab => (
+          <div
+            key={tab}
+            onClick={() => setActiveTab(tab)}
+            style={{
+              padding:'6px 14px', fontSize:10, fontWeight:600, letterSpacing:'0.07em',
+              cursor:'pointer', color: activeTab === tab ? 'var(--text)' : 'var(--text-3)',
+              borderBottom: activeTab === tab ? '2px solid var(--green)' : '2px solid transparent',
+              textTransform:'uppercase', userSelect:'none',
+            }}
+          >
+            {tab === 'open' ? `Open (${positions.length})` : `Closed (${closedTrades.length})`}
+          </div>
+        ))}
+      </div>
       <div className="panel-body" style={{overflowX: 'auto'}}>
-        {positions.length === 0 ? (
-          <EmptyState icon="○" title="NO OPEN POSITIONS" sub="No trades entered this session · entries happen at 09:20 IST" />
+        {activeTab === 'open' ? (
+          positions.length === 0 ? (
+            <EmptyState icon="○" title="NO OPEN POSITIONS" sub="No trades entered this session · entries happen at 09:20 IST" />
+          ) : (
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th className="l">Symbol</th>
+                  <th className="l">Short CE / Long CE</th>
+                  <th className="l">Short PE / Long PE</th>
+                  <th>Entry</th>
+                  <th>Entry ₹</th>
+                  <th>Mark ₹</th>
+                  <th>Spread</th>
+                  <th>Unrealised Gross</th>
+                  <th>Unrealised Net</th>
+                  <th>Leg Ages (ms)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {positions.map(p => {
+                  const { gross, net, current_spread } = computePnL(p);
+                  const cls = net >= 0 ? 'pnl-pos' : 'pnl-neg';
+                  return (
+                    <tr key={p.symbol} className={`pos-row ${cls}`}>
+                      <td className="l">
+                        <div className="sym-cell">
+                          <span className="sym">{p.symbol}</span>
+                          <span className="exp">{p.expiry} · {p.lots}×{p.lot_size}</span>
+                        </div>
+                      </td>
+                      <td className="l">
+                        <span className="legpair">
+                          <span className="short">{p.short_ce_strike}CE</span>
+                          <span className="sep">/</span>
+                          <span className="long">{p.long_ce_strike}CE</span>
+                        </span>
+                      </td>
+                      <td className="l">
+                        <span className="legpair">
+                          <span className="short">{p.short_pe_strike}PE</span>
+                          <span className="sep">/</span>
+                          <span className="long">{p.long_pe_strike}PE</span>
+                        </span>
+                      </td>
+                      <td className="muted">{p.entry_time}</td>
+                      <td>{fmtNum(p.entry_credit)}</td>
+                      <td>{fmtNum(p.current_mark)}</td>
+                      <td className={current_spread > 0 ? 'neg' : 'pos'}>{current_spread > 0 ? '+' : ''}{current_spread.toFixed(2)}%</td>
+                      <td className={gross >= 0 ? 'pos' : 'neg'}>{fmtINR(gross)}</td>
+                      <td className={net >= 0 ? 'pos' : 'neg'} style={{fontWeight: 600}}>{fmtINR(net)}</td>
+                      <td>
+                        <span style={{display:'inline-flex', gap:3}}>
+                          {p.leg_ages.map((a, i) => (
+                            a != null
+                              ? <span key={i} className={`age-chip ${a > 4000 ? 'crit' : a > 2000 ? 'warn' : ''}`}>{Math.round(a)}</span>
+                              : <span key={i} className="age-chip" style={{opacity:0.4}}>—</span>
+                          ))}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )
         ) : (
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th className="l">Symbol</th>
-                <th className="l">Short CE / Long CE</th>
-                <th className="l">Short PE / Long PE</th>
-                <th>Entry</th>
-                <th>Entry ₹</th>
-                <th>Mark ₹</th>
-                <th>Spread</th>
-                <th>Unrealised Gross</th>
-                <th>Unrealised Net</th>
-                <th>Leg Ages (ms)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {positions.map(p => {
-                const { gross, net, current_spread } = computePnL(p);
-                const cls = net >= 0 ? 'pnl-pos' : 'pnl-neg';
-                return (
-                  <tr key={p.symbol} className={`pos-row ${cls}`}>
+          closedTrades.length === 0 ? (
+            <EmptyState icon="◎" title="NO CLOSED POSITIONS" sub="Completed trades appear here after exit at 15:20 IST" />
+          ) : (
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th className="l">Symbol</th>
+                  <th className="l">Short CE / Long CE</th>
+                  <th className="l">Short PE / Long PE</th>
+                  <th>Entry</th>
+                  <th>Exit</th>
+                  <th>Exit Reason</th>
+                  <th>Credit ₹</th>
+                  <th>Debit ₹</th>
+                  <th>Gross P&L</th>
+                  <th>Net P&L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {closedTrades.map((t, i) => (
+                  <tr key={`${t.symbol}-${i}`} className={`pos-row ${t.net_pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}`}>
                     <td className="l">
                       <div className="sym-cell">
-                        <span className="sym">{p.symbol}</span>
-                        <span className="exp">{p.expiry} · {p.lots}×{p.lot_size}</span>
+                        <span className="sym">{t.symbol}</span>
+                        <span className="exp">{t.expiry} · {t.lots}×{t.lot_size}</span>
                       </div>
                     </td>
                     <td className="l">
                       <span className="legpair">
-                        <span className="short">{p.short_ce_strike}CE</span>
+                        <span className="short">{t.short_call_strike}CE</span>
                         <span className="sep">/</span>
-                        <span className="long">{p.long_ce_strike}CE</span>
+                        <span className="long">{t.long_call_strike}CE</span>
                       </span>
                     </td>
                     <td className="l">
                       <span className="legpair">
-                        <span className="short">{p.short_pe_strike}PE</span>
+                        <span className="short">{t.short_put_strike}PE</span>
                         <span className="sep">/</span>
-                        <span className="long">{p.long_pe_strike}PE</span>
+                        <span className="long">{t.long_put_strike}PE</span>
                       </span>
                     </td>
-                    <td className="muted">{p.entry_time}</td>
-                    <td>{fmtNum(p.entry_credit)}</td>
-                    <td>{fmtNum(p.current_mark)}</td>
-                    <td className={current_spread > 0 ? 'neg' : 'pos'}>{current_spread > 0 ? '+' : ''}{current_spread.toFixed(2)}%</td>
-                    <td className={gross >= 0 ? 'pos' : 'neg'}>{fmtINR(gross)}</td>
-                    <td className={net >= 0 ? 'pos' : 'neg'} style={{fontWeight: 600}}>{fmtINR(net)}</td>
+                    <td className="muted">{(t.entry_time || '').slice(11, 19) || '—'}</td>
+                    <td className="muted">{(t.exit_time || '').slice(11, 19) || '—'}</td>
                     <td>
-                      <span style={{display:'inline-flex', gap:3}}>
-                        {p.leg_ages.map((a, i) => (
-                          a != null
-                            ? <span key={i} className={`age-chip ${a > 4000 ? 'crit' : a > 2000 ? 'warn' : ''}`}>{Math.round(a)}</span>
-                            : <span key={i} className="age-chip" style={{opacity:0.4}}>—</span>
-                        ))}
+                      <span style={{fontSize:9, letterSpacing:'0.05em', color: t.forced_stale_exit ? 'var(--amber)' : 'var(--text-3)'}}>
+                        {t.exit_reason}{t.forced_stale_exit ? ' ⚠' : ''}
                       </span>
                     </td>
+                    <td>{fmtNum(t.entry_credit)}</td>
+                    <td>{fmtNum(t.exit_debit)}</td>
+                    <td className={t.gross_pnl >= 0 ? 'pos' : 'neg'}>{fmtINR(t.gross_pnl)}</td>
+                    <td className={t.net_pnl >= 0 ? 'pos' : 'neg'} style={{fontWeight:600}}>{fmtINR(t.net_pnl)}</td>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                ))}
+              </tbody>
+            </table>
+          )
         )}
       </div>
     </div>

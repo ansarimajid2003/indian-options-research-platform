@@ -403,6 +403,48 @@ class DashboardBridge:
         result = self._cached(f"equity_{date_str}", _TTL_TRADES, _load)
         return result if result is not None else []
 
+    # ── Closed trades (today's completed positions) ──────────────────────────
+
+    def get_closed_trades(self, session_date: date) -> list[dict]:
+        date_str = session_date.strftime("%Y%m%d")
+
+        def _load() -> list[dict]:
+            path = self._root / "paper_trades" / f"{date_str}.json"
+            if not path.exists():
+                return []
+            try:
+                trades: list[dict] = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return []
+            result = []
+            for t in sorted(trades, key=lambda x: x.get("exit_time") or ""):
+                if not t.get("exit_time"):
+                    continue
+                result.append({
+                    "symbol": t.get("symbol", ""),
+                    "expiry": t.get("expiry", ""),
+                    "entry_time": t.get("entry_time", ""),
+                    "exit_time": t.get("exit_time", ""),
+                    "entry_reason": t.get("entry_reason", ""),
+                    "exit_reason": t.get("exit_reason", ""),
+                    "lots": t.get("lots", 0),
+                    "lot_size": t.get("lot_size", 0),
+                    "entry_credit": t.get("entry_credit", 0.0),
+                    "exit_debit": t.get("exit_debit", 0.0),
+                    "gross_pnl": t.get("gross_pnl", 0.0),
+                    "charges": t.get("charges", 0.0),
+                    "net_pnl": t.get("net_pnl", 0.0),
+                    "short_call_strike": t.get("short_call_strike", 0),
+                    "long_call_strike": t.get("long_call_strike", 0),
+                    "short_put_strike": t.get("short_put_strike", 0),
+                    "long_put_strike": t.get("long_put_strike", 0),
+                    "forced_stale_exit": bool(t.get("forced_stale_exit", False)),
+                })
+            return result
+
+        result = self._cached(f"closed_trades_{date_str}", _TTL_TRADES, _load)
+        return result if result is not None else []
+
     # ── Signal log ───────────────────────────────────────────────────────────
 
     def get_signal_log(self, session_date: date) -> list[SignalLogEntry]:

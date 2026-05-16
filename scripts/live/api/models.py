@@ -218,6 +218,29 @@ class LivePushFrame(BaseModel):
     alerts: AlertStateModel
 
 
+# ── Closed trade (today's completed positions) ────────────────────────────────
+
+class ClosedTradeModel(BaseModel):
+    symbol: str
+    expiry: str
+    entry_time: str
+    exit_time: str
+    entry_reason: str
+    exit_reason: str
+    lots: int
+    lot_size: int
+    entry_credit: float
+    exit_debit: float
+    gross_pnl: float
+    charges: float
+    net_pnl: float
+    short_call_strike: int
+    long_call_strike: int
+    short_put_strike: int
+    long_put_strike: int
+    forced_stale_exit: bool = False
+
+
 # ── Stub responses for v2 endpoints ──────────────────────────────────────────
 
 class V2PendingResponse(BaseModel):

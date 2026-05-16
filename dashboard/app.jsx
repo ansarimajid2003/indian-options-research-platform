@@ -273,6 +273,7 @@ const Sidebar = React.memo(function Sidebar({ audioOn, onToggleAudio, depthSumma
           {[
             ['GET','get','/api/live/session'],
             ['GET','get','/api/live/positions'],
+            ['GET','get','/api/live/closed-positions'],
             ['GET','get','/api/live/equity-curve'],
             ['GET','get','/api/live/signal-log'],
             ['GET','get','/api/live/depth-health'],
@@ -309,8 +310,9 @@ function App() {
   }/*EDITMODE-END*/);
 
   // ── State — all start empty, filled exclusively from API ──────────────
-  const [positions,  setPositions]  = useState([]);
-  const [equity,     setEquity]     = useState([]);
+  const [positions,     setPositions]     = useState([]);
+  const [closedTrades,  setClosedTrades]  = useState([]);
+  const [equity,        setEquity]        = useState([]);
   const [signalLog,  setSignalLog]  = useState([]);
   const [alerts,     setAlerts]     = useState([]);
   const [session,    setSession]    = useState(null);
@@ -367,14 +369,16 @@ function App() {
     Promise.all([
       getJson('/api/live/session'),
       getJson('/api/live/positions'),
+      getJson('/api/live/closed-positions'),
       getJson('/api/live/equity-curve'),
       getJson('/api/live/signal-log'),
       getJson('/api/live/alerts'),
-    ]).then(([sess, pos, eq, sig, al]) => {
+    ]).then(([sess, pos, closed, eq, sig, al]) => {
       if (sess) setSession(sess);
 
       // Always replace state with API response (even if empty array)
       setPositions(Array.isArray(pos) ? pos.map(adaptPosition) : []);
+      setClosedTrades(Array.isArray(closed) ? closed : []);
 
       if (Array.isArray(eq) && eq.length) {
         const pts = eq.map(adaptEquityPoint);
@@ -434,6 +438,21 @@ function App() {
   useEffect(() => {
     if (activeTab !== 'live') return;
     const id = setInterval(() => fetchChainData(), 10000);
+    return () => clearInterval(id);
+  }, [activeTab]);
+
+  // Poll closed positions every 30s (trades close at 15:20; low-frequency is fine)
+  useEffect(() => {
+    if (activeTab !== 'live') return;
+    const getJson = url =>
+      fetch(url, {headers:{'Accept':'application/json'}})
+        .then(r => r.ok ? r.json() : null)
+        .catch(() => null);
+    const id = setInterval(() => {
+      getJson('/api/live/closed-positions').then(closed => {
+        if (Array.isArray(closed)) setClosedTrades(closed);
+      });
+    }, 30000);
     return () => clearInterval(id);
   }, [activeTab]);
 
@@ -537,7 +556,7 @@ function App() {
           <HeaderStrip summary={summary} session={session} />
           <div className="shell">
             <div className="workspace">
-              <PositionsPanel positions={positions} />
+              <PositionsPanel positions={positions} closedTrades={closedTrades} />
               <EquityCurvePanel seriesRef={seriesRef} equityState={equity}
                 accentColor={tweaks.accentColor} />
               <SpotChartsRow spotData={spotData} marketClosed={marketClosed} />

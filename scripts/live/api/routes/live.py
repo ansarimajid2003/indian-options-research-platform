@@ -18,6 +18,7 @@ from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from ..models import (
     AlertEntryModel,
     AlertStateModel,
+    ClosedTradeModel,
     DepthSummaryModel,
     EquityPointModel,
     LegFillModel,
@@ -204,6 +205,23 @@ def get_equity_curve(
         except (ValueError, IndexError):
             session_date = _date.today()
     return [_equity_model(p) for p in _bridge(request).get_equity_curve(session_date)]
+
+
+@router.get("/closed-positions", response_model=list[ClosedTradeModel], summary="Today's closed paper trades")
+def get_closed_positions(
+    request: Request,
+    date: str = Query(default="today", description="YYYYMMDD or 'today'"),
+) -> list[ClosedTradeModel]:
+    from datetime import date as _date
+    if date == "today":
+        session_date = _date.today()
+    else:
+        try:
+            session_date = _date.fromisoformat(f"{date[:4]}-{date[4:6]}-{date[6:]}")
+        except (ValueError, IndexError):
+            session_date = _date.today()
+    trades = _bridge(request).get_closed_trades(session_date)
+    return [ClosedTradeModel(**t) for t in trades]
 
 
 @router.get("/signal-log", response_model=list[SignalLogModel], summary="Entry/skip/exit event log")
