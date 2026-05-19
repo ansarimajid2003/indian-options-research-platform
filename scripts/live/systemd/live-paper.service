@@ -3,8 +3,8 @@ Description=Wing-6 Live Paper Trading Engine
 Documentation=file:///DATA/live-paper/indian-markets/docs/design/live_paper_trading_plan.md
 After=network-online.target health-monitor.service
 Wants=network-online.target health-monitor.service
-StartLimitIntervalSec=600
-StartLimitBurst=8
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -22,7 +22,7 @@ ExecStart=/DATA/live-paper/indian-markets/.venv/bin/python \
 Restart=on-failure
 # 45s gives the network and Dhan websockets time to stabilise after a crash.
 # The engine self-recovers positions from the checkpoint on restart.
-RestartSec=45
+RestartSec=10
 StandardOutput=append:/media/WD-Storage/indian-markets-live/logs/live-paper.log
 StandardError=append:/media/WD-Storage/indian-markets-live/logs/live-paper.log
 

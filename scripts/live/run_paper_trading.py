@@ -141,6 +141,62 @@ async def _run_dry(profile: dict, today: date, live_root: Path, access_token: st
     _log.info("DRY RUN: complete")
 
 
+async def _reconcile_collector(
+    profile: dict,
+    today: date,
+    live_root: Path,
+    depth_cache: DepthCache,
+    access_token: str,
+    client_id: str,
+) -> None:
+    """At 09:17, check if collector missed symbols that engine loaded; retry them."""
+    from datetime import time as _time, datetime as _datetime
+    from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
+
+    reconcile_at = _time(9, 17)
+    now = _datetime.now()
+    target = _datetime.combine(today, reconcile_at)
+    if now < target:
+        await asyncio.sleep((target - now).total_seconds())
+
+    state_path = resolve_durable_dir(live_root) / "latest_depth_collector_state.json"
+    if not state_path.exists():
+        return
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    failed = set(state.get("failed_symbols", []))
+    if not failed:
+        return
+
+    imap_path = resolve_snapshot_dir(live_root) / "latest_instrument_map.json"
+    if not imap_path.exists():
+        return
+    try:
+        imap = json.loads(imap_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    loaded_symbols = set()
+    for sid, info in imap.get("instruments", {}).items():
+        loaded_symbols.add(info.get("symbol"))
+    missing = [s for s in failed if s in loaded_symbols]
+    if missing:
+        _log.info("orchestrator: reconciling missing collector symbols: %s", missing)
+        await collect_order_book(
+            profile=profile,
+            session_date=today,
+            depth_cache=depth_cache,
+            access_token=access_token,
+            client_id=client_id,
+            live_root=live_root,
+            reconcile_symbols=missing,
+        )
+    else:
+        _log.info("orchestrator: no reconciliation needed (engine did not load failed symbols)")
+
+
 async def _run_live(profile: dict, today: date, live_root: Path, access_token: str, client_id: str) -> None:
     depth_cache = DepthCache()
     engine = PaperTradingEngine(
@@ -169,11 +225,15 @@ async def _run_live(profile: dict, today: date, live_root: Path, access_token: s
         )
     )
     engine_task = asyncio.create_task(engine.run())
+    reconcile_task = asyncio.create_task(
+        _reconcile_collector(profile, today, live_root, depth_cache, access_token, client_id)
+    )
+    all_tasks = [collector_task, engine_task, reconcile_task]
 
     try:
         while True:
             done, _pending = await asyncio.wait(
-                {collector_task, engine_task},
+                set(all_tasks),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if engine_task in done:
@@ -182,21 +242,33 @@ async def _run_live(profile: dict, today: date, live_root: Path, access_token: s
                 trades_json = live_root / "paper_trades" / f"{date_str}.json"
                 if trades_json.exists():
                     write_paper_reports(trades_json, today, live_root)
-                collector_task.cancel()
-                await asyncio.gather(collector_task, return_exceptions=True)
+                for task in all_tasks:
+                    if task is not engine_task and not task.done():
+                        task.cancel()
+                await asyncio.gather(*[t for t in all_tasks if t is not engine_task], return_exceptions=True)
                 return
             if collector_task in done:
                 exc = collector_task.exception()
                 if exc is not None:
-                    engine_task.cancel()
-                    await asyncio.gather(engine_task, return_exceptions=True)
-                    raise exc
-                raise RuntimeError("order-book collector stopped before paper engine finished")
+                    _log.error("orchestrator: collector failed with exception: %r", exc)
+                    # Do NOT cancel engine — collector failure is no longer fatal
+                else:
+                    _log.info("orchestrator: collector exited cleanly — engine continues")
+                all_tasks.remove(collector_task)
+                continue
+            if reconcile_task in done:
+                exc = reconcile_task.exception()
+                if exc is not None:
+                    _log.error("orchestrator: reconcile task failed: %r", exc)
+                else:
+                    _log.info("orchestrator: reconcile task complete")
+                all_tasks.remove(reconcile_task)
+                continue
     finally:
-        for task in (collector_task, engine_task):
+        for task in all_tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(collector_task, engine_task, return_exceptions=True)
+        await asyncio.gather(*all_tasks, return_exceptions=True)
 
 
 def main() -> None:
@@ -225,6 +297,18 @@ def main() -> None:
 
     live_root = _resolve_live_root()
 
+    # Pre-start duplicate-session guard
+    if not args.dry_run:
+        ph_path = resolve_snapshot_dir(live_root) / "latest_process_health.json"
+        if ph_path.exists():
+            try:
+                ph = json.loads(ph_path.read_text(encoding="utf-8"))
+                if ph.get("session_date") == today.isoformat() and ph.get("phase") == "complete":
+                    _log.warning("orchestrator: session for %s already complete — exiting", today)
+                    sys.exit(0)
+            except Exception:
+                pass
+
     if not args.dry_run:
         if not _check_health_monitor_running(live_root):
             _log.warning("orchestrator: health monitor not detected — proceeding anyway")
@@ -233,10 +317,19 @@ def main() -> None:
     _log.info("orchestrator: profile=%s date=%s live_root=%s dry_run=%s",
               args.profile, today, live_root, args.dry_run)
 
-    if args.dry_run:
-        asyncio.run(_run_dry(profile, today, live_root, access_token, client_id))
-    else:
-        asyncio.run(_run_live(profile, today, live_root, access_token, client_id))
+    exit_code = 0
+    try:
+        if args.dry_run:
+            asyncio.run(_run_dry(profile, today, live_root, access_token, client_id))
+        else:
+            asyncio.run(_run_live(profile, today, live_root, access_token, client_id))
+    except SystemExit:
+        raise
+    except Exception:
+        _log.exception("orchestrator: session failed")
+        exit_code = 1
+    # Ensure the interpreter exits so systemd marks the service inactive (dead).
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

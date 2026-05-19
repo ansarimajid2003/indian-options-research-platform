@@ -294,11 +294,64 @@ class LivePaperTests(unittest.TestCase):
         self.assertEqual(validate_profile(profile).status, "PASS")
         budget = validate_depth_budget(profile)
         self.assertEqual(budget.status, "PASS")
-        self.assertIn("102 instruments", budget.detail)
+        self.assertIn("246 instruments", budget.detail)
 
         too_small = json.loads(json.dumps(profile))
-        too_small["depth_collection"]["max_depth_connections"] = 2
+        too_small["depth_collection"]["max_depth_connections"] = 4
         self.assertEqual(validate_depth_budget(too_small).status, "FAIL")
+
+    def test_live_feed_skips_nse_options_when_depth_collector_owns_them(self) -> None:
+        engine = PaperTradingEngine(
+            profile={"profile_name": "test", "symbols": {}, "vix": {}},
+            session_date=date(2026, 5, 18),
+            depth_cache=DepthCache(),
+            access_token="token",
+            client_id="client",
+            live_root=Path("tmp_live_tests") / "feed_scope_case",
+        )
+        self.assertFalse(engine._needs_live_option_feed(
+            "NIFTY",
+            {"depth_source": "dhan_20depth", "min_dte": 1},
+            date(2026, 5, 19),
+        ))
+        self.assertFalse(engine._needs_live_option_feed(
+            "SENSEX",
+            {"depth_source": "top_of_book", "min_dte": 1, "max_dte": 2},
+            date(2026, 5, 21),
+        ))
+        self.assertTrue(engine._needs_live_option_feed(
+            "SENSEX",
+            {"depth_source": "top_of_book", "min_dte": 1, "max_dte": 3},
+            date(2026, 5, 21),
+        ))
+
+    def test_feed_state_treats_zero_option_feed_sample_as_healthy(self) -> None:
+        import os
+        root = Path("tmp_live_tests") / "feed_state_core_only"
+        shutil.rmtree(root, ignore_errors=True)
+        old_env = os.environ.pop("IM_SNAPSHOT_DIR", None)
+        try:
+            engine = PaperTradingEngine(
+                profile={"profile_name": "test", "symbols": {}, "vix": {}},
+                session_date=date(2026, 5, 18),
+                depth_cache=DepthCache(),
+                access_token="token",
+                client_id="client",
+                live_root=root,
+            )
+            engine._ensure_dirs()
+            engine._feed_connected = True
+            engine._subscribed_ids = engine._core_subscriptions()
+            engine._write_feed_state()
+            state = json.loads((root / "snapshots" / "latest_feed_state.json").read_text())
+        finally:
+            if old_env is None:
+                os.environ.pop("IM_SNAPSHOT_DIR", None)
+            else:
+                os.environ["IM_SNAPSHOT_DIR"] = old_env
+
+        self.assertEqual(state["quote_freshness_pct"], 100.0)
+        self.assertEqual(state["quote_freshness_sample_size"], 0)
 
     def test_resume_checkpoint_metadata_reaches_eod_summary(self) -> None:
         root = Path("tmp_live_tests") / "resume_summary_case"
@@ -643,6 +696,40 @@ class EngineStallTests(unittest.TestCase):
         active = asyncio.run(run_case())
         self.assertFalse(any("engine_stall" in k for k in active),
                          f"engine_stall should clear when snaps fresh, got {list(active)}")
+        self.assertFalse(any("market_data_lag" in k for k in active),
+                         f"market_data_lag should clear when snaps fresh, got {list(active)}")
+
+    def test_feed_and_depth_staleness_without_process_stall_is_warning(self) -> None:
+        async def run_case() -> dict:
+            import sys as _sys
+            root = Path("tmp_live_tests") / "market_data_lag_only"
+            self._write_snaps(root, process_age=0, feed_age=60, depth_age=60)
+            monitor = HealthMonitor(profile={}, live_root=root)
+            monitor._service_became_active_mono = 0.0
+            monitor._service_was_active = True
+
+            def _systemd_active(cmd, *args, **kwargs):
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with patch("scripts.live.health_monitor._is_market_hours", return_value=True), \
+                    patch("scripts.live.health_monitor._is_feed_active", return_value=True), \
+                    patch("scripts.live.health_monitor._is_trading_day", return_value=True), \
+                    patch("scripts.live.health_monitor.shutil.which", return_value="/bin/systemctl"), \
+                    patch("scripts.live.health_monitor.subprocess.run", side_effect=_systemd_active), \
+                    patch.object(_sys, "platform", "linux"):
+                monitor._stall_indicators = {}
+                await monitor._check_runner_process()
+                await monitor._check_feed_state()
+                await monitor._check_depth_snapshot()
+                await monitor._check_collector_heartbeat()
+                await monitor._emit_engine_stall()
+            return {key: rec for key, rec in monitor._active_alerts.items()}
+
+        active = asyncio.run(run_case())
+        lag_keys = [k for k in active if "market_data_lag" in k]
+        self.assertEqual(len(lag_keys), 1, f"expected 1 market_data_lag alert, got {list(active)}")
+        self.assertEqual(active[lag_keys[0]]["severity"], "warning")
+        self.assertFalse(any("engine_stall" in k for k in active))
 
     def test_alert_storm_simulation_one_alert_zero_restarts(self) -> None:
         """100 critical-check ticks with persistent stale snapshots — the 5/15
@@ -731,6 +818,22 @@ class EngineStallTests(unittest.TestCase):
         n_restarts = asyncio.run(run_case())
         self.assertEqual(n_restarts, 0, "monitor must never invoke systemctl restart")
 
+    def test_alert_counts_follow_jsonl_rows_not_repeated_checks(self) -> None:
+        async def run_case() -> tuple[int, int]:
+            root = Path("tmp_live_tests") / "alert_count_jsonl_rows"
+            shutil.rmtree(root, ignore_errors=True)
+            monitor = HealthMonitor(profile={}, live_root=root)
+            with patch("scripts.live.health_monitor._is_preflight_window", return_value=False):
+                await monitor._alert("critical", "engine", "engine_stall", "first")
+                await monitor._alert("critical", "engine", "engine_stall", "repeat")
+            alert_path = root / "alerts" / f"{monitor._date_str}_alerts.jsonl"
+            rows = len([line for line in alert_path.read_text().splitlines() if line.strip()])
+            return rows, monitor._alert_counts["critical"]
+
+        rows, count = asyncio.run(run_case())
+        self.assertEqual(rows, 1)
+        self.assertEqual(count, 1)
+
 
 # ── WebSocket alert payload bounded ───────────────────────────────────────────
 
@@ -741,6 +844,222 @@ class WSAlertBudgetTests(unittest.TestCase):
         # 5/15 audit: 334 KB frames with full history. 20 rows ≈ a few KB.
         self.assertGreater(_WS_ALERT_TAIL, 0)
         self.assertLessEqual(_WS_ALERT_TAIL, 50)
+
+
+class SpotHistoryTests(unittest.TestCase):
+    def _bars(self, session_date: date, complete: bool = True) -> list[dict]:
+        from options_backtest.spot_history import expected_session_index
+        idx = expected_session_index(session_date)
+        if not complete:
+            idx = idx[:10]
+        bars = []
+        for i, ts in enumerate(idx):
+            epoch = int((ts - pd.Timestamp("1970-01-01")) / pd.Timedelta("1s"))
+            bars.append({"time": epoch, "open": 100 + i, "high": 101 + i, "low": 99 + i, "close": 100.5 + i})
+        return bars
+
+    def test_live_spot_session_appends_only_when_complete(self) -> None:
+        from options_backtest.spot_history import append_live_session_if_complete
+        root = Path("tmp_live_tests") / "spot_history_complete"
+        shutil.rmtree(root, ignore_errors=True)
+        spot_dir = root / "processed" / "spot"
+        spot_dir.mkdir(parents=True, exist_ok=True)
+        (spot_dir / "nifty50_1min_CANONICAL.csv").write_text("datetime,open,high,low,close,volume\n")
+
+        ok, coverage, written = append_live_session_if_complete(
+            data_root=root,
+            session_date=date(2026, 5, 15),
+            live_bars_by_symbol={"NIFTY": self._bars(date(2026, 5, 15), complete=True)},
+            symbols=["NIFTY"],
+        )
+        self.assertTrue(ok)
+        self.assertEqual(len(written), 1)
+        self.assertTrue(all(c.complete for c in coverage))
+        out = pd.read_csv(spot_dir / "nifty50_1min_CANONICAL.csv")
+        self.assertEqual(len(out), 375)
+        self.assertEqual(out["datetime"].iloc[0], "2026-05-15 09:15:00")
+        self.assertEqual(out["datetime"].iloc[-1], "2026-05-15 15:29:00")
+
+    def test_live_spot_session_rejects_incomplete_capture(self) -> None:
+        from options_backtest.spot_history import append_live_session_if_complete
+        root = Path("tmp_live_tests") / "spot_history_incomplete"
+        shutil.rmtree(root, ignore_errors=True)
+        spot_dir = root / "processed" / "spot"
+        spot_dir.mkdir(parents=True, exist_ok=True)
+        (spot_dir / "nifty50_1min_CANONICAL.csv").write_text("datetime,open,high,low,close,volume\n")
+
+        ok, coverage, written = append_live_session_if_complete(
+            data_root=root,
+            session_date=date(2026, 5, 15),
+            live_bars_by_symbol={"NIFTY": self._bars(date(2026, 5, 15), complete=False)},
+            symbols=["NIFTY"],
+        )
+        self.assertFalse(ok)
+        self.assertEqual(written, [])
+        self.assertEqual(coverage[0].rows, 10)
+        out = pd.read_csv(spot_dir / "nifty50_1min_CANONICAL.csv")
+        self.assertEqual(len(out), 0)
+
+    def test_paper_engine_writes_one_spot_coverage_alert_when_incomplete(self) -> None:
+        root = Path("tmp_live_tests") / "spot_history_alert"
+        shutil.rmtree(root, ignore_errors=True)
+        engine = PaperTradingEngine(
+            profile={"profile_name": "test", "symbols": {}, "vix": {}},
+            session_date=date(2026, 5, 15),
+            depth_cache=DepthCache(),
+            access_token="token",
+            client_id="client",
+            live_root=root,
+        )
+        engine._spot_bars["NIFTY"] = self._bars(date(2026, 5, 15), complete=False)
+        engine._finalize_spot_history()
+
+        alert_path = root / "alerts" / "20260515_alerts.jsonl"
+        rows = [json.loads(line) for line in alert_path.read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["component"], "spot_data")
+        self.assertEqual(rows[0]["reason"], "spot_coverage_incomplete")
+
+
+class WriterThreadTests(unittest.TestCase):
+    def test_writer_thread_writes_append_only_parquet(self) -> None:
+        from scripts.live.collect_order_book import _WriterThread, _build_depth_row, _instrument_key
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as td:
+            live_root = Path(td)
+            writer = _WriterThread("20260519", live_root)
+            meta = {"symbol": "NIFTY", "expiry": "2026-05-19", "strike": 23650, "option_type": "CE"}
+            ts = pd.Timestamp("2026-05-19 09:30:00", tz="Asia/Kolkata")
+            row = _build_depth_row(
+                [DepthLevel(price=100.0, quantity=10, orders=1)],
+                [DepthLevel(price=101.0, quantity=20, orders=2)],
+                meta, ts,
+            )
+            writer.enqueue_norm(_instrument_key(meta), row)
+            time.sleep(0.1)
+            writer.stop()
+
+            norm_dir = live_root / "order_book" / "20260519"
+            files = list(norm_dir.glob("NIFTY_2026-05-19_23650_CE_*.parquet"))
+            self.assertTrue(len(files) > 0, "Expected at least one minute-partitioned parquet file")
+            df = pd.read_parquet(files[0])
+            self.assertIn("mid", df.columns)
+            self.assertGreaterEqual(len(df), 1)
+
+    def test_writer_thread_raw_flush(self) -> None:
+        from scripts.live.collect_order_book import _WriterThread
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as td:
+            live_root = Path(td)
+            writer = _WriterThread("20260519", live_root)
+            writer.enqueue_raw(b"test_packet")
+            time.sleep(0.1)
+            writer.stop()
+
+            raw_dir = live_root / "raw_depth_packets" / "20260519"
+            files = list(raw_dir.glob("depth_*.bin"))
+            self.assertTrue(len(files) > 0, "Expected at least one raw bin file")
+            self.assertEqual(files[0].read_bytes(), b"test_packet")
+
+
+class CollectorStartupTests(unittest.TestCase):
+    def test_discover_symbol_with_retry_returns_none_on_failure(self) -> None:
+        from scripts.live.collect_order_book import _discover_symbol_with_retry
+        import asyncio
+
+        class FailingResolver:
+            def fetch_expiry_list(self, *args, **kwargs):
+                return [date(2026, 5, 19)]
+            def refresh_option_chain(self, *args, **kwargs):
+                raise RuntimeError("simulated failure")
+            def security_ids_around_chain_atm(self, *args, **kwargs):
+                return []
+            @property
+            def _chain_lock(self):
+                import threading
+                return threading.Lock()
+            @property
+            def _chain(self):
+                return {}
+
+        resolver = FailingResolver()
+        result = asyncio.run(_discover_symbol_with_retry(
+            "NIFTY", resolver, date(2026, 5, 19), 13, "IDX_I", atm_offset_range=20, max_retries=2,
+        ))
+        self.assertIsNone(result)
+
+
+class ProcessExitTests(unittest.TestCase):
+    def test_main_exits_zero_on_dry_run(self) -> None:
+        from scripts.live.run_paper_trading import main
+        import sys
+
+        with patch.object(sys, "argv", ["run_paper_trading.py", "--dry-run"]):
+            with self.assertRaises(SystemExit) as cm:
+                main()
+            self.assertEqual(cm.exception.code, 0)
+
+
+class PositionMarkTests(unittest.TestCase):
+    def test_write_position_marks_with_no_positions(self) -> None:
+        import tempfile
+        from options_backtest.paper_engine import PaperTradingEngine
+
+        with tempfile.TemporaryDirectory() as td:
+            live_root = Path(td)
+            engine = PaperTradingEngine(
+                profile={"profile_name": "test", "symbols": {}, "vix": {}},
+                session_date=date(2026, 5, 19),
+                depth_cache=DepthCache(),
+                access_token="token",
+                client_id="client",
+                live_root=live_root,
+            )
+            engine._write_position_marks()
+            marks_path = live_root / "snapshots" / "latest_position_marks.json"
+            self.assertFalse(marks_path.exists(), "No marks file when no open positions")
+
+    def test_write_equity_tick_with_no_positions(self) -> None:
+        import tempfile
+        from options_backtest.paper_engine import PaperTradingEngine
+
+        with tempfile.TemporaryDirectory() as td:
+            live_root = Path(td)
+            engine = PaperTradingEngine(
+                profile={"profile_name": "test", "symbols": {}, "vix": {}},
+                session_date=date(2026, 5, 19),
+                depth_cache=DepthCache(),
+                access_token="token",
+                client_id="client",
+                live_root=live_root,
+            )
+            engine._write_equity_tick()
+            tick_path = live_root / "snapshots" / "latest_equity_tick.json"
+            self.assertTrue(tick_path.exists())
+            data = json.loads(tick_path.read_text())
+            self.assertEqual(data["open_positions"], 0)
+            self.assertEqual(data["realised_net_pnl"], 0.0)
+
+
+class OptionChainMetaTests(unittest.TestCase):
+    def test_get_option_chain_returns_dict_with_metadata(self) -> None:
+        import tempfile
+        from options_backtest.dashboard_bridge import DashboardBridge
+
+        with tempfile.TemporaryDirectory() as td:
+            live_root = Path(td)
+            bridge = DashboardBridge(live_root)
+            result = bridge.get_option_chain("NIFTY")
+            self.assertIsInstance(result, dict)
+            self.assertIn("symbol", result)
+            self.assertIn("rows", result)
+            self.assertIn("depth_status", result)
+            self.assertIn("strike_step", result)
+            self.assertIsInstance(result["rows"], list)
 
 
 if __name__ == "__main__":

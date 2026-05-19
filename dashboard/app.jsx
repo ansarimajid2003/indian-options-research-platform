@@ -333,6 +333,9 @@ function App() {
   const [chainData, setChainData] = useState({
     NIFTY: [], FINNIFTY: [], MIDCPNIFTY: [], SENSEX: [],
   });
+  const [chainMeta, setChainMeta] = useState({
+    NIFTY: {}, FINNIFTY: {}, MIDCPNIFTY: {}, SENSEX: {},
+  });
   const [chainLoaded, setChainLoaded] = useState(false);
 
   const seriesRef = useRef(null);
@@ -423,12 +426,26 @@ function App() {
       const responses = { NIFTY: n, FINNIFTY: f, MIDCPNIFTY: m, SENSEX: s };
       setChainData(prev => {
         const next = { ...prev };
-        Object.entries(responses).forEach(([sym, rows]) => {
-          if (Array.isArray(rows)) next[sym] = rows;
+        Object.entries(responses).forEach(([sym, data]) => {
+          if (data && Array.isArray(data.rows)) next[sym] = data.rows;
         });
         return next;
       });
-      if (Object.values(responses).some(rows => Array.isArray(rows))) {
+      setChainMeta(prev => {
+        const next = { ...prev };
+        Object.entries(responses).forEach(([sym, data]) => {
+          if (data && typeof data === 'object') {
+            next[sym] = {
+              underlying_spot: data.underlying_spot,
+              strike_step: data.strike_step,
+              atm_strike: data.atm_strike,
+              depth_status: data.depth_status,
+            };
+          }
+        });
+        return next;
+      });
+      if (Object.values(responses).some(data => data && Array.isArray(data.rows))) {
         setChainLoaded(true);
       }
     });
@@ -560,7 +577,7 @@ function App() {
               <EquityCurvePanel seriesRef={seriesRef} equityState={equity}
                 accentColor={tweaks.accentColor} />
               <SpotChartsRow spotData={spotData} marketClosed={marketClosed} />
-              <OptionChainPanel chainData={chainData} chainLoaded={chainLoaded} marketClosed={marketClosed} session={session} />
+              <OptionChainPanel chainData={chainData} chainMeta={chainMeta} chainLoaded={chainLoaded} marketClosed={marketClosed} session={session} />
               <SignalLogPanel entries={signalLog} />
               <div ref={alertPanelRef} className="span-alerts">
                 <AlertsPanel alerts={alerts} />

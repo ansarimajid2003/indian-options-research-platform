@@ -573,18 +573,20 @@ function _chainSpot(rows) {
   return bestRow.strike + ce - pe;
 }
 
-const OptionChainPanel = React.memo(function OptionChainPanel({ chainData, chainLoaded, marketClosed, session }) {
+const OptionChainPanel = React.memo(function OptionChainPanel({ chainData, chainMeta, chainLoaded, marketClosed, session }) {
   const symbols = ['NIFTY','FINNIFTY','MIDCPNIFTY','SENSEX'];
   const [active, setActive] = useState('NIFTY');
   const rows = chainData[active] || [];
+  const meta = chainMeta[active] || {};
 
   const engineOffline = !session || session.engine_phase === 'offline' || !session.feed_connected;
   const noData = chainLoaded && rows.length === 0;
+  const depthUnavailable = meta.depth_status === 'unavailable';
 
-  // ATM filtering is done in the bridge (all 4 symbols); rows are already ATM ± 15
-  const spot = rows.length ? _chainSpot(rows) : null;
-  const step = rows.length > 1 ? rows[1].strike - rows[0].strike : 100;
-  const atmStrike = spot != null ? Math.round(spot / step) * step : null;
+  // Use backend-provided spot and ATM (no frontend put-call parity)
+  const spot = meta.underlying_spot != null ? meta.underlying_spot : (rows.length ? _chainSpot(rows) : null);
+  const step = meta.strike_step || (rows.length > 1 ? rows[1].strike - rows[0].strike : 100);
+  const atmStrike = meta.atm_strike != null ? meta.atm_strike : (spot != null ? Math.round(spot / step) * step : null);
   const visibleRows = rows;  // bridge pre-filters; keep for isAtm highlight only
 
   return (
@@ -606,8 +608,8 @@ const OptionChainPanel = React.memo(function OptionChainPanel({ chainData, chain
       </div>
       <div className="chain-tabs">
         {symbols.map(s => {
-          const sRows = chainData[s] || [];
-          const sSpot = sRows.length ? _chainSpot(sRows) : null;
+          const sMeta = chainMeta[s] || {};
+          const sSpot = sMeta.underlying_spot != null ? sMeta.underlying_spot : (chainData[s]?.length ? _chainSpot(chainData[s]) : null);
           return (
             <div key={s} className={`chain-tab ${active === s ? 'active' : ''}`} onClick={() => setActive(s)}>
               {s}
@@ -646,6 +648,18 @@ const OptionChainPanel = React.memo(function OptionChainPanel({ chainData, chain
                 <span style={{fontSize:10, color:'var(--text-4)'}}>Engine has not fetched chains yet · available after 09:15 IST</span>
               </>
           }
+        </div>
+      )}
+      {/* Depth unavailable banner */}
+      {depthUnavailable && (
+        <div style={{
+          margin:'0 14px 8px', padding:'6px 12px', borderRadius:3,
+          background:'rgba(248,113,113,0.08)', border:'1px solid rgba(248,113,113,0.25)',
+          display:'flex', alignItems:'center', gap:8, fontSize:10, color:'var(--text-3)',
+        }}>
+          <span style={{fontWeight:600, letterSpacing:'0.06em', color:'var(--red)'}}>DEPTH UNAVAILABLE</span>
+          <span>·</span>
+          <span>Collector did not subscribe this symbol — quotes shown are stale or missing</span>
         </div>
       )}
       {/* When market is closed show EOD snapshot banner inline (no blocking overlay) */}

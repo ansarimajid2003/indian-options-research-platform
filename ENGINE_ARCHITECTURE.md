@@ -1,7 +1,9 @@
 # Options Backtest Engine — Architecture Reference
 
 > Single-source-of-truth for the engine. Read this file instead of individual modules.
-> Updated: May 2026. Reflects multi-index support (BANKNIFTY/FINNIFTY/MIDCPNIFTY), monthly expiry fallback, min_dte config, min_leg_premium on ShortStrangle, weekly t-stat, and the bars_for() monthly DTE fix.
+> Updated: May 2026. Reflects multi-index support (BANKNIFTY/FINNIFTY/MIDCPNIFTY/SENSEX), monthly expiry fallback, min_dte config, min_leg_premium on ShortStrangle, weekly t-stat, and the bars_for() monthly DTE fix.
+
+> **Live infrastructure** (paper engine, live resolver, depth cache, dashboard bridge, health monitor) is documented in `docs/design/wing6_live_deployment_reference.md`. This file covers backtest engine internals only.
 
 ---
 
@@ -10,7 +12,7 @@
 ```
 options_backtest/
   schemas.py          Core data structures (Contract, Leg, Fill, Trade, BacktestConfig, BacktestResult)
-  calendar.py         NSE trading calendar, instrument metadata, lot-size schedules, expiry logic
+  calendar.py         NSE/BSE trading calendar, instrument metadata, lot-size schedules, expiry logic
   data_store.py       Shoonya CSV reader + normaliser; builds option_bars and spot_bars DataFrames
   contract_resolver.py  Bar lookup (O(log n)), ATM resolution, strike cache — generic/Shoonya path
   liquidity.py        Entry gate (volume/OI thresholds) + OI-based slippage multiplier
@@ -22,6 +24,14 @@ options_backtest/
   reports.py          Metrics (Sharpe/Sortino/Calmar/t-stat), ledger, equity curve, markdown output
   validation.py       Data quality auditing (standalone; not in hot path)
   cli.py              Command-line entry point
+  # Live infrastructure (see docs/design/wing6_live_deployment_reference.md)
+  paper_engine.py     Daily paper trading loop: Dhan websocket, entry/exit, checkpointing, EOD reports
+  live_resolver.py    Live contract resolver backed by Dhan REST option chain + websocket quote cache
+  depth_cache.py      Thread-safe 20-level depth cache shared between collector and paper engine
+  dashboard_bridge.py Read-only TTL-cached file bridge for FastAPI dashboard (never opens Dhan sockets)
+  live_paths.py       Path resolution helpers (durable vs snapshot dirs, tmpfs fallback)
+  clock_sync.py       NTP sync check/remediation for pre-market clock validation
+  spot_history.py     Appends live spot sessions to canonical static CSVs
 ```
 
 ---
@@ -31,7 +41,7 @@ options_backtest/
 ```
 Raw data on disk
   Shoonya: data/raw/options/shoonya/nifty/YYYYMMDD/{STRIKE}{CE|PE}_YYYYMMDD.csv + nifty_spot.csv
-  Dhan:    data/processed/options/dhan/{nifty|banknifty|finnifty|midcpnifty}/week/expiry_code_1/{call|put}/{ATM|ATMp1..ATMp10|ATMm1..ATMm10}.parquet
+  Dhan:    data/processed/options/dhan/{nifty|banknifty|finnifty|midcpnifty|sensex}/week/expiry_code_1/{call|put}/{ATM|ATMp1..ATMp10|ATMm1..ATMm10}.parquet
   Spot:    data/processed/spot/{nifty50_1min_CANONICAL|banknifty_1min_DHAN|finnifty_1min_DHAN|midcpnifty_1min_DHAN}.csv
 
        ↓ data_store.py (Shoonya) or dhan_loader.py (Dhan)
@@ -130,7 +140,7 @@ class InstrumentSpec:
     spot_csv: str | None       # canonical 1-min spot path for BnH baseline
 ```
 
-`INSTRUMENT_SPECS` contains entries for all four supported symbols. Key `weekly_discontinued_after` dates:
+`INSTRUMENT_SPECS` contains entries for all five supported symbols (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX). Key `weekly_discontinued_after` dates:
 
 | Symbol | Weekly expiry weekday | Discontinued after | Falls back to |
 |---|---|---|---|
@@ -138,6 +148,7 @@ class InstrumentSpec:
 | BANKNIFTY | Wednesday (was Thursday pre-Sep 2023) | 2024-11-13 | Monthly (last Thursday/Tuesday) |
 | FINNIFTY | Tuesday | 2024-11-19 | Monthly (last Tuesday) |
 | MIDCPNIFTY | Monday (was Wednesday pre-Aug 2023) | 2024-11-18 | Monthly (last Monday/Thursday) |
+| SENSEX | Friday (→ Tuesday Jan 2025 → Thursday Sep 2025) | — (still active) | — |
 
 After a symbol's `weekly_discontinued_after`, `weekly_expiry_on_or_after()` automatically delegates to `monthly_expiry_on_or_after()`. All calling code is transparent to this — pass `expiry_type="week"` and the correct expiry (weekly or monthly) is returned.
 
@@ -258,7 +269,7 @@ All rates looked up from schedules based on trade_date:
 
 Pre-2026 rates are different — `ChargesConfig.for_date(d)` returns the correct schedule. STT was 0.10% Oct 2024–Mar 2026, 0.0625% before that.
 
-Break-even premium move: ~₹1/unit. Round-trip cost at ₹100 premium: ₹65–80/lot.
+Break-even premium move: ~₹1/unit. Total round-trip: ~₹50–65/lot at ₹100 premium.
 
 ---
 
@@ -294,7 +305,7 @@ Optional method `get_spot_stop_level(context) → float | None` — return a spo
 | `SingleLegOption` | 1 | `option_type`, `side`, `atm_offset`, `lots` | Buy or sell any single leg at ATM ± offset |
 | `ShortStraddle` | 2 | `lots` | Sell ATM call + ATM put |
 | `ShortStrangle` | 2 | `call_offset=2`, `put_offset=-2`, `lots`, `min_leg_premium=0.0` | Sell OTM call + put; skips entry if either leg close < `min_leg_premium` |
-| `IronCondor` | 4 | `short_call_offset=2`, `long_call_offset=4`, `short_put_offset=-2`, `long_put_offset=-4`, `lots` | Sell OTM call/put + buy further OTM call/put |
+| `IronCondor` | 4 | `short_call_offset=2`, `long_call_offset=4`, `short_put_offset=-2`, `long_put_offset=-4`, `lots` | Sell OTM call/put + buy further OTM call/put. **Note:** class defaults to ±4 wings; the live Wing-6 deployment overrides `long_call_offset=8` and `long_put_offset=-8` |
 | `ThreePMDirectional` | 1 | `signal_time`, `lots` | 3 PM bullish → buy call; bearish → buy put |
 | `ThreePMV2Put` | 1 | `lots` | 3 PM bullish + 3:15 bearish → buy ATM put |
 | `ThreePMV2CallLevelStop` | 1 | `lots` | Same setup → buy ATM call; spot-stop at 3 PM close level |
@@ -426,7 +437,7 @@ Wraps `DhanOptionData`; sliced to `[trade_date, exit_date]` window.
 Subclass of `BacktestEngine`. Overrides `run()` entirely:
 
 1. Loads `DhanOptionData` once (or accepts pre-loaded via `data=` kwarg)
-2. Auto-selects canonical spot CSV from `InstrumentSpec.spot_csv` for the symbol (BANKNIFTY, FINNIFTY, MIDCPNIFTY each have their own spot file)
+2. Auto-selects canonical spot CSV from `InstrumentSpec.spot_csv` for the symbol (BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX each have their own spot file)
 3. Iterates `all_dates` (filtered by from_date/to_date)
 4. For each date:
    - `strategy.can_enter(trade_date, canonical_spot_by_date)` — fast pre-filter

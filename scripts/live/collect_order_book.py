@@ -1,10 +1,9 @@
 """
 NSE 20-level order-book collector for Wing-6 paper trading.
 
-Manages three Dhan 20-depth websocket connections (≤50 instruments each):
-  Connection 1: 34 NIFTY options
-  Connection 2: 34 FINNIFTY options
-  Connection 3: 34 MIDCPNIFTY options
+Manages up to five Dhan 20-depth websocket connections (<=50 instruments each):
+  Configured major-index universe: NIFTY + FINNIFTY + MIDCPNIFTY
+  Default capture width: ATM +/- 20 strikes = 246 NSE option contracts
 
 Binary packet format (Dhan twentydepth feed):
   Header   : 12 bytes  — <hh i i>  (feed_code int16, msg_len int16, security_id int32, ts_ms int32)
@@ -25,7 +24,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import queue
 import struct
+import threading
 import time as _time
 from collections import defaultdict
 from datetime import date, datetime
@@ -75,7 +76,7 @@ _FLUSH_INTERVAL = 60        # seconds
 _RECONNECT_DELAY = 5        # seconds between reconnect attempts
 _PING_INTERVAL = 10         # seconds between server pings
 
-# NSE options universe for 20-depth (ATM ±8 strikes = 17 strikes × 2 types = 34 per symbol)
+# NSE options universe for 20-depth; concrete width comes from live config.
 _MAJOR_NSE_INDEX_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
 _NSE_SYMBOLS = _MAJOR_NSE_INDEX_SYMBOLS  # Backward-compatible alias for the shadowed legacy coroutine.
 
@@ -157,129 +158,139 @@ def _disconnect_code(raw: bytes) -> int | None:
     return None
 
 
-class _RawWriter:
-    """Buffered raw-packet writer. Flushes every _FLUSH_INTERVAL seconds."""
-
-    def __init__(self, date_str: str, live_root: Path) -> None:
-        self._dir = live_root / "raw_depth_packets" / date_str
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._buffer: list[bytes] = []
-        self._lock = asyncio.Lock()
-        self._last_flush = _time.monotonic()
-
-    async def append(self, raw: bytes) -> None:
-        async with self._lock:
-            self._buffer.append(raw)
-            if _time.monotonic() - self._last_flush >= _FLUSH_INTERVAL:
-                await self._flush_locked()
-
-    async def flush(self) -> None:
-        async with self._lock:
-            await self._flush_locked()
-
-    async def _flush_locked(self) -> None:
-        if not self._buffer:
-            return
-        ts_str = datetime.now().strftime("%H%M%S%f")
-        out_path = self._dir / f"depth_{ts_str}.bin"
-        data = b"".join(self._buffer)
-        out_path.write_bytes(data)
-        self._buffer = []
-        self._last_flush = _time.monotonic()
+def _instrument_key(meta: dict) -> str:
+    return f"{meta['symbol']}_{meta['expiry']}_{meta['strike']}_{meta['option_type']}"
 
 
-class _NormalizedBuffer:
-    """Per-instrument depth row accumulator; flushes to parquet every _FLUSH_INTERVAL s."""
+def _build_depth_row(snap_bid: list[DepthLevel], snap_ask: list[DepthLevel], meta: dict, ts: pd.Timestamp) -> dict:
+    """Build a normalized depth row dict from bid/ask snapshots."""
+    row: dict = {"timestamp": ts.isoformat()}
+    for i, lv in enumerate(snap_bid[:20], 1):
+        row[f"bid_p{i}"] = lv.price
+        row[f"bid_q{i}"] = lv.quantity
+        row[f"bid_o{i}"] = lv.orders
+    for i in range(len(snap_bid) + 1, 21):
+        row[f"bid_p{i}"] = row[f"bid_q{i}"] = row[f"bid_o{i}"] = 0
+    for i, lv in enumerate(snap_ask[:20], 1):
+        row[f"ask_p{i}"] = lv.price
+        row[f"ask_q{i}"] = lv.quantity
+        row[f"ask_o{i}"] = lv.orders
+    for i in range(len(snap_ask) + 1, 21):
+        row[f"ask_p{i}"] = row[f"ask_q{i}"] = row[f"ask_o{i}"] = 0
+    best_bid = snap_bid[0].price if snap_bid else 0.0
+    best_ask = snap_ask[0].price if snap_ask else 0.0
+    mid = (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0
+    spread_abs = best_ask - best_bid
+    spread_pct = spread_abs / mid if mid > 0 else 0.0
+    total_bid = sum(lv.quantity for lv in snap_bid)
+    total_ask = sum(lv.quantity for lv in snap_ask)
+    total = total_bid + total_ask
+    imbalance = (total_bid - total_ask) / total if total > 0 else 0.0
+    qty1 = snap_bid[0].quantity if snap_bid else 0
+    qty1_ask = snap_ask[0].quantity if snap_ask else 0
+    vwap_buy = sum(lv.price * lv.quantity for lv in snap_ask) / total_ask if total_ask else 0.0
+    vwap_sell = sum(lv.price * lv.quantity for lv in snap_bid) / total_bid if total_bid else 0.0
+    row.update({
+        "best_bid": best_bid, "best_ask": best_ask, "mid": mid,
+        "spread_abs": spread_abs, "spread_pct": spread_pct,
+        "total_bid_qty": total_bid, "total_ask_qty": total_ask, "imbalance": imbalance,
+        "depth_vwap_buy_lots_1": vwap_buy, "depth_vwap_sell_lots_1": vwap_sell,
+        "depth_qty_at_best_bid": qty1, "depth_qty_at_best_ask": qty1_ask,
+    })
+    return row
+
+
+class _WriterThread:
+    """Dedicated thread for all blocking disk I/O."""
 
     def __init__(self, date_str: str, live_root: Path) -> None:
         self._date_str = date_str
-        self._dir = live_root / "order_book" / date_str
+        self._raw_dir = live_root / "raw_depth_packets" / date_str
+        self._norm_dir = live_root / "order_book" / date_str
         self._dir_1min = live_root / "order_book_1min" / date_str
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._dir_1min.mkdir(parents=True, exist_ok=True)
-        # instrument_key -> list of row dicts
-        self._rows: dict[str, list[dict]] = defaultdict(list)
-        self._lock = asyncio.Lock()
-        self._last_flush = _time.monotonic()
+        for d in (self._raw_dir, self._norm_dir, self._dir_1min):
+            d.mkdir(parents=True, exist_ok=True)
+        self._q: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        self._stop_requested = False
+        self._flush_seq = 0
 
-    def _instrument_key(self, meta: dict) -> str:
-        return f"{meta['symbol']}_{meta['expiry']}_{meta['strike']}_{meta['option_type']}"
+    def enqueue_raw(self, raw: bytes) -> None:
+        if not self._stop_requested:
+            self._q.put(("raw", raw))
 
-    def _build_row(self, snap_bid, snap_ask, meta: dict, ts: pd.Timestamp) -> dict:
-        row: dict = {"timestamp": ts.isoformat()}
-        for i, lv in enumerate(snap_bid[:20], 1):
-            row[f"bid_p{i}"] = lv.price
-            row[f"bid_q{i}"] = lv.quantity
-            row[f"bid_o{i}"] = lv.orders
-        for i in range(len(snap_bid) + 1, 21):
-            row[f"bid_p{i}"] = row[f"bid_q{i}"] = row[f"bid_o{i}"] = 0
-        for i, lv in enumerate(snap_ask[:20], 1):
-            row[f"ask_p{i}"] = lv.price
-            row[f"ask_q{i}"] = lv.quantity
-            row[f"ask_o{i}"] = lv.orders
-        for i in range(len(snap_ask) + 1, 21):
-            row[f"ask_p{i}"] = row[f"ask_q{i}"] = row[f"ask_o{i}"] = 0
-        best_bid = snap_bid[0].price if snap_bid else 0.0
-        best_ask = snap_ask[0].price if snap_ask else 0.0
-        mid = (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0
-        spread_abs = best_ask - best_bid
-        spread_pct = spread_abs / mid if mid > 0 else 0.0
-        total_bid = sum(lv.quantity for lv in snap_bid)
-        total_ask = sum(lv.quantity for lv in snap_ask)
-        total = total_bid + total_ask
-        imbalance = (total_bid - total_ask) / total if total > 0 else 0.0
-        qty1 = snap_bid[0].quantity if snap_bid else 0
-        qty1_ask = snap_ask[0].quantity if snap_ask else 0
-        vwap_buy = sum(lv.price * lv.quantity for lv in snap_ask) / total_ask if total_ask else 0.0
-        vwap_sell = sum(lv.price * lv.quantity for lv in snap_bid) / total_bid if total_bid else 0.0
-        row.update({
-            "best_bid": best_bid, "best_ask": best_ask, "mid": mid,
-            "spread_abs": spread_abs, "spread_pct": spread_pct,
-            "total_bid_qty": total_bid, "total_ask_qty": total_ask, "imbalance": imbalance,
-            "depth_vwap_buy_lots_1": vwap_buy, "depth_vwap_sell_lots_1": vwap_sell,
-            "depth_qty_at_best_bid": qty1, "depth_qty_at_best_ask": qty1_ask,
-        })
-        return row
+    def enqueue_norm(self, ikey: str, row: dict) -> None:
+        if not self._stop_requested:
+            self._q.put(("norm", ikey, row))
 
-    async def append_snapshot(
-        self,
-        snap_bid: list[DepthLevel],
-        snap_ask: list[DepthLevel],
-        meta: dict,
-        ts: pd.Timestamp,
-    ) -> None:
-        row = self._build_row(snap_bid, snap_ask, meta, ts)
-        ikey = self._instrument_key(meta)
-        async with self._lock:
-            self._rows[ikey].append(row)
-            if _time.monotonic() - self._last_flush >= _FLUSH_INTERVAL:
-                await self._flush_locked()
+    def _loop(self) -> None:
+        raw_buffer: list[bytes] = []
+        norm_rows: dict[str, list[dict]] = defaultdict(list)
+        last_raw_flush = _time.monotonic()
+        last_norm_flush = _time.monotonic()
 
-    async def flush(self) -> None:
-        async with self._lock:
-            await self._flush_locked()
+        while True:
+            try:
+                item = self._q.get(timeout=1.0)
+            except queue.Empty:
+                item = None
 
-    async def _flush_locked(self) -> None:
-        if not self._rows:
+            if item is not None and item[0] == "stop":
+                self._stop_requested = True
+                break
+
+            if item is not None:
+                kind = item[0]
+                if kind == "raw":
+                    raw_buffer.append(item[1])
+                elif kind == "norm":
+                    norm_rows[item[1]].append(item[2])
+
+            now = _time.monotonic()
+            if now - last_raw_flush >= _FLUSH_INTERVAL:
+                if raw_buffer:
+                    self._flush_raw(raw_buffer)
+                    raw_buffer = []
+                last_raw_flush = now
+            if now - last_norm_flush >= _FLUSH_INTERVAL:
+                if norm_rows:
+                    self._flush_norm(norm_rows)
+                    norm_rows = defaultdict(list)
+                last_norm_flush = now
+
+        # Final flush after stop
+        if raw_buffer:
+            self._flush_raw(raw_buffer)
+        if norm_rows:
+            self._flush_norm(norm_rows)
+
+    def _flush_raw(self, buffer: list[bytes]) -> None:
+        if not buffer:
             return
-        for ikey, rows in self._rows.items():
+        ts_str = datetime.now().strftime("%H%M%S%f")
+        out_path = self._raw_dir / f"depth_{ts_str}.bin"
+        out_path.write_bytes(b"".join(buffer))
+
+    def _flush_norm(self, rows_by_ikey: dict[str, list[dict]]) -> None:
+        if not rows_by_ikey:
+            return
+        self._flush_seq += 1
+        seq = self._flush_seq
+        minute_bucket = datetime.now().strftime("%H%M")
+        for ikey, rows in rows_by_ikey.items():
             if not rows:
                 continue
             df = pd.DataFrame(rows)
-            out_path = self._dir / f"{ikey}.parquet"
-            # Append mode: read existing, concat, write back
-            if out_path.exists():
-                existing = pd.read_parquet(out_path)
-                df = pd.concat([existing, df], ignore_index=True)
+            # Tick-level depth parquet — append-only, no reads during market hours
+            out_path = self._norm_dir / f"{ikey}_{minute_bucket}_{seq:04d}.parquet"
             tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
             pq.write_table(pa.Table.from_pandas(df), str(tmp_path), compression="snappy")
             tmp_path.replace(out_path)
-            # 1-min OHLCV aggregate
-            self._write_1min(df, ikey)
-        self._rows = defaultdict(list)
-        self._last_flush = _time.monotonic()
+            # 1-min OHLCV derived from these ticks — also append-only
+            self._write_1min(df, ikey, minute_bucket, seq)
 
-    def _write_1min(self, df: pd.DataFrame, ikey: str) -> None:
+    def _write_1min(self, df: pd.DataFrame, ikey: str, minute_bucket: str, seq: int) -> None:
         df2 = df.copy()
         df2["timestamp"] = pd.to_datetime(df2["timestamp"])
         df2 = df2.set_index("timestamp").sort_index()
@@ -288,17 +299,14 @@ class _NormalizedBuffer:
         agg = df2["mid"].resample("1min").ohlc()
         agg["volume"] = df2["total_bid_qty"].resample("1min").sum()
         agg["spread_pct_mean"] = df2["spread_pct"].resample("1min").mean()
-        out_path = self._dir_1min / f"{ikey}.parquet"
-        if out_path.exists():
-            existing = pd.read_parquet(out_path)
-            if "timestamp" in existing.columns:
-                existing["timestamp"] = pd.to_datetime(existing["timestamp"])
-                existing = existing.set_index("timestamp").sort_index()
-            agg = pd.concat([existing, agg])
-            agg = agg[~agg.index.duplicated(keep="last")].sort_index()
+        out_path = self._dir_1min / f"{ikey}_{minute_bucket}_{seq:04d}.parquet"
         tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
         pq.write_table(pa.Table.from_pandas(agg.reset_index()), str(tmp_path), compression="snappy")
         tmp_path.replace(out_path)
+
+    def stop(self) -> None:
+        self._q.put(("stop",))
+        self._thread.join(timeout=30)
 
 
 def _write_gap_sentinel(live_root: Path, date_str: str, symbol: str, gap_start: str, gap_end: str, reason: str) -> None:
@@ -391,6 +399,8 @@ def _write_collector_state(
     date_str: str,
     status: str,
     security_ids: list[str],
+    configured_symbols: list[str] | None = None,
+    failed_symbols: list[str] | None = None,
 ) -> None:
     payload = {
         "written_at": _now_ist().isoformat(),
@@ -398,6 +408,8 @@ def _write_collector_state(
         "pid": os.getpid(),
         "status": status,
         "configured_security_ids": len(security_ids),
+        "configured_symbols": configured_symbols or [],
+        "failed_symbols": failed_symbols or [],
     }
     _write_atomic_json(resolve_durable_dir(live_root) / "latest_depth_collector_state.json", payload)
 
@@ -461,8 +473,7 @@ class DepthCollector:
         self._client_id = client_id
         self._live_root = live_root
         self._date_str = date_str
-        self._raw_writer = _RawWriter(date_str, live_root)
-        self._norm_buf = _NormalizedBuffer(date_str, live_root)
+        self._writer = _WriterThread(date_str, live_root)
         self._stop_event = asyncio.Event()
         self._started_at: str | None = None
         self._backpressure_instruments: set[str] = set()
@@ -482,14 +493,11 @@ class DepthCollector:
             asyncio.create_task(self._connection_loop(url, batch, conn_idx))
             for conn_idx, batch in enumerate(batches)
         ]
-        flush_task = asyncio.create_task(self._periodic_flush())
         await self._stop_event.wait()
-        flush_task.cancel()
         for t in tasks:
             t.cancel()
-        await asyncio.gather(*tasks, flush_task, return_exceptions=True)
-        await self._raw_writer.flush()
-        await self._norm_buf.flush()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._writer.stop()
 
     async def _connection_loop(self, url: str, sids: list[str], conn_idx: int) -> None:
         """Reconnect loop for one depth websocket connection."""
@@ -533,7 +541,7 @@ class DepthCollector:
             await ws.send(json.dumps(sub))
 
     async def _handle_packet(self, raw: bytes) -> None:
-        await self._raw_writer.append(raw)
+        self._writer.enqueue_raw(raw)
         for packet in _iter_packets(raw):
             code = _disconnect_code(packet)
             if code is not None:
@@ -553,17 +561,14 @@ class DepthCollector:
             if snap is not None and sid in self._id_to_meta:
                 meta = self._id_to_meta[sid]
                 try:
-                    await self._norm_buf.append_snapshot(snap.bid_levels, snap.ask_levels, meta, ts)
+                    row = _build_depth_row(snap.bid_levels, snap.ask_levels, meta, ts)
+                    self._writer.enqueue_norm(_instrument_key(meta), row)
                 except Exception:
                     if sid not in self._backpressure_instruments:
                         self._backpressure_instruments.add(sid)
                         print(f"[depth_collector] collector_backpressure sid={sid}")
 
-    async def _periodic_flush(self) -> None:
-        while not self._stop_event.is_set():
-            await asyncio.sleep(_FLUSH_INTERVAL)
-            await self._raw_writer.flush()
-            await self._norm_buf.flush()
+
 
 
 def _build_subscription_universe(
@@ -618,6 +623,33 @@ def _depth_collection_settings(profile: dict) -> tuple[list[str], int, int]:
     return symbols, offset_range, max_depth_connections
 
 
+async def _discover_symbol_with_retry(
+    symbol: str,
+    resolver: LiveDhanContractResolver,
+    expiry: date,
+    scrip_id: int,
+    segment: str,
+    atm_offset_range: int,
+    max_retries: int = 3,
+) -> tuple[list[str], dict[str, dict]] | None:
+    """Build subscription universe for one symbol with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                await asyncio.sleep(2.0 * (2 ** attempt))
+            sids, id_to_meta = _build_subscription_universe(
+                symbol, resolver, expiry, scrip_id, segment,
+                atm_offset_range=atm_offset_range,
+            )
+            return sids, id_to_meta
+        except Exception as exc:
+            if attempt < max_retries - 1:
+                print(f"[collect_order_book] {symbol} chain discovery attempt {attempt + 1} failed: {exc} — retrying")
+            else:
+                print(f"[collect_order_book] {symbol} chain discovery failed after {max_retries} attempts: {exc}")
+                return None
+
+
 async def collect_order_book(
     profile: dict,
     session_date: date,
@@ -626,8 +658,14 @@ async def collect_order_book(
     client_id: str,
     live_root: Path | None = None,
     dry_run: bool = False,
+    reconcile_symbols: list[str] | None = None,
 ) -> None:
-    """Collect configured major-index 20-depth data in pooled 50-instrument batches."""
+    """Collect configured major-index 20-depth data in pooled 50-instrument batches.
+
+    Args:
+        reconcile_symbols: If provided, subscribe depth for these symbols only
+            (used by the engine's 09:17 reconciliation pass).
+    """
     if live_root is None:
         live_root = _live_root()
 
@@ -649,8 +687,17 @@ async def collect_order_book(
         print("[collect_order_book] No major NSE index symbols configured for depth collection")
         return
 
+    if reconcile_symbols is not None:
+        # Reconciliation mode: only process symbols the engine asks for
+        depth_symbols = [s for s in reconcile_symbols if s in depth_symbols]
+        if not depth_symbols:
+            print("[collect_order_book] reconcile_symbols has no overlap with configured depth symbols")
+            return
+        print(f"[collect_order_book] RECONCILIATION mode for symbols: {depth_symbols}")
+
     all_sids: list[str] = []
     all_meta: dict[str, dict] = {}
+    failed_symbols: list[str] = []
 
     for symbol in depth_symbols:
         sym_cfg = profile.get("symbols", {}).get(symbol, {})
@@ -670,25 +717,22 @@ async def collect_order_book(
         valid_expiries = [e for e in expiries if e >= session_date]
         if not valid_expiries:
             print(f"[collect_order_book] SKIP {symbol} - no valid (non-expired) expiries (got: {expiries[:3]})")
+            failed_symbols.append(symbol)
             continue
         expiry = valid_expiries[0]
 
         gap_start = _now_ist().isoformat()
-        try:
-            sids, id_to_meta = _build_subscription_universe(
-                symbol,
-                resolver,
-                expiry,
-                scrip_id,
-                segment,
-                atm_offset_range=atm_offset_range,
-            )
-        except Exception as exc:
-            print(f"[collect_order_book] SKIP {symbol} - chain discovery failed: {exc}")
+        result = await _discover_symbol_with_retry(
+            symbol, resolver, expiry, scrip_id, segment,
+            atm_offset_range=atm_offset_range,
+        )
+        if result is None:
             gap_end = _now_ist().isoformat()
-            _write_gap_sentinel(live_root, date_str, symbol, gap_start, gap_end, f"chain_discovery_failed: {exc}")
+            _write_gap_sentinel(live_root, date_str, symbol, gap_start, gap_end, "chain_discovery_failed")
+            failed_symbols.append(symbol)
             continue
 
+        sids, id_to_meta = result
         print(f"[collect_order_book] {symbol}: {len(sids)} instruments for expiry {expiry} ATM +/- {atm_offset_range}")
         for sid in sids:
             if sid in all_meta:
@@ -696,25 +740,34 @@ async def collect_order_book(
             all_sids.append(sid)
             all_meta[sid] = id_to_meta[sid]
 
-    if not all_sids:
-        print("[collect_order_book] No symbols to collect - exiting")
-        return
+    configured_symbols = list(depth_symbols)
 
-    depth_connections = (len(all_sids) + _MAX_PER_CONN - 1) // _MAX_PER_CONN
-    if depth_connections > max_depth_connections:
-        raise RuntimeError(
-            f"Depth universe needs {depth_connections} Dhan 20-depth connections for "
-            f"{len(all_sids)} instruments, above configured max_depth_connections={max_depth_connections}. "
-            "Reduce depth_collection.symbols or depth_collection.atm_offset_range."
-        )
+    if not all_sids:
+        print("[collect_order_book] WARNING: no depth instruments discovered — collector has nothing to subscribe")
+        _write_collector_state(live_root, date_str, "running", all_sids, configured_symbols, failed_symbols)
+        # Keep running so the snapshot loop writes empty depth state; engine may still trade SENSEX
+        depth_connections = 0
+    else:
+        depth_connections = (len(all_sids) + _MAX_PER_CONN - 1) // _MAX_PER_CONN
+        if depth_connections > max_depth_connections:
+            raise RuntimeError(
+                f"Depth universe needs {depth_connections} Dhan 20-depth connections for "
+                f"{len(all_sids)} instruments, above configured max_depth_connections={max_depth_connections}. "
+                "Reduce depth_collection.symbols or depth_collection.atm_offset_range."
+            )
 
     print(
         f"[collect_order_book] major-index universe: {len(all_sids)} instruments, "
-        f"{depth_connections} depth connections"
+        f"{depth_connections} depth connections, failed={failed_symbols}"
     )
     if _write_restart_gap_if_needed(live_root, date_str):
         print("[collect_order_book] restart gap sentinel written")
-    _write_collector_state(live_root, date_str, "running", all_sids)
+    _write_collector_state(live_root, date_str, "running", all_sids, configured_symbols, failed_symbols)
+    if not all_sids:
+        # Nothing to collect — just run the snapshot loop so depth state stays fresh
+        await _depth_snapshot_loop(live_root, date_str, depth_cache, all_sids, all_meta)
+        return
+
     collector = DepthCollector(
         symbol="NSE_MAJOR_INDICES",
         security_ids=all_sids,
@@ -744,7 +797,7 @@ async def collect_order_book(
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.to_thread(_write_collector_state, live_root, date_str, "stopped", all_sids)
+        await asyncio.to_thread(_write_collector_state, live_root, date_str, "stopped", all_sids, configured_symbols, failed_symbols)
 
 
 if __name__ == "__main__":

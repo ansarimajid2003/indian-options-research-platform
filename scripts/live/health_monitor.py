@@ -374,8 +374,8 @@ class HealthMonitor:
 
     async def _run_critical_checks(self) -> None:
         try:
-            # Reset stall indicators at start of each tick; sub-checks below will
-            # flag indicators and _emit_engine_stall collapses them into one alert.
+            # Reset lag/stall indicators at start of each tick; sub-checks below
+            # flag indicators and _emit_engine_stall emits one grouped incident.
             self._stall_indicators = {}
             runner = await self._check_runner_process()
             collector = await self._check_collector_heartbeat()
@@ -413,26 +413,40 @@ class HealthMonitor:
             _log.error("critical checks failed unexpectedly: %r", exc)
 
     def _flag_stall(self, name: str, detail: str) -> None:
-        """Record an engine-stall indicator collected during the current tick."""
+        """Record a lag/stall indicator collected during the current tick."""
         self._stall_indicators[name] = detail
 
     async def _emit_engine_stall(self) -> None:
         """
-        Collapse the 4-alert staleness family (process_health, feed_state,
-        depth_snapshot, collector_heartbeat) into a single engine_stall
-        incident. One JSONL row per state transition instead of one row per
-        sub-check per tick.
+        Collapse staleness symptoms into one operator-facing incident.
+
+        A stale process heartbeat means the runner itself is probably wedged, so
+        that remains critical engine_stall. Fresh process heartbeat with stale
+        feed/depth/collector snapshots is market-data lag and should not be
+        counted as engine death.
         """
-        if self._stall_indicators:
+        process_detail = self._stall_indicators.get("process_health")
+        if process_detail is not None:
             reasons = ", ".join(f"{k}({v})" for k, v in sorted(self._stall_indicators.items()))
             await self._alert(
                 "critical",
                 "engine",
                 "engine_stall",
-                f"engine stall — {reasons}",
+                f"engine stall - {reasons}",
             )
+            await self._clear_alert("engine", "market_data_lag")
+        elif self._stall_indicators:
+            reasons = ", ".join(f"{k}({v})" for k, v in sorted(self._stall_indicators.items()))
+            await self._alert(
+                "warning",
+                "engine",
+                "market_data_lag",
+                f"market data lag - {reasons}",
+            )
+            await self._clear_alert("engine", "engine_stall")
         else:
             await self._clear_alert("engine", "engine_stall")
+            await self._clear_alert("engine", "market_data_lag")
 
     async def _run_slow_checks(self) -> None:
         try:
@@ -1077,7 +1091,6 @@ class HealthMonitor:
     async def _alert(self, severity: str, component: str, reason: str, message: str) -> None:
         message = _scrub_message(message)
         key = f"{severity}:{component}:{reason}"
-        self._alert_counts[severity] = self._alert_counts.get(severity, 0) + 1
         existing = self._active_alerts.get(key, {})
         self._active_alerts[key] = {
             "severity": severity,
@@ -1102,6 +1115,7 @@ class HealthMonitor:
             with self._alerts_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
             self._alert_jsonl_write_times[key] = now_mono
+            self._alert_counts[severity] = self._alert_counts.get(severity, 0) + 1
 
         level = logging.CRITICAL if severity == "critical" else logging.WARNING if severity == "warning" else logging.INFO
         _log.log(level, "alert: [%s] %s %s - %s", severity.upper(), component, reason, message)

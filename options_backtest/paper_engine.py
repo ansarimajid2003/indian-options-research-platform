@@ -31,10 +31,12 @@ from .depth_cache import DepthCache
 from .live_paths import resolve_durable_dir, resolve_snapshot_dir
 from .live_resolver import LiveDhanContractResolver, StaleQuoteError
 from .schemas import Contract, OptionType, Side
+from .spot_history import append_live_session_if_complete
 from .volatility_filter import VIX_BUCKETS
 
 _IST = ZoneInfo("Asia/Kolkata")
 _log = logging.getLogger(__name__)
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Dhan live feed endpoint
 _FEED_URL = "wss://api-feed.dhan.co?version=2&token={token}&clientId={client_id}&authType=2"
@@ -53,6 +55,7 @@ _TYPE_DISCONNECT = 50
 
 # Fatal codes: do not reconnect
 _FATAL_DISCONNECT_CODES = {805, 806, 807, 808, 809}
+_LIVE_OPTION_FEED_SOURCES = {"top_of_book"}
 
 # Exchange segment strings for live feed subscriptions
 _SEG_IDX = "IDX_I"
@@ -468,16 +471,35 @@ class PaperTradingEngine:
         # 15:31 — flush + EOD report
         await _sleep_until(_T_EOD, self._session_date)
         self._phase = "eod"
-        self._generate_eod_report()
-        # Write final EOD snapshots — these persist as the definitive closing chain
-        # until the engine restarts next morning.
-        await asyncio.to_thread(self._write_feed_state)
-        await asyncio.to_thread(self._write_spot_bars)
-        await asyncio.to_thread(self._write_eod_snapshot)
+        await self._run_eod_step("eod_report", self._generate_eod_report)
+        # Critical EOD artifacts first: these keep the dashboard/session audit
+        # coherent even when optional archival work is disabled or slow.
+        await self._run_eod_step("feed_state", self._write_feed_state)
+        await self._run_eod_step("spot_bars", self._write_spot_bars)
+        await self._run_eod_step("eod_snapshot", self._write_eod_snapshot)
 
         self._stop_event.set()
         await asyncio.gather(feed_task, snapshot_task, health_task, vix_rest_task, return_exceptions=True)
+
+        if self._profile.get("global", {}).get("append_live_spot_history", False):
+            await self._run_eod_step("spot_history", self._finalize_spot_history)
+        else:
+            _log.info("eod_step: spot_history skipped append_live_spot_history=false")
+        self._phase = "complete"
+        self._feed_connected = False
+        await self._run_eod_step("feed_state_complete", self._write_feed_state)
+        await self._run_eod_step("process_health_complete", self._write_process_health)
         _log.info("paper_engine: session complete")
+
+    async def _run_eod_step(self, name: str, fn: Any) -> None:
+        start = _time.monotonic()
+        _log.info("eod_step: %s start", name)
+        try:
+            await asyncio.to_thread(fn)
+        except Exception as exc:
+            _log.exception("eod_step: %s failed: %r", name, exc)
+            return
+        _log.info("eod_step: %s complete duration=%.1fs", name, _time.monotonic() - start)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Live feed websocket
@@ -514,11 +536,22 @@ class PaperTradingEngine:
                             break
             except asyncio.CancelledError:
                 break
+            except websockets.ConnectionClosed as exc:
+                self._feed_connected = False
+                _log.warning(
+                    "live_feed: disconnected close_code=%s close_reason=%r detail=%r - reconnecting in 5s",
+                    getattr(exc, "code", None),
+                    getattr(exc, "reason", ""),
+                    exc,
+                )
+                if self._fatal_disconnect:
+                    _log.error("live_feed: fatal disconnect code - aborting reconnect")
+                    break
             except Exception as exc:
                 self._feed_connected = False
-                _log.warning("live_feed: disconnected — %r — reconnecting in 5s", exc)
+                _log.warning("live_feed: disconnected - %r - reconnecting in 5s", exc)
                 if self._fatal_disconnect:
-                    _log.error("live_feed: fatal disconnect code — aborting reconnect")
+                    _log.error("live_feed: fatal disconnect code - aborting reconnect")
                     break
             self._ws = None
             if not self._stop_event.is_set() and not self._fatal_disconnect:
@@ -695,6 +728,19 @@ class PaperTradingEngine:
     # Chain fetch + subscriptions
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _needs_live_option_feed(self, symbol: str, sym_cfg: dict, expiry: date) -> bool:
+        """Return True only for option contracts that need the quote/full feed."""
+        if sym_cfg.get("depth_source") not in _LIVE_OPTION_FEED_SOURCES:
+            return False
+        dte = (expiry - self._session_date).days
+        min_dte = int(sym_cfg.get("min_dte", 1))
+        if dte < min_dte:
+            return False
+        max_dte = sym_cfg.get("max_dte")
+        if max_dte is not None and dte > int(max_dte):
+            return False
+        return True
+
     async def _fetch_chains_and_subscribe(self) -> None:
         instruments_to_sub: list[dict] = []
         depth_cfg = self._profile.get("depth_collection", {})
@@ -765,23 +811,36 @@ class PaperTradingEngine:
 
             _log.info("chain_fetch: %s expiry=%s instruments=%d", symbol, expiry, len(sids))
 
-            # Determine exchange segment for options subscriptions
-            if symbol == "SENSEX":
-                exch_seg = _SEG_BSE_FNO
+            if self._needs_live_option_feed(symbol, sym_cfg, expiry):
+                # Determine exchange segment for option subscriptions.
+                exch_seg = _SEG_BSE_FNO if symbol == "SENSEX" else _SEG_NSE_FNO
+                for sid in sids:
+                    instruments_to_sub.append({"ExchangeSegment": exch_seg, "SecurityId": sid})
             else:
-                exch_seg = _SEG_NSE_FNO
-
-            for sid in sids:
-                instruments_to_sub.append({"ExchangeSegment": exch_seg, "SecurityId": sid})
+                _log.info(
+                    "live_feed: %s option subscriptions skipped depth_source=%s dte=%d",
+                    symbol,
+                    sym_cfg.get("depth_source"),
+                    (expiry - self._session_date).days,
+                )
 
         self._subscribed_ids = instruments_to_sub
         self._write_instrument_map()
 
         if self._ws is not None and self._feed_connected:
-            await self._subscribe_instruments(self._ws, instruments_to_sub)
-            _log.info("live_feed: subscribed %d instruments", len(instruments_to_sub))
+            core_keys = {
+                (inst["ExchangeSegment"], str(inst["SecurityId"]))
+                for inst in self._core_subscriptions()
+            }
+            queued = [
+                inst for inst in instruments_to_sub
+                if (inst["ExchangeSegment"], str(inst["SecurityId"])) not in core_keys
+            ]
+            if queued:
+                await self._subscribe_instruments(self._ws, queued)
+            _log.info("live_feed: subscription set=%d queued_options=%d", len(instruments_to_sub), len(queued))
         else:
-            _log.warning("live_feed: not connected at chain_fetch — subscriptions queued")
+            _log.warning("live_feed: not connected at chain_fetch - subscriptions queued")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Resolve check (09:17)
@@ -1269,6 +1328,8 @@ class PaperTradingEngine:
                 await asyncio.gather(
                     asyncio.to_thread(self._write_feed_state),
                     asyncio.to_thread(self._write_spot_bars),
+                    asyncio.to_thread(self._write_position_marks),
+                    asyncio.to_thread(self._write_equity_tick),
                     return_exceptions=True,
                 )
             except Exception as exc:
@@ -1289,11 +1350,13 @@ class PaperTradingEngine:
             await asyncio.sleep(_SNAPSHOT_INTERVAL)
 
     def _write_feed_state(self) -> None:
-        # Quote freshness: fraction of subscribed option IDs with a fresh quote
+        # Quote freshness only covers option IDs carried on the quote/full feed.
+        # NSE option fills use the separate 20-depth collector, so zero sampled
+        # feed options is healthy rather than 0% fresh.
         sub_sids = [inst["SecurityId"] for inst in self._subscribed_ids
                     if inst.get("ExchangeSegment") in (_SEG_NSE_FNO, _SEG_BSE_FNO)]
         ready = sum(1 for sid in sub_sids if self._is_quote_fresh(sid)) if sub_sids else 0
-        freshness_pct = round(ready / len(sub_sids) * 100, 1) if sub_sids else 0.0
+        freshness_pct = round(ready / len(sub_sids) * 100, 1) if sub_sids else 100.0
         quotes = self._merged_quote_snapshot()
 
         state = {
@@ -1301,6 +1364,7 @@ class PaperTradingEngine:
             "connected": self._feed_connected,
             "subscribed_count": len(self._subscribed_ids),
             "quote_freshness_pct": freshness_pct,
+            "quote_freshness_sample_size": len(sub_sids),
             "core_quotes": self._core_quote_state(quotes),
             "chain_status": dict(self._chain_status),
         }
@@ -1310,6 +1374,13 @@ class PaperTradingEngine:
         for sid, tob in self._last_tob.items():
             if sid not in quotes:
                 quotes[sid] = {"ltp": tob.get("ltp", 0.0), "oi": 0, "volume": 0, "ts": tob.get("ts", pd.Timestamp.now(tz="Asia/Kolkata")).isoformat()}
+            # Merge SENSEX top-of-book bid/ask when available
+            if "best_bid" in tob:
+                quotes[sid]["top_bid"] = tob["best_bid"]
+                quotes[sid]["top_ask"] = tob["best_ask"]
+                # Quantities not available from type-8 feed; set to 0
+                quotes[sid]["bid_qty"] = tob.get("bid_qty", 0)
+                quotes[sid]["ask_qty"] = tob.get("ask_qty", 0)
         # Attach IV and greeks from chain_greeks cache
         for sid, meta in self._chain_greeks.items():
             if sid in quotes:
@@ -1318,6 +1389,110 @@ class PaperTradingEngine:
                 quotes[sid]["theta"] = (meta.get("greeks") or {}).get("theta")
         if quotes:
             _write_atomic(self._snapshot_dir / "latest_quotes.json", {"written_at": _ts_str(), "quotes": quotes}, sync=False)
+
+    def _get_exit_mark(self, sid: str) -> tuple[float, str, int] | None:
+        """Return (mark_mid, basis, age_ms) for a security_id using depth or feed TOB."""
+        snap = self._depth_cache.snapshot(sid)
+        if snap is not None and snap.best_bid > 0 and snap.best_ask > 0:
+            mark = round((snap.best_bid + snap.best_ask) / 2, 2)
+            age_ms = int((pd.Timestamp.now(tz="Asia/Kolkata") - snap.bid_ts).total_seconds() * 1000)
+            return mark, "depth_cache", age_ms
+        tob = self._last_tob.get(sid)
+        if tob is not None and tob.get("best_bid", 0) > 0 and tob.get("best_ask", 0) > 0:
+            mark = round((tob["best_bid"] + tob["best_ask"]) / 2, 2)
+            age_ms = int((pd.Timestamp.now(tz="Asia/Kolkata") - tob["ts"]).total_seconds() * 1000)
+            return mark, "top_of_book_feed", age_ms
+        return None
+
+    def _write_position_marks(self) -> None:
+        """Write latest_position_marks.json with live mark-to-market for open positions."""
+        if not self._open_positions:
+            return
+        marks = []
+        for pos in self._open_positions:
+            leg_marks = []
+            total_mark_debit = 0.0
+            stale = False
+            for leg in pos.legs:
+                sid = str(leg.get("security_id", ""))
+                result = self._get_exit_mark(sid) if sid else None
+                if result is None:
+                    stale = True
+                    leg_marks.append({"security_id": sid, "mark": None, "basis": None, "age_ms": None})
+                    continue
+                mark, basis, age_ms = result
+                side = leg.get("side", "")
+                qty = leg.get("quantity", 0)
+                # Exit-side value: BUY to cover short, SELL long hedge
+                exit_value = mark * qty
+                leg_marks.append({"security_id": sid, "mark": mark, "basis": basis, "age_ms": age_ms})
+                total_mark_debit += exit_value
+
+            if stale:
+                marks.append({
+                    "symbol": pos.symbol,
+                    "expiry": pos.expiry.isoformat(),
+                    "current_mark": None,
+                    "unrealised_gross_pnl": None,
+                    "unrealised_net_pnl": None,
+                    "stale": True,
+                })
+                continue
+
+            gross = pos.entry_credit - total_mark_debit
+            # Approximate exit charges using entry charge ratio
+            charge_ratio = pos.entry_charges / pos.entry_credit if pos.entry_credit > 0 else 0.0
+            est_charges = total_mark_debit * charge_ratio
+            net = gross - est_charges
+            marks.append({
+                "symbol": pos.symbol,
+                "expiry": pos.expiry.isoformat(),
+                "current_mark": round(total_mark_debit, 2),
+                "unrealised_gross_pnl": round(gross, 2),
+                "unrealised_net_pnl": round(net, 2),
+                "stale": False,
+                "legs": leg_marks,
+            })
+
+        _write_atomic(
+            self._snapshot_dir / "latest_position_marks.json",
+            {"written_at": _ts_str(), "marks": marks},
+            sync=False,
+        )
+
+    def _write_equity_tick(self) -> None:
+        """Write latest_equity_tick.json with realised + unrealised PnL."""
+        realised = sum(t.get("net_pnl", 0.0) for t in self._completed_trades)
+        unrealised = 0.0
+        stale = False
+        for pos in self._open_positions:
+            total_mark_debit = 0.0
+            pos_stale = False
+            for leg in pos.legs:
+                sid = str(leg.get("security_id", ""))
+                result = self._get_exit_mark(sid) if sid else None
+                if result is None:
+                    pos_stale = True
+                    break
+                mark, _basis, _age = result
+                qty = leg.get("quantity", 0)
+                total_mark_debit += mark * qty
+            if pos_stale:
+                stale = True
+                continue
+            charge_ratio = pos.entry_charges / pos.entry_credit if pos.entry_credit > 0 else 0.0
+            est_charges = total_mark_debit * charge_ratio
+            unrealised += (pos.entry_credit - total_mark_debit - est_charges)
+
+        tick = {
+            "ts": _ts_str(),
+            "realised_net_pnl": round(realised, 2),
+            "unrealised_net_pnl": round(unrealised, 2) if not stale else None,
+            "total_net_pnl": round(realised + unrealised, 2) if not stale else None,
+            "open_positions": len(self._open_positions),
+            "quote_stale": stale,
+        }
+        _write_atomic(self._snapshot_dir / "latest_equity_tick.json", tick, sync=False)
 
     def _merged_quote_snapshot(self) -> dict[str, dict]:
         quotes: dict[str, dict] = {}
@@ -1378,8 +1553,7 @@ class PaperTradingEngine:
             bar["low"]  = min(bar["low"],  ltp)
             bar["close"] = ltp
 
-    def _write_spot_bars(self) -> None:
-        """Write latest_spot_bars.json — closed bars + current open bar for all spot symbols."""
+    def _spot_snapshot_payload(self) -> dict:
         bars_out: dict[str, list[dict]] = {}
         for sym in _SPOT_SID_TO_SYMBOL.values():
             closed = list(self._spot_bars[sym])
@@ -1396,12 +1570,61 @@ class PaperTradingEngine:
                      "low": open_bar["low"], "close": open_bar["close"]}
                 ]
             bars_out[sym] = closed
+        return {
+            "written_at": _ts_str(),
+            "session_date": self._session_date.isoformat(),
+            "bars": bars_out,
+        }
+
+    def _write_spot_bars(self) -> None:
+        """Write latest_spot_bars.json - closed bars + current open bar for all spot symbols."""
+        payload = self._spot_snapshot_payload()
+        bars_out = payload["bars"]
         if any(bars_out.values()):
-            _write_atomic(self._snapshot_dir / "latest_spot_bars.json", {
-                "written_at": _ts_str(),
-                "session_date": self._session_date.isoformat(),
-                "bars": bars_out,
-            }, sync=False)
+            _write_atomic(self._snapshot_dir / "latest_spot_bars.json", payload, sync=False)
+
+    def _finalize_spot_history(self) -> None:
+        """Append full live spot sessions to static CSVs; alert once if incomplete."""
+        payload = self._spot_snapshot_payload()
+        bars = payload.get("bars", {})
+        symbols = list(_SPOT_SID_TO_SYMBOL.values())
+        try:
+            ok, coverage, written = append_live_session_if_complete(
+                data_root=_REPO_ROOT / "data",
+                session_date=self._session_date,
+                live_bars_by_symbol=bars,
+                symbols=symbols,
+            )
+        except Exception as exc:
+            self._write_spot_coverage_alert(f"spot coverage validation failed: {exc!r}")
+            _log.warning("spot_history: validation failed - %r", exc)
+            return
+
+        if ok:
+            _log.info("spot_history: appended complete %s spot session to %d static CSVs", self._session_date, len(written))
+            return
+
+        detail = "; ".join(
+            f"{c.symbol} rows={c.rows}/{c.expected_rows} missing={c.missing_minutes} first={c.first} last={c.last}"
+            for c in coverage
+        )
+        self._write_spot_coverage_alert(
+            f"spot coverage incomplete for {self._session_date}; data not added to static CSVs. {detail}"
+        )
+        _log.warning("spot_history: incomplete coverage; static CSVs not updated - %s", detail)
+
+    def _write_spot_coverage_alert(self, message: str) -> None:
+        path = self._live_root / "alerts" / f"{self._date_str}_alerts.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": _ts_str(),
+            "severity": "warning",
+            "component": "spot_data",
+            "reason": "spot_coverage_incomplete",
+            "message": message,
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
 
     def _write_eod_snapshot(self) -> None:
         """Write latest_eod_snapshot.json at 15:31 — preserves true closing quotes."""

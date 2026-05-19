@@ -27,7 +27,7 @@ from typing import Any
 
 import pandas as pd
 
-from .calendar import is_trading_day as _is_trading_day
+from .calendar import is_trading_day as _is_trading_day, get_instrument_spec
 from .live_paths import resolve_durable_dir, resolve_snapshot_dir
 
 _REPO_ROOT = Path(__file__).parents[1]
@@ -350,11 +350,20 @@ class DashboardBridge:
             data = self._read_json(self._snap("latest_open_positions.json"))
             if not data:
                 return []
+            # Merge with live position marks if available
+            marks_data = self._read_json(self._snap("latest_position_marks.json")) or {}
+            marks_by_symbol: dict[str, dict] = {}
+            for m in marks_data.get("marks", []):
+                marks_by_symbol[m.get("symbol", "")] = m
+
             rows: list[PositionRow] = []
             for pos in data.get("open_positions", []):
                 legs = _parse_legs(pos.get("legs", []))
+                sym = pos.get("symbol", "")
+                mark = marks_by_symbol.get(sym, {})
+                stale = mark.get("stale", True)
                 rows.append(PositionRow(
-                    symbol=pos.get("symbol", ""),
+                    symbol=sym,
                     expiry=pos.get("expiry", ""),
                     lots=pos.get("lots", 0),
                     lot_size=pos.get("lot_size", 0),
@@ -362,9 +371,9 @@ class DashboardBridge:
                     entry_credit=pos.get("entry_credit", 0.0),
                     entry_charges=pos.get("entry_charges", 0.0),
                     legs=legs,
-                    current_mark=None,
-                    unrealised_gross_pnl=None,
-                    unrealised_net_pnl=None,
+                    current_mark=mark.get("current_mark") if not stale else None,
+                    unrealised_gross_pnl=mark.get("unrealised_gross_pnl") if not stale else None,
+                    unrealised_net_pnl=mark.get("unrealised_net_pnl") if not stale else None,
                 ))
             return rows
 
@@ -377,16 +386,24 @@ class DashboardBridge:
         date_str = session_date.strftime("%Y%m%d")
 
         def _load() -> list[EquityPoint]:
+            points: list[EquityPoint] = []
+            # Include live intraday tick if positions are open
+            tick = self._read_json(self._snap("latest_equity_tick.json")) or {}
+            if tick.get("total_net_pnl") is not None and tick.get("open_positions", 0) > 0:
+                points.append(EquityPoint(
+                    ts=tick.get("ts", ""),
+                    cumulative_gross_pnl=round(tick.get("realised_net_pnl", 0.0), 2),
+                    cumulative_net_pnl=round(tick.get("total_net_pnl", 0.0), 2),
+                ))
             path = self._root / "paper_trades" / f"{date_str}.json"
             if not path.exists():
-                return []
+                return points
             try:
                 trades: list[dict] = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
-                return []
-            points: list[EquityPoint] = []
-            cum_gross = 0.0
-            cum_net = 0.0
+                return points
+            cum_gross = points[-1].cumulative_gross_pnl if points else 0.0
+            cum_net = points[-1].cumulative_net_pnl if points else 0.0
             for trade in sorted(trades, key=lambda t: t.get("exit_time") or ""):
                 exit_t = trade.get("exit_time")
                 if not exit_t:
@@ -555,18 +572,11 @@ class DashboardBridge:
         atm = round(spot / step) * step
         return [r for r in rows if abs(r["strike"] - atm) <= n * step]
 
-    def get_option_chain(self, symbol: str) -> list[dict]:
+    def get_option_chain(self, symbol: str) -> dict:
         """
         Build a per-strike option chain for `symbol`.
 
-        Source priority:
-          - When market is closed and latest_eod_snapshot.json exists for today:
-            use that (true closing quotes written at 15:31).
-          - Otherwise use latest_instrument_map.json + latest_quotes.json (rolling 10s snapshot).
-
-        Rows are filtered to the nearest expiry and ATM ± 15 strikes so all
-        four symbols show liquid strikes only, regardless of how many far-OTM
-        contracts are in the instrument map.
+        Returns a dict with metadata (spot, atm_strike, depth_status) and rows.
         """
         from datetime import date as _date
         today = _date.today()
@@ -575,21 +585,40 @@ class DashboardBridge:
         eod_data = self._read_json(self._snap("latest_eod_snapshot.json")) or {}
         use_eod = eod_data.get("session_date") == today.isoformat() and bool(eod_data.get("instruments"))
 
+        # Strike step from calendar (always needed for metadata)
+        try:
+            spec = get_instrument_spec(symbol.upper())
+            step = spec.strike_step
+        except Exception:
+            step = 50
+
         if use_eod:
             instruments = eod_data.get("instruments", {})
             quotes = eod_data.get("quotes", {})
-            tob: dict[str, dict] = {}  # depth not included in EOD snapshot
+            tob: dict[str, dict] = {}
+            depth_status = "eod"
         else:
             imap_data = self._read_json(self._snap("latest_instrument_map.json"))
             if not imap_data:
-                return []
+                return {"symbol": symbol, "underlying_spot": None, "strike_step": step, "atm_strike": None, "depth_status": "unavailable", "rows": []}
             instruments = imap_data.get("instruments", {})
             quotes = (self._read_json(self._snap("latest_quotes.json")) or {}).get("quotes", {})
             tob = (self._read_json(self._snap("latest_depth_cache.json")) or {}).get("tob", {})
+            # Derive depth status from depth cache snapshot
+            dc = self._read_json(self._snap("latest_depth_cache.json")) or {}
+            by_symbol = dc.get("by_symbol", {})
+            sym_depth = by_symbol.get(symbol.upper(), {})
+            ready_pct = sym_depth.get("ready_pct", 0.0) if isinstance(sym_depth, dict) else 0.0
+            if ready_pct >= 95:
+                depth_status = "full"
+            elif ready_pct >= 50:
+                depth_status = "partial"
+            else:
+                depth_status = "unavailable"
 
         rows = self._build_chain_rows(instruments, quotes, tob, symbol.upper())
 
-        # Get spot from live spot bars for accurate ATM (avoids put-call parity failure on sparse chains)
+        # Get spot from live spot bars for accurate ATM
         spot: float | None = None
         live_bars = self._read_json(self._snap("latest_spot_bars.json")) or {}
         if live_bars.get("session_date") == today.isoformat():
@@ -597,7 +626,20 @@ class DashboardBridge:
             if sym_bars:
                 spot = float(sym_bars[-1].get("close", 0)) or None
 
-        return self._filter_chain_atm(rows, spot)
+        filtered_rows = self._filter_chain_atm(rows, spot)
+
+        atm_strike = None
+        if spot is not None and step:
+            atm_strike = int(round(spot / step) * step)
+
+        return {
+            "symbol": symbol.upper(),
+            "underlying_spot": spot,
+            "strike_step": step,
+            "atm_strike": atm_strike,
+            "depth_status": depth_status,
+            "rows": filtered_rows,
+        }
 
     # ── Depth health ─────────────────────────────────────────────────────────
 

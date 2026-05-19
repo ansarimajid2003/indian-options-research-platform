@@ -278,7 +278,7 @@ def get_alerts(
 
 
 @router.get("/option-chain/{symbol}", summary="Live per-strike option chain for a symbol")
-def get_option_chain(symbol: str, request: Request) -> list[dict]:
+def get_option_chain(symbol: str, request: Request) -> dict:
     return _bridge(request).get_option_chain(symbol.upper())
 
 

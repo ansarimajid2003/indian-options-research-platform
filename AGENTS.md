@@ -5,7 +5,7 @@
 
 Multi-index options backtest engine + research pipeline for Indian equity indices (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX).
 
-Current phase: defined-risk short-vol deployment → live monitoring / scaling.
+Current phase: **live paper trading** on zimaos (Wing-6 Iron Condor). No real orders placed. See § Live Deployment below.
 
 The codebase is organised into four layers:
 - **Engine** (`options_backtest/`): broker-neutral backtest engine with tiered fill model, cost accounting, and strategy plug-ins.
@@ -21,7 +21,7 @@ The codebase is organised into four layers:
   - Shoonya 1-min OHLCV (primary, NIFTY only, full strike chain)
   - Dhan rolling ATM JSON/parquet (2021–2026, ATM±10, embedded IV, all 5 indices)
   - NSE Bhavcopy EOD (2008–2026, long-run validation)
-- **No package manager files**: there is no `pyproject.toml`, `requirements.txt`, `setup.py`, `setup.cfg`, `Makefile`, `package.json`, or `Cargo.toml`. Dependencies are managed manually. Inspect imports to infer what is needed.
+- **No formal package manager files**: there is no `pyproject.toml`, root `requirements.txt`, `setup.py`, `setup.cfg`, `Makefile`, `package.json`, or `Cargo.toml`. `requirements-live.txt` exists only as the live-server dependency list. For research/backtest scripts, inspect imports to infer what is needed.
 - **No CI/CD**: no GitHub Actions, Docker, pre-commit hooks, or automated linting/formatting configs (no black, ruff, flake8, mypy configs present).
 
 ## Project Structure
@@ -84,10 +84,12 @@ The codebase is organised into four layers:
 │   ├── research/              # Data audits, KB reviews
 │   ├── setup/                 # Broker setup guides
 │   └── DATA_LAYOUT.md         # Canonical data layout reference
-├── reports/                   # Generated backtest and analysis outputs
+├── reports/                   # Generated backtest, analysis, live-audit outputs
 │   ├── backtests/
 │   ├── analysis/
 │   ├── data_quality/
+│   ├── live/
+│   │   └── session_audits/    # Daily live-paper session audits
 │   └── research/
 ├── logs/                      # Download and run logs
 ├── ENGINE_ARCHITECTURE.md     # Single-source-of-truth for engine internals
@@ -186,33 +188,31 @@ python -m unittest tests.test_bias_audit.BiasAuditTests -v
 
 ## Engine Reference
 
-**Before touching any engine code or writing strategies, read `ENGINE_ARCHITECTURE.md` first.**
-It is a single-file reference covering all 13 modules, the complete data flow, fill model tiers, strategy interface, how-to-write-strategies guide, and key invariants. Reading it replaces ~15 individual file reads. Always load it at the start of any engine-related session.
+**Before touching backtest engine code or writing strategies, read `ENGINE_ARCHITECTURE.md` first.**
+It covers the backtest internals: all modules, data flow, fill model tiers, strategy interface, how-to-write-strategies guide, and key invariants. Reading it replaces ~15 individual file reads.
+
+**Before touching live infrastructure (paper engine, dashboard API, health monitor, systemd services), read `docs/design/wing6_live_deployment_reference.md` first.**
+
+| Topic | Read this |
+|---|---|
+| Backtest engine, strategies, Dhan loader, reports | `ENGINE_ARCHITECTURE.md` |
+| Live paper trading, zimaos services, dashboard, entry gates, crash recovery | `docs/design/wing6_live_deployment_reference.md` |
 
 ## Active Alpha: Wing-6 Optimized Iron Condor
 
 Defined-risk iron condor across NIFTY, FINNIFTY, MIDCPNIFTY, SENSEX. BANKNIFTY excluded.
-Short at ±2 offsets, long at ±8 offsets (300-pt wings for NIFTY/FINNIFTY, 125–175 pt for MIDCPNIFTY, 600-pt for SENSEX).
+Short at ±2 offsets, long at ±8 offsets.
 
-Per-symbol filters: NIFTY VIX>=13 (weekly), FINNIFTY DTE<=7 (monthly), MIDCPNIFTY DTE<=7 (monthly), SENSEX DTE<=2 (weekly). Smart bucket policies per symbol.
+Per-symbol filters: NIFTY VIX>=13 (weekly), FINNIFTY DTE<=7 + skip VIX 10-13 (monthly), MIDCPNIFTY DTE<=7 + skip VIX 22-30 (monthly), SENSEX DTE<=2 (weekly).
 
-**Primary deployable (1:1:1:1 lots N:F:M:S, filtered 4x1 all VIX):**
+**Primary deployable (1:1:1:1 lots N:F:M:S, filtered 4x1):**
 - 901 trades | Net PnL +195,631 | CAGR 4.3% | Sharpe 2.746 | t-stat 5.302
 - Sortino 3.999 | Calmar 4.175 | MaxDD -1.0% | PF 1.988 | Win% 60%
 - IS: PnL +68,317, Sharpe 2.064 | OOS: PnL +127,314, Sharpe 3.892
 
-**Scaled deployment grid (same Sharpe/Calmar, linearly scaled risk):**
-
-| Scale | Lots (N:F:M:S) | CAGR | Sharpe | MaxDD% | Net PnL | CVaR95/day |
-|---|---:|---:|---:|---:|---:|---:|
-| 1x | 1:1:1:1 | 4.3% | 2.746 | -1.0% | +195,631 | -2,080 |
-| 2x | 2:2:2:2 | 8.1% | 2.746 | -2.0% | +391,262 | -4,160 |
-| 3x | 3:3:3:3 | 11.6% | 2.746 | -3.0% | +586,893 | -6,240 |
-| 4x | 4:4:4:4 | 14.9% | 2.746 | -4.0% | +782,524 | -8,320 |
-
 Sweet spot: 2x–3x scale → CAGR 8–12% with MaxDD under -3.5%.
 
-**All engine bugs fixed (May 2026).** Includes: expiry, calendar, stop gate, tiered slippage, OI liquidity thresholds, asymmetric exit fills, Sortino/Calmar metrics. Additional bias fixes (May 2026): `bars_for()` monthly DTE window removed (was silently skipping all trades >6 DTE from monthly expiry), `min_dte` config field added, weekly t-stat resampling, `ShortStrangle.min_leg_premium` for sub-tick MIDCPNIFTY filtering. Re-run with new config before drawing conclusions.
+**Full live setup** (services, disk layout, daily timeline, entry gates, fill model, crash recovery) → `docs/design/wing6_live_deployment_reference.md`.
 
 ## Code Rules
 
@@ -246,8 +246,8 @@ Break-even move: ~₹1/unit. All pre-2026 backtests are **invalid** until re-run
 3. ~~**Short-vol contributor validation**~~ ✓ Done May 2026.
 4. ~~**Structure upgrade**~~ ✓ Done May 2026 — Wing-6 IC validated: defined-risk iron condor across NIFTY/FINNIFTY/MIDCPNIFTY. Primary 1:2:2 lots, Sharpe 2.454, MaxDD -1.0%, t-stat 4.798.
 5. ~~**SENSEX integration**~~ ✓ Done May 2026 — SENSEX added to engine (calendar.py, cli.py), Dhan data backfilled (May 2023–May 2026, 84 parquet files, 19M bars). Wing-6 IC DTE<=2 filter: Sharpe 3.69, t-stat 5.62, 141 trades. Expanded portfolio (N:F:M:S 1:1:1:1): Sharpe 2.746, t-stat 5.30.
-6. ~~**Web dashboard**~~ ✓ Done May 2026 — FastAPI backend + CDN React frontend deployed on zimaos; real spot charts (4 indices), alert timeline, storage health, equity curve, positions panel. See § Web Dashboard above.
-7. **Live deployment prep** — broker integration, order sizing, daily signal generation.
+6. ~~**Web dashboard**~~ ✓ Done May 2026 — FastAPI backend + CDN React frontend deployed on zimaos; real spot charts (4 indices), alert timeline, storage health, equity curve, positions panel. See § Live Deployment below.
+7. ~~**Live deployment prep**~~ ✓ Done May 2026 — live paper trading active on zimaos (timer-driven daily, Dhan websocket + REST, crash recovery, health monitor, dashboard API).
 8. **OOS monitoring** — track top performers monthly; pause variant if OOS Sharpe < 1.5 for two consecutive months.
 9. **Data validation** — cross-check Shoonya vs Dhan, confirm MIDCPNIFTY/BANKNIFTY/FINNIFTY spot CSV coverage post-2024.
 10. **ML layer** — only after 3+ years clean OOS; turnover-regularized model with DTE/moneyness/IV/volume/OI.
@@ -266,45 +266,79 @@ Break-even move: ~₹1/unit. All pre-2026 backtests are **invalid** until re-run
 | SENSEX spot 1-min | 2023 – 2026 | BnH baseline + canonical fills for SENSEX | `data/processed/spot/sensex_1min_DHAN.csv` |
 | India VIX 1-min/daily | 2015 – 2026 | Regime gate | `data/processed/market_archive_cleaned/INDIA VIX_*.csv` |
 
-- **No bid/ask anywhere.** Fill proxy: tiered spread on close (ATM 0.3% → expiry-day OTM 2.0%) + OI-scaled slippage multiplier. Zero-volume bars rejected as data artifacts.
+- **Historical backtest datasets have no bid/ask.** Offline fills use the tiered spread proxy on close (ATM 0.3% → expiry-day OTM 2.0%) + OI-scaled slippage multiplier. Live paper trading separately records executable bid/ask/depth where available. Zero-volume bars are rejected as data artifacts.
 - **Weekly expiry discontinuation (non-NIFTY):** BANKNIFTY weekly ended 2024-11-13, FINNIFTY 2024-11-19, MIDCPNIFTY 2024-11-18. Engine falls back to monthly expiry automatically — post-discontinuation trades have DTE 15–30 at entry and different risk character.
 - **NIFTY expiry regime break:** NSE changed weekly expiry Thursday → Tuesday on 2025-09-02. `calendar.py` handles this. `summary()` flags `regime_break_in_sample: true` for any backtest spanning this date.
 - **SENSEX expiry regime breaks:** BSE launched weekly options May 2023 (Friday expiry); shifted to Tuesday Jan 2025; shifted to Thursday Sep 2025. `calendar.py` handles all three transitions. Lot size changed 10→20 on Jan 10 2025.
 - **Quarantine:** `20250925`, `20251224` excluded from all runs.
 - Data manifest: `data/manifests/data_inventory_manifest.csv` (502 datasets, 30 GB).
 
-## Web Dashboard
+## Live Deployment
 
-Live read-only monitoring dashboard deployed on zimaos. Shows real-time positions, equity curve, spot charts, alert timeline, and storage health.
+Active paper-trading profile: `wing6_4x1_all_vix_filtered`. Runs on `zimaos` (ZimaOS Linux, public IP 183.83.38.115 via ACT).
 
-**Access from laptop:**
+**Systemd-managed runtime:**
+- `live-paper-daily.timer` — active timer; starts `live-paper.service` Mon-Fri 08:45 IST
+- `live-paper.service` — one-shot daily paper engine from pre-open through EOD; can be inactive/dead outside the session window
+- `dashboard-api.service` — FastAPI/uvicorn daemon on `127.0.0.1:8000`
+- `health-monitor.service` — independent uptime/integrity monitor daemon
+
+**Disk layout:**
+- `/DATA` (SSD, 222G) — repo, venv, small caches
+- `/media/WD-Storage` (btrfs, 466G) — live artifacts, order book, paper outputs
+- `data/live` → symlink to `/media/WD-Storage/indian-markets-live`
+
+**Dashboard access:**
 ```bash
-ssh -L 9000:127.0.0.1:8000 zimaos   # keep terminal open
-# open http://localhost:9000/ in browser
+ssh -L 9000:127.0.0.1:8000 zimaos
+# open http://localhost:9000/
 ```
-(Local port 8000 is occupied; use 9000.)
 
-**Services on zimaos (auto-start on boot):**
-- `dashboard-api.service` — FastAPI/uvicorn, `127.0.0.1:8000`, `LIVE_ROOT=/media/WD-Storage/indian-markets-live`
-- `health-monitor.service` — writes alert/storage snapshots (~60 s off-hours, ~30 s during market)
+**Service restart:** `ssh zimaos "systemctl restart dashboard-api health-monitor"`
 
-**Restart command:** `ssh zimaos "systemctl restart dashboard-api health-monitor"`
+**Full live reference** (timeline, entry gates, fill model, crash recovery, env vars, data artifacts) → `docs/design/wing6_live_deployment_reference.md`.
 
-**Wiring summary:**
+## Session Audits
 
-| Layer | Key files |
-|---|---|
-| Backend entry | `scripts/live/api/main.py` — FastAPI app; mounts `dashboard/` as static root |
-| Routes | `scripts/live/api/routes/live.py` — all `/api/live/*` REST + `/ws/live` WS push |
-| Data bridge | `options_backtest/dashboard_bridge.py` — TTL-cached file reader (3 s live / 5 s trades / 60 s hist); never opens Dhan sockets |
-| Frontend | `dashboard/app.jsx` — REST fetch on mount; WS for live updates; `adaptPosition()`, `adaptEquityPoint()`, `adaptAlert()` shape API→UI |
-| Mock fallback | `dashboard/data.jsx` (`window.WingData`) — used when API data not yet loaded |
-| Spot charts | `/api/live/spot/{symbol}?days=N` → last N sessions from `data/processed/spot/*.csv`; timestamps are "display epoch" (IST naive treated as UTC so chart shows IST labels) |
-| WS frame | `LivePushFrame` in `scripts/live/api/models.py`; pushed every 1 s (market hours) / 5 s (off-hours) |
+Canonical local audit folder: `reports/live/session_audits/`.
 
-**Market-closed behaviour:** spot charts show last session data with "LAST SESSION" badge; option chain shows "MARKET CLOSED" overlay; storage and alert panels always show live values from WD drive.
+Every live-paper session should get a dated post-session audit named `YYYYMMDD_session_audit.md` in that folder, even for no-trade days. Use zimaos artifacts under `/media/WD-Storage/indian-markets-live` as the source of truth, then write the local audit report with:
+- session verdict and whether it is usable paper-trading evidence
+- trade outcome and signal skips from `paper_trades/YYYYMMDD*.json*`
+- alert counts, external heartbeat status, and dashboard/API health
+- Dhan transport checks split by REST, live-feed websocket, and 20-depth websocket
+- root cause, fixed-vs-open issues, and safe-now vs after-hours actions
 
-**Full design spec:** `docs/design/live_paper_trading_plan.md` § 13 (Web Dashboard).
+Existing audits:
+- `reports/live/session_audits/20260515_session_audit.md`
+- `reports/live/session_audits/20260518_session_audit.md`
+
+## Best Practices (Project-Specific)
+
+### Before touching anything live
+- **Read `ENGINE_ARCHITECTURE.md` first** before modifying any engine code. It replaces ~15 individual file reads.
+- **Read `docs/design/wing6_live_deployment_reference.md`** before touching live infrastructure, configs, or systemd services.
+- **Verify zimaos state live** — never assume server state from old context. SSH and check `systemctl status`, logs, or disk state when describing what is running.
+
+### Data & facts
+- **Never assume data exists.** The `data/` directory is largely gitignored. Always check `Path.exists()` before reading.
+- **Never assume the calendar.** NSE has had multiple regime breaks (NIFTY Thu→Tue 2025, SENSEX Fri→Tue→Thu, weekly discontinuations Nov 2024, lot size changes). Always check `calendar.py` or expiry logic before making claims about a symbol's expiry day.
+- **Never hardcode cost rates.** STT changed April 2026 (0.10% → 0.15%). Costs are date-sensitive via `ChargesConfig.for_date()`. Pre-2026 backtests are invalid until re-run.
+- **Check `OOS_UNLOCKED=1`** is required to load out-of-sample data. Don't accidentally snoop OOS.
+
+### Code & configs
+- **Never modify a test to make it pass.** Fix the engine/strategy code. Tests are the ground truth.
+- **Never commit secrets.** `.env.live`, tokens, and API keys are gitignored. Redact token-like strings from all logs and markdown.
+- **Never make network calls in engine code.** The backtest engine (`options_backtest/`) is purely offline. Only `scripts/download/` makes external requests.
+- **Always use `pathlib.Path`**, never string paths.
+- **Always preserve determinism.** No `random`, no global mutable state, no unseeded numpy calls.
+- **Check subdirectory `AGENTS.md` files** — deeper directories may override parent guidance.
+
+### Live infra
+- **Never touch `configs/live/` without reading the full gate logic.** Entry has 9 sequential checks; changing one field can silently skip all trades.
+- **Read the latest session audit before diagnosing live issues.** The current audit trail lives in `reports/live/session_audits/`; preserve the distinction between startup failures, host outages, Dhan transport issues, dashboard/runtime issues, and paper-engine/health-monitor behavior.
+- **Never assume the laptop and zimaos are in sync.** The server has a separate bare repo (`/DATA/live-paper/indian-markets.git`). Code must be pushed and pulled before it runs on zimaos.
+- **Never run git mutations** (`git commit`, `git push`, `git reset`, `git rebase`) without explicit user confirmation each time.
 
 ## Security Considerations
 
@@ -328,9 +362,3 @@ ssh -L 9000:127.0.0.1:8000 zimaos   # keep terminal open
 Qdrant+PostgreSQL at `100.101.17.114:8765` via `kb` MCP. 1,868 quant papers.
 Search before implementing. Key topic filters: `options_derivatives`, `backtesting`, `risk_management`, `market_microstructure`, `kelly_criterion`.
 
-Key papers already indexed and relevant:
-- `Baltussen 2025` — EOD reversal; 73.4% touch rate; reversal in 1–2 h
-- `Lou/Polk/Skouras 2019` — momentum profits: overnight OR intraday, not both
-- `2508.16598` — hybrid Kelly × VIX sizing for short-vol; 0–5 DTE far OTM optimal
-- `2407.21791` — turnover regularization; high-churn option strategies destroyed by costs
-- `2207.02989` — mid-price calibration biased with wide spreads; Shoonya OHLC not trustworthy for live fills
