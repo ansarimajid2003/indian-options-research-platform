@@ -558,6 +558,8 @@ class HealthMonitor:
     async def _check_collector_heartbeat(self) -> bool | None:
         if not _is_feed_active():
             await self._clear_alert("collector", "collector_heartbeat_missing")
+            await self._clear_alert("collector", "collector_writer_failed")
+            await self._clear_alert("collector", "collector_writer_dropped")
             return None
         path = self._snapshot_dir / "latest_depth_cache.json"
         if not path.exists():
@@ -576,11 +578,41 @@ class HealthMonitor:
                 # Flag for engine_stall grouping rather than firing a standalone alert.
                 self._flag_stall("collector_heartbeat", f"age={age:.0f}s")
                 return False
+            if not await self._check_collector_writer_state():
+                return False
             await self._clear_alert("collector", "collector_heartbeat_missing")
             return True
         except Exception as exc:
             await self._alert("warning", "collector", "collector_heartbeat_parse_error", str(exc))
             return False
+
+    async def _check_collector_writer_state(self) -> bool:
+        state_path = self._durable_dir / "latest_depth_collector_state.json"
+        if not state_path.exists():
+            await self._clear_alert("collector", "collector_writer_failed")
+            await self._clear_alert("collector", "collector_writer_dropped")
+            return True
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            await self._alert("warning", "collector", "collector_state_parse_error", str(exc))
+            return False
+        writer = state.get("writer_status") or {}
+        if not writer:
+            await self._clear_alert("collector", "collector_writer_failed")
+            await self._clear_alert("collector", "collector_writer_dropped")
+            return True
+        status = state.get("status")
+        if status == "running" and (writer.get("error") or writer.get("alive") is False):
+            await self._alert("critical", "collector", "collector_writer_failed", f"writer_status={writer}")
+            return False
+        dropped = int(writer.get("dropped_raw", 0) or 0) + int(writer.get("dropped_norm", 0) or 0)
+        if dropped > 0:
+            await self._alert("warning", "collector", "collector_writer_dropped", f"dropped writer items={dropped} status={writer}")
+            return False
+        await self._clear_alert("collector", "collector_writer_failed")
+        await self._clear_alert("collector", "collector_writer_dropped")
+        return True
 
     async def _check_feed_state(self) -> bool | None:
         if not _is_feed_active():

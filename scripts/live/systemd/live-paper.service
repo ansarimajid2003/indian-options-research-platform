@@ -18,11 +18,19 @@ ExecStartPre=/bin/mkdir -p /run/im-snapshots
 ExecStartPre=/DATA/live-paper/indian-markets/.venv/bin/python scripts/live/clock_sync.py --remediate --wait --timeout 180 --max-offset 2.0
 ExecStart=/DATA/live-paper/indian-markets/.venv/bin/python \
     scripts/live/run_paper_trading.py \
-    --profile wing6_4x1_all_vix_filtered
+    --profile wing6_4x1_all_vix_filtered \
+    --hard-exit
 Restart=on-failure
-# 45s gives the network and Dhan websockets time to stabilise after a crash.
+# 10s gives the network and Dhan websockets time to stabilise after a crash.
 # The engine self-recovers positions from the checkpoint on restart.
 RestartSec=10
+MemoryAccounting=yes
+MemoryHigh=2500M
+MemoryMax=3200M
+MemorySwapMax=512M
+OOMPolicy=stop
+TimeoutStopSec=45
+KillMode=mixed
 StandardOutput=append:/media/WD-Storage/indian-markets-live/logs/live-paper.log
 StandardError=append:/media/WD-Storage/indian-markets-live/logs/live-paper.log
 

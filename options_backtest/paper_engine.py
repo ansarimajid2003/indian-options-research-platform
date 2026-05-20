@@ -72,6 +72,9 @@ _VIX_MAX_AGE = 300
 _SPOT_MAX_AGE = 5
 _OPTION_MAX_AGE = 5
 _DEPTH_MAX_AGE = 5
+_MAX_ENTRY_QUOTE_AGE_MS = _OPTION_MAX_AGE * 1000
+_MAX_ENTRY_SPREAD_PCT = 20.0
+_MIN_ENTRY_CREDIT = 0.0
 
 # Timing constants (IST)
 _T_CONNECT = time(9, 0)
@@ -986,6 +989,19 @@ class PaperTradingEngine:
             lot_sz = lot_size(symbol, self._session_date)
             quantity = lots * lot_sz
             depth_source = sym_cfg.get("depth_source", "dhan_20depth")
+            global_cfg = self._profile.get("global", {})
+            max_entry_quote_age_ms = int(sym_cfg.get(
+                "max_entry_quote_age_ms",
+                global_cfg.get("max_entry_quote_age_ms", _MAX_ENTRY_QUOTE_AGE_MS),
+            ))
+            max_entry_spread_pct = float(sym_cfg.get(
+                "max_entry_spread_pct",
+                global_cfg.get("max_entry_spread_pct", _MAX_ENTRY_SPREAD_PCT),
+            ))
+            require_positive_credit = bool(sym_cfg.get(
+                "require_positive_entry_credit",
+                global_cfg.get("require_positive_entry_credit", True),
+            ))
             charges_cfg = ChargesConfig.for_date(self._session_date)
             fill_model = FillModel(charges=charges_cfg)
 
@@ -1006,6 +1022,9 @@ class PaperTradingEngine:
                     fill_model=fill_model,
                     now_ts=now_ts,
                     now_dt=now_dt,
+                    strict_entry=True,
+                    max_quote_age_ms=max_entry_quote_age_ms,
+                    max_spread_pct=max_entry_spread_pct,
                 )
                 if fill_dict is None:
                     fill_fail = True
@@ -1023,6 +1042,17 @@ class PaperTradingEngine:
             if fill_fail:
                 self._log_signal("skip", symbol, "insufficient_depth", vix=vix_val, dte=dte, bucket=effective_vix_bucket)
                 _log.info("entry: %s SKIP insufficient_depth", symbol)
+                continue
+
+            if not self._entry_credit_is_acceptable(entry_credit, require_positive_credit):
+                self._log_signal("skip", symbol, "non_credit_entry", vix=vix_val, dte=dte, bucket=effective_vix_bucket)
+                _log.warning(
+                    "entry: %s SKIP non_credit_entry credit=%.2f charges=%.2f legs=%s",
+                    symbol,
+                    entry_credit,
+                    entry_charges,
+                    [(f["leg_role"], f["side"], f["price"], f["quote_age_ms"], f["spread_pct"]) for f in entry_fills],
+                )
                 continue
 
             # Build leg list for position tracking
@@ -1055,6 +1085,11 @@ class PaperTradingEngine:
             self._write_signal_record("entry", symbol, vix=vix_val, dte=dte, bucket=effective_vix_bucket)
             _log.info("entry: %s ENTERED expiry=%s dte=%d credit=%.2f legs=%d", symbol, expiry, dte, entry_credit, len(legs))
 
+    def _entry_credit_is_acceptable(self, entry_credit: float, require_positive_credit: bool = True) -> bool:
+        if not require_positive_credit:
+            return True
+        return entry_credit > _MIN_ENTRY_CREDIT
+
     def _get_fill(
         self,
         sid: str,
@@ -1067,6 +1102,9 @@ class PaperTradingEngine:
         fill_model: FillModel,
         now_ts: pd.Timestamp,
         now_dt: datetime,
+        strict_entry: bool = False,
+        max_quote_age_ms: int = _MAX_ENTRY_QUOTE_AGE_MS,
+        max_spread_pct: float = _MAX_ENTRY_SPREAD_PCT,
     ) -> dict | None:
         """Compute executable fill price and return fill dict. Returns None on insufficient depth."""
         snap = self._depth_cache.snapshot(sid)
@@ -1079,25 +1117,87 @@ class PaperTradingEngine:
         quote_age_ms = 0
 
         if depth_source == "dhan_20depth":
+            if snap is None:
+                return None
+            now_pd = pd.Timestamp.now(tz="Asia/Kolkata")
+            bid_age = (now_pd - snap.bid_ts).total_seconds()
+            ask_age = (now_pd - snap.ask_ts).total_seconds()
+            quote_age_ms = int(max(bid_age, ask_age) * 1000)
+            if quote_age_ms > max_quote_age_ms:
+                _log.warning(
+                    "fill_quality: %s %s sid=%s SKIP stale_depth age_ms=%d max_ms=%d",
+                    symbol,
+                    role,
+                    sid,
+                    quote_age_ms,
+                    max_quote_age_ms,
+                )
+                return None
+            if snap.best_bid <= 0 or snap.best_ask <= 0 or snap.best_ask < snap.best_bid:
+                _log.warning(
+                    "fill_quality: %s %s sid=%s SKIP invalid_depth bid=%.2f ask=%.2f",
+                    symbol,
+                    role,
+                    sid,
+                    snap.best_bid,
+                    snap.best_ask,
+                )
+                return None
+            spread_pct = round(snap.spread_pct * 100, 4)
+            if strict_entry and spread_pct > max_spread_pct:
+                _log.warning(
+                    "fill_quality: %s %s sid=%s SKIP wide_spread spread_pct=%.4f max_pct=%.4f bid=%.2f ask=%.2f",
+                    symbol,
+                    role,
+                    sid,
+                    spread_pct,
+                    max_spread_pct,
+                    snap.best_bid,
+                    snap.best_ask,
+                )
+                return None
             exec_price = self._depth_cache.executable_price(sid, side, quantity)
             if exec_price is None:
                 return None
-            if snap:
-                top_bid = snap.best_bid
-                top_ask = snap.best_ask
-                spread_pct = round(snap.spread_pct * 100, 4)
-                depth_available_qty = snap.total_ask_qty if side == Side.BUY else snap.total_bid_qty
-                now_pd = pd.Timestamp.now(tz="Asia/Kolkata")
-                age = (now_pd - (snap.ask_ts if side == Side.BUY else snap.bid_ts)).total_seconds()
-                quote_age_ms = int(age * 1000)
+            top_bid = snap.best_bid
+            top_ask = snap.best_ask
+            depth_available_qty = snap.total_ask_qty if side == Side.BUY else snap.total_bid_qty
             depth_vwap = exec_price
             fill_basis = "depth_vwap"
             fill_price = exec_price
         else:
             # SENSEX: top-of-book from live feed type-8 or DepthCache if available
             if snap:
+                now_pd = pd.Timestamp.now(tz="Asia/Kolkata")
+                quote_age_ms = int(max(
+                    (now_pd - snap.bid_ts).total_seconds(),
+                    (now_pd - snap.ask_ts).total_seconds(),
+                ) * 1000)
+                if quote_age_ms > max_quote_age_ms:
+                    _log.warning(
+                        "fill_quality: %s %s sid=%s SKIP stale_tob_depth age_ms=%d max_ms=%d",
+                        symbol,
+                        role,
+                        sid,
+                        quote_age_ms,
+                        max_quote_age_ms,
+                    )
+                    return None
                 top_bid = snap.best_bid
                 top_ask = snap.best_ask
+                spread_pct = round(snap.spread_pct * 100, 4)
+                if top_bid <= 0 or top_ask <= 0 or top_ask < top_bid:
+                    return None
+                if strict_entry and spread_pct > max_spread_pct:
+                    _log.warning(
+                        "fill_quality: %s %s sid=%s SKIP wide_tob_depth spread_pct=%.4f max_pct=%.4f",
+                        symbol,
+                        role,
+                        sid,
+                        spread_pct,
+                        max_spread_pct,
+                    )
+                    return None
                 fill_price = top_ask if side == Side.BUY else top_bid
                 fill_basis = "top_of_book_depth_cache"
             elif sid in self._last_tob:
@@ -1108,6 +1208,30 @@ class PaperTradingEngine:
                 fill_basis = "top_of_book_feed"
                 age = (pd.Timestamp.now(tz="Asia/Kolkata") - tob["ts"]).total_seconds()
                 quote_age_ms = int(age * 1000)
+                if quote_age_ms > max_quote_age_ms:
+                    _log.warning(
+                        "fill_quality: %s %s sid=%s SKIP stale_tob age_ms=%d max_ms=%d",
+                        symbol,
+                        role,
+                        sid,
+                        quote_age_ms,
+                        max_quote_age_ms,
+                    )
+                    return None
+                if top_bid <= 0 or top_ask <= 0 or top_ask < top_bid:
+                    return None
+                mid = (top_bid + top_ask) / 2
+                spread_pct = round(((top_ask - top_bid) / mid * 100), 4) if mid > 0 else 0.0
+                if strict_entry and spread_pct > max_spread_pct:
+                    _log.warning(
+                        "fill_quality: %s %s sid=%s SKIP wide_tob spread_pct=%.4f max_pct=%.4f",
+                        symbol,
+                        role,
+                        sid,
+                        spread_pct,
+                        max_spread_pct,
+                    )
+                    return None
             else:
                 return None
 

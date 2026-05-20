@@ -151,6 +151,26 @@ class IronCondor(OptionStrategy):
 
 
 @dataclass(frozen=True)
+class IronButterfly(OptionStrategy):
+    """
+    Iron Butterfly: sell ATM call + ATM put, buy further OTM call + put.
+    Higher credit than iron condor but narrower profit zone and higher gamma risk.
+    """
+    long_call_offset: int = 8
+    long_put_offset: int = -8
+    lots: int = 1
+    name: str = "IronButterfly"
+
+    def entry_legs(self, context: StrategyContext) -> list[Leg]:
+        return [
+            Leg(context.resolver.resolve_atm_offset(context.timestamp, 0, OptionType.CALL), Side.SELL, self.lots),
+            Leg(context.resolver.resolve_atm_offset(context.timestamp, self.long_call_offset, OptionType.CALL), Side.BUY, self.lots),
+            Leg(context.resolver.resolve_atm_offset(context.timestamp, 0, OptionType.PUT), Side.SELL, self.lots),
+            Leg(context.resolver.resolve_atm_offset(context.timestamp, self.long_put_offset, OptionType.PUT), Side.BUY, self.lots),
+        ]
+
+
+@dataclass(frozen=True)
 class CreditSpread(OptionStrategy):
     """
     Two-leg credit spread: sell short_offset option, buy long_offset option of the same type.

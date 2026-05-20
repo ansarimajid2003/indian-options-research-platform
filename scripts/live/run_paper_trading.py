@@ -241,11 +241,14 @@ async def _run_live(profile: dict, today: date, live_root: Path, access_token: s
                 date_str = today.strftime("%Y%m%d")
                 trades_json = live_root / "paper_trades" / f"{date_str}.json"
                 if trades_json.exists():
-                    write_paper_reports(trades_json, today, live_root)
+                    _log.info("orchestrator: engine complete; writing paper reports from %s", trades_json)
+                    await asyncio.to_thread(write_paper_reports, trades_json, today, live_root)
+                    _log.info("orchestrator: paper reports complete")
                 for task in all_tasks:
                     if task is not engine_task and not task.done():
                         task.cancel()
                 await asyncio.gather(*[t for t in all_tasks if t is not engine_task], return_exceptions=True)
+                _log.info("orchestrator: ancillary tasks stopped; live run complete")
                 return
             if collector_task in done:
                 exc = collector_task.exception()
@@ -275,6 +278,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Wing-6 paper trading orchestrator")
     parser.add_argument("--profile", default="wing6_4x1_all_vix_filtered", help="Profile name (no .json)")
     parser.add_argument("--dry-run", action="store_true", help="30-second dry run, no websockets")
+    parser.add_argument("--hard-exit", action="store_true", help="Force interpreter exit after live cleanup for systemd one-shot runs")
     args = parser.parse_args()
 
     access_token = os.environ.get("DHAN_ACCESS_TOKEN", "")
@@ -329,6 +333,9 @@ def main() -> None:
         _log.exception("orchestrator: session failed")
         exit_code = 1
     # Ensure the interpreter exits so systemd marks the service inactive (dead).
+    if args.hard_exit and not args.dry_run:
+        logging.shutdown()
+        os._exit(exit_code)
     sys.exit(exit_code)
 
 

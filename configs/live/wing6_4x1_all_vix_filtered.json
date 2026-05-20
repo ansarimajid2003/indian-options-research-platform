@@ -25,6 +25,9 @@
     "min_dte": 1,
     "allow_partial_entry": false,
     "allow_substitute_expiry_strike": false,
+    "require_positive_entry_credit": true,
+    "max_entry_quote_age_ms": 5000,
+    "max_entry_spread_pct": 20.0,
     "costs": "ChargesConfig.for_date"
   },
   "symbols": {

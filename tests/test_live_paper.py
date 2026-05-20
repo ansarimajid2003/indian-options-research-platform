@@ -948,6 +948,32 @@ class WriterThreadTests(unittest.TestCase):
             self.assertIn("mid", df.columns)
             self.assertGreaterEqual(len(df), 1)
 
+    def test_writer_thread_handles_mixed_iso_timestamp_precision(self) -> None:
+        from scripts.live.collect_order_book import _WriterThread, _instrument_key
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            live_root = Path(td)
+            writer = _WriterThread("20260520", live_root)
+            meta = {"symbol": "FINNIFTY", "expiry": "2026-05-26", "strike": 27000, "option_type": "PE"}
+            ikey = _instrument_key(meta)
+            base = {
+                "best_bid": 100.0,
+                "best_ask": 101.0,
+                "mid": 100.5,
+                "spread_pct": 0.01,
+                "total_bid_qty": 100,
+                "total_ask_qty": 100,
+            }
+            writer.enqueue_norm(ikey, {"timestamp": "2026-05-20T09:20:43.123456+05:30", **base})
+            writer.enqueue_norm(ikey, {"timestamp": "2026-05-20T09:20:43+05:30", **base})
+            writer.stop()
+
+            one_min_dir = live_root / "order_book_1min" / "20260520"
+            files = list(one_min_dir.glob("FINNIFTY_2026-05-26_27000_PE_*.parquet"))
+            self.assertTrue(files, "Expected mixed ISO timestamps to produce 1-minute parquet")
+            self.assertIsNone(writer.status()["error"])
+
     def test_writer_thread_raw_flush(self) -> None:
         from scripts.live.collect_order_book import _WriterThread
         import tempfile
@@ -964,6 +990,84 @@ class WriterThreadTests(unittest.TestCase):
             files = list(raw_dir.glob("depth_*.bin"))
             self.assertTrue(len(files) > 0, "Expected at least one raw bin file")
             self.assertEqual(files[0].read_bytes(), b"test_packet")
+
+
+class EntryFillQualityTests(unittest.TestCase):
+    def _engine(self, cache: DepthCache) -> PaperTradingEngine:
+        return PaperTradingEngine(
+            profile={"profile_name": "test", "symbols": {}, "vix": {}},
+            session_date=date(2026, 5, 20),
+            depth_cache=cache,
+            access_token="token",
+            client_id="client",
+            live_root=Path("tmp_live_tests") / "entry_fill_quality",
+        )
+
+    def _contract(self):
+        from options_backtest.schemas import Contract, OptionType
+        return Contract(expiry=date(2026, 5, 26), strike=27000, option_type=OptionType.PUT, ticker="TEST")
+
+    def test_entry_fill_rejects_stale_depth_even_when_depth_exists(self) -> None:
+        from options_backtest.broker_sim import ChargesConfig, FillModel
+        from options_backtest.schemas import Side
+
+        cache = DepthCache()
+        stale = pd.Timestamp.now(tz="Asia/Kolkata") - pd.Timedelta(seconds=8)
+        fresh = pd.Timestamp.now(tz="Asia/Kolkata")
+        cache.update_bid_packet("1", stale, [DepthLevel(price=100.0, quantity=100, orders=1)])
+        cache.update_ask_packet("1", fresh, [DepthLevel(price=101.0, quantity=100, orders=1)])
+        engine = self._engine(cache)
+
+        fill = engine._get_fill(
+            sid="1",
+            side=Side.SELL,
+            quantity=60,
+            depth_source="dhan_20depth",
+            symbol="FINNIFTY",
+            role="short_put",
+            contract=self._contract(),
+            fill_model=FillModel(charges=ChargesConfig.for_date(date(2026, 5, 20))),
+            now_ts=pd.Timestamp.now(tz="Asia/Kolkata"),
+            now_dt=datetime.now(tz=ZoneInfo("Asia/Kolkata")),
+            strict_entry=True,
+            max_quote_age_ms=5000,
+            max_spread_pct=20.0,
+        )
+
+        self.assertIsNone(fill)
+
+    def test_entry_fill_rejects_wide_depth_spread(self) -> None:
+        from options_backtest.broker_sim import ChargesConfig, FillModel
+        from options_backtest.schemas import Side
+
+        cache = DepthCache()
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        cache.update_bid_packet("1", now, [DepthLevel(price=10.0, quantity=100, orders=1)])
+        cache.update_ask_packet("1", now, [DepthLevel(price=40.0, quantity=100, orders=1)])
+        engine = self._engine(cache)
+
+        fill = engine._get_fill(
+            sid="1",
+            side=Side.SELL,
+            quantity=60,
+            depth_source="dhan_20depth",
+            symbol="FINNIFTY",
+            role="short_put",
+            contract=self._contract(),
+            fill_model=FillModel(charges=ChargesConfig.for_date(date(2026, 5, 20))),
+            now_ts=pd.Timestamp.now(tz="Asia/Kolkata"),
+            now_dt=datetime.now(tz=ZoneInfo("Asia/Kolkata")),
+            strict_entry=True,
+            max_quote_age_ms=5000,
+            max_spread_pct=20.0,
+        )
+
+        self.assertIsNone(fill)
+
+    def test_positive_credit_gate_rejects_debit_iron_condor_entry(self) -> None:
+        engine = self._engine(DepthCache())
+        self.assertFalse(engine._entry_credit_is_acceptable(-12942.0, require_positive_credit=True))
+        self.assertTrue(engine._entry_credit_is_acceptable(12603.5, require_positive_credit=True))
 
 
 class CollectorStartupTests(unittest.TestCase):

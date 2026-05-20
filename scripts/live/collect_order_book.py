@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import queue
 import struct
@@ -31,12 +32,14 @@ import time as _time
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import websockets
+
+_log = logging.getLogger(__name__)
 
 # Adjust import path when running as module vs standalone
 try:
@@ -75,6 +78,9 @@ _DEFAULT_MAX_DEPTH_CONNECTIONS = 5
 _FLUSH_INTERVAL = 60        # seconds
 _RECONNECT_DELAY = 5        # seconds between reconnect attempts
 _PING_INTERVAL = 10         # seconds between server pings
+_WRITER_QUEUE_MAX_ITEMS = 20_000
+_WRITER_STOP_TIMEOUT = 10.0
+_WRITER_DROP_LOG_INTERVAL = 30.0
 
 # NSE options universe for 20-depth; concrete width comes from live config.
 _MAJOR_NSE_INDEX_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
@@ -203,28 +209,80 @@ def _build_depth_row(snap_bid: list[DepthLevel], snap_ask: list[DepthLevel], met
 class _WriterThread:
     """Dedicated thread for all blocking disk I/O."""
 
-    def __init__(self, date_str: str, live_root: Path) -> None:
+    def __init__(self, date_str: str, live_root: Path, max_queue_size: int = _WRITER_QUEUE_MAX_ITEMS) -> None:
         self._date_str = date_str
         self._raw_dir = live_root / "raw_depth_packets" / date_str
         self._norm_dir = live_root / "order_book" / date_str
         self._dir_1min = live_root / "order_book_1min" / date_str
         for d in (self._raw_dir, self._norm_dir, self._dir_1min):
             d.mkdir(parents=True, exist_ok=True)
-        self._q: queue.Queue = queue.Queue()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        self._q: queue.Queue = queue.Queue(maxsize=max_queue_size)
         self._stop_requested = False
         self._flush_seq = 0
+        self._error: BaseException | None = None
+        self._dropped_raw = 0
+        self._dropped_norm = 0
+        self._last_drop_log = 0.0
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
-    def enqueue_raw(self, raw: bytes) -> None:
-        if not self._stop_requested:
-            self._q.put(("raw", raw))
+    def enqueue_raw(self, raw: bytes) -> bool:
+        return self._enqueue(("raw", raw), "raw")
 
-    def enqueue_norm(self, ikey: str, row: dict) -> None:
-        if not self._stop_requested:
-            self._q.put(("norm", ikey, row))
+    def enqueue_norm(self, ikey: str, row: dict) -> bool:
+        return self._enqueue(("norm", ikey, row), "norm")
+
+    def _enqueue(self, item: tuple, kind: str) -> bool:
+        if self._stop_requested or self._error is not None:
+            return False
+        try:
+            self._q.put_nowait(item)
+            return True
+        except queue.Full:
+            with self._lock:
+                if kind == "raw":
+                    self._dropped_raw += 1
+                else:
+                    self._dropped_norm += 1
+                now = _time.monotonic()
+                if now - self._last_drop_log >= _WRITER_DROP_LOG_INTERVAL:
+                    self._last_drop_log = now
+                    _log.error(
+                        "depth_writer: queue full, dropping %s packets raw_dropped=%d norm_dropped=%d qsize=%d",
+                        kind,
+                        self._dropped_raw,
+                        self._dropped_norm,
+                        self._safe_qsize(),
+                    )
+            return False
+
+    def _safe_qsize(self) -> int:
+        try:
+            return self._q.qsize()
+        except NotImplementedError:
+            return -1
+
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "alive": self._thread.is_alive(),
+                "queue_size": self._safe_qsize(),
+                "queue_max_size": self._q.maxsize,
+                "dropped_raw": self._dropped_raw,
+                "dropped_norm": self._dropped_norm,
+                "error": repr(self._error) if self._error is not None else None,
+            }
 
     def _loop(self) -> None:
+        try:
+            self._run_loop()
+        except Exception as exc:
+            self._error = exc
+            self._stop_requested = True
+            _log.exception("depth_writer: fatal writer thread failure; writer is disabled: %r", exc)
+
+    def _run_loop(self) -> None:
         raw_buffer: list[bytes] = []
         norm_rows: dict[str, list[dict]] = defaultdict(list)
         last_raw_flush = _time.monotonic()
@@ -292,7 +350,13 @@ class _WriterThread:
 
     def _write_1min(self, df: pd.DataFrame, ikey: str, minute_bucket: str, seq: int) -> None:
         df2 = df.copy()
-        df2["timestamp"] = pd.to_datetime(df2["timestamp"])
+        df2["timestamp"] = _parse_depth_timestamps(df2["timestamp"])
+        bad_rows = int(df2["timestamp"].isna().sum())
+        if bad_rows:
+            _log.warning("depth_writer: dropping %d rows with unparseable timestamps for %s", bad_rows, ikey)
+            df2 = df2.dropna(subset=["timestamp"])
+        if df2.empty:
+            return
         df2 = df2.set_index("timestamp").sort_index()
         if "mid" not in df2.columns:
             return
@@ -305,8 +369,31 @@ class _WriterThread:
         tmp_path.replace(out_path)
 
     def stop(self) -> None:
-        self._q.put(("stop",))
-        self._thread.join(timeout=30)
+        self._stop_requested = True
+        try:
+            self._q.put(("stop",), timeout=1.0)
+        except queue.Full:
+            _log.error("depth_writer: queue still full during stop; leaving daemon writer to terminate with process")
+        self._thread.join(timeout=_WRITER_STOP_TIMEOUT)
+        if self._thread.is_alive():
+            _log.error("depth_writer: writer did not stop within %.1fs status=%s", _WRITER_STOP_TIMEOUT, self.status())
+
+
+def _parse_depth_timestamps(values: pd.Series) -> pd.Series:
+    """Parse Dhan depth timestamps with or without fractional seconds."""
+    try:
+        return pd.to_datetime(values, format="ISO8601", errors="coerce")
+    except (TypeError, ValueError):
+        return values.map(_parse_one_depth_timestamp)
+
+
+def _parse_one_depth_timestamp(value: object) -> pd.Timestamp:
+    if value is None:
+        return pd.NaT
+    try:
+        return pd.Timestamp(value)
+    except Exception:
+        return pd.NaT
 
 
 def _write_gap_sentinel(live_root: Path, date_str: str, symbol: str, gap_start: str, gap_end: str, reason: str) -> None:
@@ -401,6 +488,7 @@ def _write_collector_state(
     security_ids: list[str],
     configured_symbols: list[str] | None = None,
     failed_symbols: list[str] | None = None,
+    writer_status: dict | None = None,
 ) -> None:
     payload = {
         "written_at": _now_ist().isoformat(),
@@ -410,6 +498,7 @@ def _write_collector_state(
         "configured_security_ids": len(security_ids),
         "configured_symbols": configured_symbols or [],
         "failed_symbols": failed_symbols or [],
+        "writer_status": writer_status or {},
     }
     _write_atomic_json(resolve_durable_dir(live_root) / "latest_depth_collector_state.json", payload)
 
@@ -439,11 +528,24 @@ async def _depth_snapshot_loop(
     depth_cache: DepthCache,
     security_ids: list[str],
     id_to_meta: dict[str, dict],
+    writer_status_getter: Callable[[], dict] | None = None,
+    configured_symbols: list[str] | None = None,
+    failed_symbols: list[str] | None = None,
     interval_seconds: float = 10.0,
 ) -> None:
     while True:
         await asyncio.to_thread(_write_depth_cache_snapshot, live_root, date_str, depth_cache, security_ids, id_to_meta)
-        await asyncio.to_thread(_write_collector_state, live_root, date_str, "running", security_ids)
+        writer_status = writer_status_getter() if writer_status_getter else None
+        await asyncio.to_thread(
+            _write_collector_state,
+            live_root,
+            date_str,
+            "running",
+            security_ids,
+            configured_symbols,
+            failed_symbols,
+            writer_status,
+        )
         await asyncio.sleep(interval_seconds)
 
 
@@ -480,6 +582,9 @@ class DepthCollector:
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def writer_status(self) -> dict:
+        return self._writer.status()
 
     async def run(self) -> None:
         self._started_at = _now_ist().isoformat()
@@ -562,7 +667,9 @@ class DepthCollector:
                 meta = self._id_to_meta[sid]
                 try:
                     row = _build_depth_row(snap.bid_levels, snap.ask_levels, meta, ts)
-                    self._writer.enqueue_norm(_instrument_key(meta), row)
+                    if not self._writer.enqueue_norm(_instrument_key(meta), row) and sid not in self._backpressure_instruments:
+                        self._backpressure_instruments.add(sid)
+                        print(f"[depth_collector] writer_backpressure sid={sid} status={self._writer.status()}")
                 except Exception:
                     if sid not in self._backpressure_instruments:
                         self._backpressure_instruments.add(sid)
@@ -765,7 +872,15 @@ async def collect_order_book(
     _write_collector_state(live_root, date_str, "running", all_sids, configured_symbols, failed_symbols)
     if not all_sids:
         # Nothing to collect — just run the snapshot loop so depth state stays fresh
-        await _depth_snapshot_loop(live_root, date_str, depth_cache, all_sids, all_meta)
+        await _depth_snapshot_loop(
+            live_root,
+            date_str,
+            depth_cache,
+            all_sids,
+            all_meta,
+            configured_symbols=configured_symbols,
+            failed_symbols=failed_symbols,
+        )
         return
 
     collector = DepthCollector(
@@ -781,7 +896,16 @@ async def collect_order_book(
     _write_depth_cache_snapshot(live_root, date_str, depth_cache, all_sids, all_meta)
     tasks = [
         asyncio.create_task(collector.run()),
-        asyncio.create_task(_depth_snapshot_loop(live_root, date_str, depth_cache, all_sids, all_meta)),
+        asyncio.create_task(_depth_snapshot_loop(
+            live_root,
+            date_str,
+            depth_cache,
+            all_sids,
+            all_meta,
+            writer_status_getter=collector.writer_status,
+            configured_symbols=configured_symbols,
+            failed_symbols=failed_symbols,
+        )),
     ]
     try:
         done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -797,7 +921,16 @@ async def collect_order_book(
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.to_thread(_write_collector_state, live_root, date_str, "stopped", all_sids, configured_symbols, failed_symbols)
+        await asyncio.to_thread(
+            _write_collector_state,
+            live_root,
+            date_str,
+            "stopped",
+            all_sids,
+            configured_symbols,
+            failed_symbols,
+            collector.writer_status(),
+        )
 
 
 if __name__ == "__main__":
