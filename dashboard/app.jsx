@@ -27,7 +27,9 @@ function adaptPosition(apiPos) {
     long_ce_premium:  lCe.price   || 0,
     short_pe_premium: sPe.price   || 0,
     long_pe_premium:  lPe.price   || 0,
-    current_mark:  apiPos.current_mark ?? apiPos.entry_credit,
+    current_mark:  apiPos.current_mark ?? null,
+    unrealised_gross_pnl: apiPos.unrealised_gross_pnl ?? null,
+    unrealised_net_pnl:   apiPos.unrealised_net_pnl ?? null,
     leg_ages: [
       sCe.quote_age_ms ?? null,
       lCe.quote_age_ms ?? null,
@@ -38,7 +40,10 @@ function adaptPosition(apiPos) {
 }
 
 function adaptEquityPoint(apiEq) {
-  const ms = new Date(apiEq.ts).getTime();
+  const m = String(apiEq.ts || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
+  const ms = m
+    ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6])
+    : new Date(apiEq.ts).getTime();
   return {
     time: Math.floor(ms / 1000),
     cumulative_gross_pnl: apiEq.cumulative_gross_pnl,

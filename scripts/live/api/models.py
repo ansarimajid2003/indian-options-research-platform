@@ -201,7 +201,7 @@ class LivePushFrame(BaseModel):
     React client usage pattern:
       - Overwrite session / positions / depth / storage / alerts on every frame.
       - Append equity_tick to local series (never re-fetch the full curve on each tick).
-      - Render equity_tick as null when there are no closed trades yet today.
+      - Render equity_tick as null when no live or realised PnL point is available.
     """
 
     ts: str
@@ -211,7 +211,7 @@ class LivePushFrame(BaseModel):
     positions: list[PositionModel]
 
     equity_tick: EquityPointModel | None = None
-    """Latest cumulative equity point — append to local chart series"""
+    """Latest cumulative mark-to-market equity point — append to local chart series"""
 
     depth: DepthSummaryModel | None = None
     storage: StorageHealthModel

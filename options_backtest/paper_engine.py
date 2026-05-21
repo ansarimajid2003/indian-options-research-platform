@@ -1061,6 +1061,7 @@ class PaperTradingEngine:
                     "leg_role": ef["leg_role"],
                     "side": ef["side"],
                     "security_id": ef["security_id"],
+                    "quantity": ef["quantity"],
                     "strike": contract.strike,
                     "option_type": contract.option_type.value,
                     "expiry": contract.expiry.isoformat(),
@@ -1514,68 +1515,128 @@ class PaperTradingEngine:
         if quotes:
             _write_atomic(self._snapshot_dir / "latest_quotes.json", {"written_at": _ts_str(), "quotes": quotes}, sync=False)
 
-    def _get_exit_mark(self, sid: str) -> tuple[float, str, int] | None:
-        """Return (mark_mid, basis, age_ms) for a security_id using depth or feed TOB."""
+    def _get_exit_mark(self, sid: str, exit_side: Side, quantity: int) -> tuple[float, str, int] | None:
+        """Return executable exit mark, basis, and age for a security_id."""
         snap = self._depth_cache.snapshot(sid)
         if snap is not None and snap.best_bid > 0 and snap.best_ask > 0:
-            mark = round((snap.best_bid + snap.best_ask) / 2, 2)
+            exec_price = self._depth_cache.executable_price(sid, exit_side, quantity)
+            mark = round(exec_price if exec_price is not None else (snap.best_bid + snap.best_ask) / 2, 2)
+            basis = "depth_vwap" if exec_price is not None else "depth_mid_insufficient_qty"
             age_ms = int((pd.Timestamp.now(tz="Asia/Kolkata") - snap.bid_ts).total_seconds() * 1000)
-            return mark, "depth_cache", age_ms
+            return mark, basis, age_ms
         tob = self._last_tob.get(sid)
         if tob is not None and tob.get("best_bid", 0) > 0 and tob.get("best_ask", 0) > 0:
-            mark = round((tob["best_bid"] + tob["best_ask"]) / 2, 2)
+            mark = round(tob["best_ask"] if exit_side == Side.BUY else tob["best_bid"], 2)
             age_ms = int((pd.Timestamp.now(tz="Asia/Kolkata") - tob["ts"]).total_seconds() * 1000)
             return mark, "top_of_book_feed", age_ms
         return None
+
+    @staticmethod
+    def _leg_quantity(pos: _OpenPosition, leg: dict) -> int:
+        q = leg.get("quantity")
+        if not q:
+            q = (leg.get("entry_fill") or {}).get("quantity")
+        if not q:
+            q = pos.lots * pos.lot_size
+        return int(q)
+
+    def _mark_position(self, pos: _OpenPosition, fill_model: FillModel) -> dict:
+        """Return live exit-debit, gross/net PnL, charges, and leg mark details."""
+        leg_marks = []
+        total_exit_debit = 0.0
+        exit_charges = 0.0
+        stale = False
+
+        for leg in pos.legs:
+            sid = str(leg.get("security_id", ""))
+            qty = self._leg_quantity(pos, leg)
+            entry_side = Side(leg.get("side", ""))
+            exit_side = Side.BUY if entry_side == Side.SELL else Side.SELL
+            result = self._get_exit_mark(sid, exit_side, qty) if sid else None
+            if result is None:
+                stale = True
+                leg_marks.append({
+                    "security_id": sid,
+                    "mark": None,
+                    "basis": None,
+                    "age_ms": None,
+                    "quantity": qty,
+                    "exit_side": None,
+                })
+                continue
+
+            mark, basis, age_ms = result
+            exit_value = mark * qty
+            if exit_side == Side.BUY:
+                total_exit_debit += exit_value
+            else:
+                total_exit_debit -= exit_value
+            exit_charges += fill_model.estimate_charges(
+                exit_side,
+                qty,
+                mark,
+                trade_date=self._session_date,
+            )
+            leg_marks.append({
+                "security_id": sid,
+                "mark": mark,
+                "basis": basis,
+                "age_ms": age_ms,
+                "quantity": qty,
+                "exit_side": exit_side.value,
+            })
+
+        if stale:
+            return {
+                "stale": True,
+                "current_mark": None,
+                "unrealised_gross_pnl": None,
+                "unrealised_net_pnl": None,
+                "estimated_exit_charges": None,
+                "legs": leg_marks,
+            }
+
+        gross = pos.entry_credit - total_exit_debit
+        total_charges = pos.entry_charges + exit_charges
+        return {
+            "stale": False,
+            "current_mark": round(total_exit_debit, 2),
+            "unrealised_gross_pnl": round(gross, 2),
+            "unrealised_net_pnl": round(gross - total_charges, 2),
+            "estimated_exit_charges": round(exit_charges, 2),
+            "legs": leg_marks,
+        }
 
     def _write_position_marks(self) -> None:
         """Write latest_position_marks.json with live mark-to-market for open positions."""
         if not self._open_positions:
             return
+        fill_model = FillModel(charges=ChargesConfig.for_date(self._session_date))
         marks = []
         for pos in self._open_positions:
-            leg_marks = []
-            total_mark_debit = 0.0
-            stale = False
-            for leg in pos.legs:
-                sid = str(leg.get("security_id", ""))
-                result = self._get_exit_mark(sid) if sid else None
-                if result is None:
-                    stale = True
-                    leg_marks.append({"security_id": sid, "mark": None, "basis": None, "age_ms": None})
-                    continue
-                mark, basis, age_ms = result
-                side = leg.get("side", "")
-                qty = leg.get("quantity", 0)
-                # Exit-side value: BUY to cover short, SELL long hedge
-                exit_value = mark * qty
-                leg_marks.append({"security_id": sid, "mark": mark, "basis": basis, "age_ms": age_ms})
-                total_mark_debit += exit_value
-
-            if stale:
+            mtm = self._mark_position(pos, fill_model)
+            if mtm["stale"]:
                 marks.append({
                     "symbol": pos.symbol,
                     "expiry": pos.expiry.isoformat(),
                     "current_mark": None,
                     "unrealised_gross_pnl": None,
                     "unrealised_net_pnl": None,
+                    "estimated_exit_charges": None,
                     "stale": True,
+                    "legs": mtm["legs"],
                 })
                 continue
 
-            gross = pos.entry_credit - total_mark_debit
-            # Approximate exit charges using entry charge ratio
-            charge_ratio = pos.entry_charges / pos.entry_credit if pos.entry_credit > 0 else 0.0
-            est_charges = total_mark_debit * charge_ratio
-            net = gross - est_charges
             marks.append({
                 "symbol": pos.symbol,
                 "expiry": pos.expiry.isoformat(),
-                "current_mark": round(total_mark_debit, 2),
-                "unrealised_gross_pnl": round(gross, 2),
-                "unrealised_net_pnl": round(net, 2),
+                "current_mark": mtm["current_mark"],
+                "unrealised_gross_pnl": mtm["unrealised_gross_pnl"],
+                "unrealised_net_pnl": mtm["unrealised_net_pnl"],
+                "estimated_exit_charges": mtm["estimated_exit_charges"],
                 "stale": False,
-                "legs": leg_marks,
+                "legs": mtm["legs"],
             })
 
         _write_atomic(
@@ -1586,37 +1647,37 @@ class PaperTradingEngine:
 
     def _write_equity_tick(self) -> None:
         """Write latest_equity_tick.json with realised + unrealised PnL."""
-        realised = sum(t.get("net_pnl", 0.0) for t in self._completed_trades)
-        unrealised = 0.0
+        realised_gross = sum(t.get("gross_pnl", 0.0) for t in self._completed_trades)
+        realised_net = sum(t.get("net_pnl", 0.0) for t in self._completed_trades)
+        unrealised_gross = 0.0
+        unrealised_net = 0.0
         stale = False
+        fill_model = FillModel(charges=ChargesConfig.for_date(self._session_date))
         for pos in self._open_positions:
-            total_mark_debit = 0.0
-            pos_stale = False
-            for leg in pos.legs:
-                sid = str(leg.get("security_id", ""))
-                result = self._get_exit_mark(sid) if sid else None
-                if result is None:
-                    pos_stale = True
-                    break
-                mark, _basis, _age = result
-                qty = leg.get("quantity", 0)
-                total_mark_debit += mark * qty
-            if pos_stale:
+            mtm = self._mark_position(pos, fill_model)
+            if mtm["stale"]:
                 stale = True
                 continue
-            charge_ratio = pos.entry_charges / pos.entry_credit if pos.entry_credit > 0 else 0.0
-            est_charges = total_mark_debit * charge_ratio
-            unrealised += (pos.entry_credit - total_mark_debit - est_charges)
+            unrealised_gross += float(mtm["unrealised_gross_pnl"])
+            unrealised_net += float(mtm["unrealised_net_pnl"])
 
         tick = {
             "ts": _ts_str(),
-            "realised_net_pnl": round(realised, 2),
-            "unrealised_net_pnl": round(unrealised, 2) if not stale else None,
-            "total_net_pnl": round(realised + unrealised, 2) if not stale else None,
+            "realised_gross_pnl": round(realised_gross, 2),
+            "realised_net_pnl": round(realised_net, 2),
+            "unrealised_gross_pnl": round(unrealised_gross, 2) if not stale else None,
+            "unrealised_net_pnl": round(unrealised_net, 2) if not stale else None,
+            "total_gross_pnl": round(realised_gross + unrealised_gross, 2) if not stale else None,
+            "total_net_pnl": round(realised_net + unrealised_net, 2) if not stale else None,
             "open_positions": len(self._open_positions),
             "quote_stale": stale,
         }
         _write_atomic(self._snapshot_dir / "latest_equity_tick.json", tick, sync=False)
+        if tick["total_net_pnl"] is not None and self._open_positions:
+            history_dir = self._live_root / "equity_ticks"
+            history_dir.mkdir(parents=True, exist_ok=True)
+            with (history_dir / f"{self._date_str}.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(tick, default=str) + "\n")
 
     def _merged_quote_snapshot(self) -> dict[str, dict]:
         quotes: dict[str, dict] = {}
@@ -1920,7 +1981,7 @@ class PaperTradingEngine:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _ensure_dirs(self) -> None:
-        for subdir in ("paper_trades", "reports", "logs", "snapshots", "alerts"):
+        for subdir in ("paper_trades", "reports", "logs", "snapshots", "alerts", "equity_ticks"):
             (self._live_root / subdir).mkdir(parents=True, exist_ok=True)
 
     def _setup_file_logging(self) -> None:

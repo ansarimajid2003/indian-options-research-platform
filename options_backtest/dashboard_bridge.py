@@ -386,38 +386,68 @@ class DashboardBridge:
         date_str = session_date.strftime("%Y%m%d")
 
         def _load() -> list[EquityPoint]:
-            points: list[EquityPoint] = []
-            # Include live intraday tick if positions are open
+            points_by_ts: dict[str, EquityPoint] = {}
+
+            def _point_from_tick(tick: dict) -> EquityPoint | None:
+                ts = str(tick.get("ts") or "")
+                if not ts.startswith(session_date.isoformat()):
+                    return None
+                total_net = tick.get("total_net_pnl")
+                if total_net is None:
+                    return None
+                total_gross = tick.get("total_gross_pnl")
+                if total_gross is None:
+                    total_gross = tick.get("realised_gross_pnl", tick.get("realised_net_pnl", 0.0))
+                return EquityPoint(
+                    ts=ts,
+                    cumulative_gross_pnl=round(float(total_gross), 2),
+                    cumulative_net_pnl=round(float(total_net), 2),
+                )
+
+            # Live history is absolute mark-to-market total PnL per tick.
+            history_path = self._root / "equity_ticks" / f"{date_str}.jsonl"
+            if history_path.exists():
+                try:
+                    for line in history_path.read_text(encoding="utf-8").splitlines():
+                        if not line.strip():
+                            continue
+                        point = _point_from_tick(json.loads(line))
+                        if point is not None:
+                            points_by_ts[point.ts] = point
+                except Exception:
+                    pass
+
+            # Include the latest tick even if the JSONL history is delayed.
             tick = self._read_json(self._snap("latest_equity_tick.json")) or {}
-            if tick.get("total_net_pnl") is not None and tick.get("open_positions", 0) > 0:
-                points.append(EquityPoint(
-                    ts=tick.get("ts", ""),
-                    cumulative_gross_pnl=round(tick.get("realised_net_pnl", 0.0), 2),
-                    cumulative_net_pnl=round(tick.get("total_net_pnl", 0.0), 2),
-                ))
+            point = _point_from_tick(tick)
+            if point is not None and tick.get("open_positions", 0) > 0:
+                points_by_ts[point.ts] = point
+
+            # Closed trades are realised absolute totals. They complement the
+            # live MTM series without being added on top of the latest tick.
             path = self._root / "paper_trades" / f"{date_str}.json"
             if not path.exists():
-                return points
+                return sorted(points_by_ts.values(), key=lambda p: p.ts)
             try:
                 trades: list[dict] = json.loads(path.read_text(encoding="utf-8"))
+                cum_gross = 0.0
+                cum_net = 0.0
+                for trade in sorted(trades, key=lambda t: t.get("exit_time") or ""):
+                    exit_t = trade.get("exit_time")
+                    if not exit_t:
+                        continue
+                    cum_gross += trade.get("gross_pnl", 0.0)
+                    cum_net += trade.get("net_pnl", 0.0)
+                    points_by_ts[exit_t] = EquityPoint(
+                        ts=exit_t,
+                        cumulative_gross_pnl=round(cum_gross, 2),
+                        cumulative_net_pnl=round(cum_net, 2),
+                    )
             except Exception:
-                return points
-            cum_gross = points[-1].cumulative_gross_pnl if points else 0.0
-            cum_net = points[-1].cumulative_net_pnl if points else 0.0
-            for trade in sorted(trades, key=lambda t: t.get("exit_time") or ""):
-                exit_t = trade.get("exit_time")
-                if not exit_t:
-                    continue
-                cum_gross += trade.get("gross_pnl", 0.0)
-                cum_net += trade.get("net_pnl", 0.0)
-                points.append(EquityPoint(
-                    ts=exit_t,
-                    cumulative_gross_pnl=round(cum_gross, 2),
-                    cumulative_net_pnl=round(cum_net, 2),
-                ))
-            return points
+                pass
+            return sorted(points_by_ts.values(), key=lambda p: p.ts)
 
-        result = self._cached(f"equity_{date_str}", _TTL_TRADES, _load)
+        result = self._cached(f"equity_{date_str}", _TTL_LIVE, _load)
         return result if result is not None else []
 
     # ── Closed trades (today's completed positions) ──────────────────────────

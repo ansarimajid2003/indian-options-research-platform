@@ -76,7 +76,7 @@ const PositionsPanel = React.memo(function PositionsPanel({ positions, closedTra
               <tbody>
                 {positions.map(p => {
                   const { gross, net, current_spread } = computePnL(p);
-                  const cls = net >= 0 ? 'pnl-pos' : 'pnl-neg';
+                  const cls = net == null ? '' : (net >= 0 ? 'pnl-pos' : 'pnl-neg');
                   return (
                     <tr key={p.symbol} className={`pos-row ${cls}`}>
                       <td className="l">
@@ -102,9 +102,11 @@ const PositionsPanel = React.memo(function PositionsPanel({ positions, closedTra
                       <td className="muted">{p.entry_time}</td>
                       <td>{fmtNum(p.entry_credit)}</td>
                       <td>{fmtNum(p.current_mark)}</td>
-                      <td className={current_spread > 0 ? 'neg' : 'pos'}>{current_spread > 0 ? '+' : ''}{current_spread.toFixed(2)}%</td>
-                      <td className={gross >= 0 ? 'pos' : 'neg'}>{fmtINR(gross)}</td>
-                      <td className={net >= 0 ? 'pos' : 'neg'} style={{fontWeight: 600}}>{fmtINR(net)}</td>
+                      <td className={current_spread == null ? 'muted' : (current_spread > 0 ? 'neg' : 'pos')}>
+                        {current_spread == null ? '-' : `${current_spread > 0 ? '+' : ''}${current_spread.toFixed(2)}%`}
+                      </td>
+                      <td className={gross == null ? 'muted' : (gross >= 0 ? 'pos' : 'neg')}>{fmtINR(gross)}</td>
+                      <td className={net == null ? 'muted' : (net >= 0 ? 'pos' : 'neg')} style={{fontWeight: 600}}>{fmtINR(net)}</td>
                       <td>
                         <span style={{display:'inline-flex', gap:3}}>
                           {p.leg_ages.map((a, i) => (
@@ -260,7 +262,7 @@ const EquityCurvePanel = React.memo(function EquityCurvePanel({ seriesRef, equit
         <div ref={containerRef} className="eq-chart" />
         {equityState.length === 0 && (
           <div style={{position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center', background:'#111'}}>
-            <EmptyState icon="◈" title="NO TRADES YET" sub="Equity curve populates when positions are closed" />
+            <EmptyState icon="◈" title="NO LIVE MARKS YET" sub="Equity curve populates when position marks are available" />
           </div>
         )}
       </div>

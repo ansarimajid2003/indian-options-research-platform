@@ -60,10 +60,15 @@ function aggregateBars(bars, minutes) {
 
 // computePnL for positions panel (uses live leg data)
 function computePnL(p) {
-  const totalLotSize = (p.lots || 0) * (p.lot_size || 0);
-  const gross = ((p.entry_credit || 0) - (p.current_mark || p.entry_credit || 0)) * totalLotSize;
-  const net = gross - (p.entry_charges || 0);
-  const current_spread = ((p.current_mark || p.entry_credit) / (p.entry_credit || 1) - 1) * 100;
+  const gross = p.unrealised_gross_pnl != null
+    ? p.unrealised_gross_pnl
+    : (p.current_mark != null ? (p.entry_credit || 0) - p.current_mark : null);
+  const net = p.unrealised_net_pnl != null
+    ? p.unrealised_net_pnl
+    : (gross != null ? gross - (p.entry_charges || 0) : null);
+  const current_spread = p.current_mark != null && p.entry_credit
+    ? (p.current_mark / p.entry_credit - 1) * 100
+    : null;
   return { gross, net, current_spread };
 }
 
