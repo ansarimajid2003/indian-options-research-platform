@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -44,6 +45,9 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 _log = logging.getLogger(__name__)
+_POST_REPORT_HARD_EXIT_SECONDS = 45.0
+_ANCILLARY_SHUTDOWN_TIMEOUT_SECONDS = 20.0
+_PAPER_REPORT_TIMEOUT_SECONDS = 30.0
 
 
 def _resolve_live_root() -> Path:
@@ -53,7 +57,7 @@ def _resolve_live_root() -> Path:
         if not str(resolved).startswith("/media/WD-Storage"):
             raise RuntimeError(
                 f"data/live resolves to {resolved}, expected /media/WD-Storage/... "
-                "Aborting to protect root filesystem."
+                "Aborting to protect writable live storage."
             )
     live_path.mkdir(parents=True, exist_ok=True)
     return live_path
@@ -87,6 +91,54 @@ def _check_health_monitor_running(live_root: Path) -> bool:
     """Best-effort check: did health monitor write a recent alert-state file?"""
     health_path = resolve_snapshot_dir(live_root) / "latest_alert_state.json"
     return health_path.exists()
+
+
+def _load_restart_reason(live_root: Path, today: date) -> dict | None:
+    """Return a same-day operator restart reason, if one was written before restart."""
+    path = resolve_durable_dir(live_root) / "restart_reason.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        _log.warning("restart_reason: could not load - %r", exc)
+        return None
+    session_date = data.get("session_date")
+    if session_date and session_date != today.isoformat():
+        return None
+    reason = str(data.get("reason") or "").strip()
+    if not reason:
+        return None
+    return data
+
+
+async def _cancel_tasks(tasks: list[asyncio.Task], timeout: float) -> bool:
+    pending = [task for task in tasks if not task.done()]
+    for task in pending:
+        task.cancel()
+    if not pending:
+        return True
+    try:
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        _log.error("orchestrator: ancillary shutdown timed out after %.1fs", timeout)
+        return False
+
+
+def _start_post_report_hard_exit_timer(enabled: bool, exit_code: int = 0) -> threading.Timer | None:
+    if not enabled:
+        return None
+
+    def _force_exit() -> None:
+        _log.error("orchestrator: post-report hard-exit watchdog fired")
+        logging.shutdown()
+        os._exit(exit_code)
+
+    timer = threading.Timer(_POST_REPORT_HARD_EXIT_SECONDS, _force_exit)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def _ensure_fresh_token(access_token: str, client_id: str) -> str:
@@ -197,7 +249,14 @@ async def _reconcile_collector(
         _log.info("orchestrator: no reconciliation needed (engine did not load failed symbols)")
 
 
-async def _run_live(profile: dict, today: date, live_root: Path, access_token: str, client_id: str) -> None:
+async def _run_live(
+    profile: dict,
+    today: date,
+    live_root: Path,
+    access_token: str,
+    client_id: str,
+    hard_exit: bool = False,
+) -> None:
     depth_cache = DepthCache()
     engine = PaperTradingEngine(
         profile=profile,
@@ -212,7 +271,7 @@ async def _run_live(profile: dict, today: date, live_root: Path, access_token: s
     if checkpoint is not None:
         _log.info("RESUME MODE: orchestrator loaded checkpoint with %d open positions",
                   len(checkpoint.get("open_positions", [])))
-        engine.resume_from_checkpoint(checkpoint)
+        engine.resume_from_checkpoint(checkpoint, restart_reason=_load_restart_reason(live_root, today))
 
     collector_task = asyncio.create_task(
         collect_order_book(
@@ -238,16 +297,31 @@ async def _run_live(profile: dict, today: date, live_root: Path, access_token: s
             )
             if engine_task in done:
                 await engine_task
+                watchdog = _start_post_report_hard_exit_timer(hard_exit, exit_code=0)
+                keep_watchdog = False
                 date_str = today.strftime("%Y%m%d")
                 trades_json = live_root / "paper_trades" / f"{date_str}.json"
                 if trades_json.exists():
                     _log.info("orchestrator: engine complete; writing paper reports from %s", trades_json)
-                    await asyncio.to_thread(write_paper_reports, trades_json, today, live_root)
-                    _log.info("orchestrator: paper reports complete")
-                for task in all_tasks:
-                    if task is not engine_task and not task.done():
-                        task.cancel()
-                await asyncio.gather(*[t for t in all_tasks if t is not engine_task], return_exceptions=True)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(write_paper_reports, trades_json, today, live_root),
+                            timeout=_PAPER_REPORT_TIMEOUT_SECONDS,
+                        )
+                        _log.info("orchestrator: paper reports complete")
+                    except asyncio.TimeoutError:
+                        _log.error("orchestrator: paper report conversion timed out after %.1fs", _PAPER_REPORT_TIMEOUT_SECONDS)
+                        keep_watchdog = True
+                try:
+                    clean_shutdown = await _cancel_tasks(
+                        [t for t in all_tasks if t is not engine_task],
+                        timeout=_ANCILLARY_SHUTDOWN_TIMEOUT_SECONDS,
+                    )
+                    if not clean_shutdown:
+                        keep_watchdog = True
+                finally:
+                    if watchdog is not None and not keep_watchdog:
+                        watchdog.cancel()
                 _log.info("orchestrator: ancillary tasks stopped; live run complete")
                 return
             if collector_task in done:
@@ -268,10 +342,7 @@ async def _run_live(profile: dict, today: date, live_root: Path, access_token: s
                 all_tasks.remove(reconcile_task)
                 continue
     finally:
-        for task in all_tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*all_tasks, return_exceptions=True)
+        await _cancel_tasks(all_tasks, timeout=_ANCILLARY_SHUTDOWN_TIMEOUT_SECONDS)
 
 
 def main() -> None:
@@ -326,7 +397,7 @@ def main() -> None:
         if args.dry_run:
             asyncio.run(_run_dry(profile, today, live_root, access_token, client_id))
         else:
-            asyncio.run(_run_live(profile, today, live_root, access_token, client_id))
+            asyncio.run(_run_live(profile, today, live_root, access_token, client_id, hard_exit=args.hard_exit))
     except SystemExit:
         raise
     except Exception:

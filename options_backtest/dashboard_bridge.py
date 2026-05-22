@@ -286,6 +286,13 @@ class DashboardBridge:
             return self._durable_dir / name
         return self._snapshot_dir / name
 
+    def _read_chain_metadata(self) -> dict:
+        return (
+            self._read_json(self._snapshot_dir / "latest_chain_metadata.json")
+            or self._read_json(self._durable_dir / "latest_chain_metadata.json")
+            or {}
+        )
+
     # ── Session status ───────────────────────────────────────────────────────
 
     def get_session_status(self) -> SessionStatus:
@@ -554,10 +561,10 @@ class DashboardBridge:
                 "delta":   q.get("delta"),
                 "theta":   q.get("theta"),
                 "oi":      q.get("oi", 0),
-                "bid":     d.get("bid", 0.0),
-                "ask":     d.get("ask", 0.0),
-                "bid_qty": d.get("bid_qty", 0),
-                "ask_qty": d.get("ask_qty", 0),
+                "bid":     d.get("bid", q.get("top_bid", 0.0)),
+                "ask":     d.get("ask", q.get("top_ask", 0.0)),
+                "bid_qty": d.get("bid_qty", q.get("bid_qty", 0)),
+                "ask_qty": d.get("ask_qty", q.get("ask_qty", 0)),
                 "age_ms":  max(d.get("bid_age_ms", 0), d.get("ask_age_ms", 0)),
                 "sid":     sid,
             }
@@ -602,6 +609,39 @@ class DashboardBridge:
         atm = round(spot / step) * step
         return [r for r in rows if abs(r["strike"] - atm) <= n * step]
 
+    @staticmethod
+    def _merge_chain_metadata(quotes: dict[str, dict], chain_data: dict) -> dict[str, dict]:
+        contracts = chain_data.get("contracts", chain_data) if isinstance(chain_data, dict) else {}
+        if not isinstance(contracts, dict):
+            return quotes
+        merged = {str(sid): dict(q) for sid, q in quotes.items()}
+        for sid, meta in contracts.items():
+            if not isinstance(meta, dict):
+                continue
+            q = merged.setdefault(str(sid), {})
+            greeks = meta.get("greeks") or {}
+            if q.get("ltp") in (None, 0, 0.0) and meta.get("ltp") is not None:
+                q["ltp"] = meta.get("ltp")
+            if q.get("oi") in (None, 0) and meta.get("oi") is not None:
+                q["oi"] = meta.get("oi")
+            if q.get("volume") in (None, 0) and meta.get("volume") is not None:
+                q["volume"] = meta.get("volume")
+            q["iv"] = meta.get("iv")
+            q["delta"] = greeks.get("delta")
+            q["theta"] = greeks.get("theta")
+            q["gamma"] = greeks.get("gamma")
+            q["vega"] = greeks.get("vega")
+            q["rho"] = greeks.get("rho")
+            if meta.get("top_bid") is not None:
+                q.setdefault("top_bid", meta.get("top_bid"))
+            if meta.get("top_ask") is not None:
+                q.setdefault("top_ask", meta.get("top_ask"))
+            if meta.get("bid_qty") is not None:
+                q.setdefault("bid_qty", meta.get("bid_qty"))
+            if meta.get("ask_qty") is not None:
+                q.setdefault("ask_qty", meta.get("ask_qty"))
+        return merged
+
     def get_option_chain(self, symbol: str) -> dict:
         """
         Build a per-strike option chain for `symbol`.
@@ -625,6 +665,11 @@ class DashboardBridge:
         if use_eod:
             instruments = eod_data.get("instruments", {})
             quotes = eod_data.get("quotes", {})
+            quotes = self._merge_chain_metadata(quotes, eod_data.get("chain_metadata", {}))
+            quotes = self._merge_chain_metadata(
+                quotes,
+                self._read_chain_metadata(),
+            )
             tob: dict[str, dict] = {}
             depth_status = "eod"
         else:
@@ -633,6 +678,10 @@ class DashboardBridge:
                 return {"symbol": symbol, "underlying_spot": None, "strike_step": step, "atm_strike": None, "depth_status": "unavailable", "rows": []}
             instruments = imap_data.get("instruments", {})
             quotes = (self._read_json(self._snap("latest_quotes.json")) or {}).get("quotes", {})
+            quotes = self._merge_chain_metadata(
+                quotes,
+                self._read_chain_metadata(),
+            )
             tob = (self._read_json(self._snap("latest_depth_cache.json")) or {}).get("tob", {})
             # Derive depth status from depth cache snapshot
             dc = self._read_json(self._snap("latest_depth_cache.json")) or {}

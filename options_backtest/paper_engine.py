@@ -335,6 +335,8 @@ class PaperTradingEngine:
         self._phase = "init"
         self._stop_event = asyncio.Event()
         self._resumed_after_crash = False
+        self._resumed_after_manual_restart = False
+        self._restart_reason: str | None = None
         self._crash_gap_start: str | None = None
         self._crash_gap_end: str | None = None
         self._crash_gap_minutes: float | None = None
@@ -358,7 +360,7 @@ class PaperTradingEngine:
             )
             self._resolvers[symbol] = resolver
 
-    def resume_from_checkpoint(self, checkpoint: dict) -> None:
+    def resume_from_checkpoint(self, checkpoint: dict, restart_reason: dict | None = None) -> None:
         """Load open positions from a checkpoint dict (crash recovery)."""
         for pos_dict in checkpoint.get("open_positions", []):
             pos = _OpenPosition(
@@ -380,13 +382,18 @@ class PaperTradingEngine:
             pos.exit_reason = pos_dict.get("exit_reason")
             pos.forced_stale_exit = pos_dict.get("forced_stale_exit", False)
             self._open_positions.append(pos)
-        self._resumed_after_crash = True
+        reason = str((restart_reason or {}).get("reason") or "").strip()
+        is_manual = reason.startswith("manual")
+        self._restart_reason = reason or None
+        self._resumed_after_manual_restart = is_manual
+        self._resumed_after_crash = not is_manual
         self._crash_gap_start = checkpoint.get("written_at")
         self._crash_gap_end = _ts_str()
         self._crash_gap_minutes = self._compute_gap_minutes(self._crash_gap_start, self._crash_gap_end)
         _log.info(
-            "RESUME MODE: loaded %d open positions from checkpoint gap_start=%s gap_end=%s gap_minutes=%s",
+            "RESUME MODE: loaded %d open positions from checkpoint restart_reason=%s gap_start=%s gap_end=%s gap_minutes=%s",
             len(self._open_positions),
+            self._restart_reason or ("crash_or_unexpected" if self._resumed_after_crash else "manual"),
             self._crash_gap_start,
             self._crash_gap_end,
             self._crash_gap_minutes,
@@ -829,6 +836,7 @@ class PaperTradingEngine:
 
         self._subscribed_ids = instruments_to_sub
         self._write_instrument_map()
+        self._write_chain_metadata(durable=False)
 
         if self._ws is not None and self._feed_connected:
             core_keys = {
@@ -1431,6 +1439,8 @@ class PaperTradingEngine:
             "charges": round(total_charges, 2),
             "net_pnl": round(net_pnl, 2),
             "resumed_after_crash": self._resumed_after_crash,
+            "resumed_after_manual_restart": self._resumed_after_manual_restart,
+            "restart_reason": self._restart_reason,
             "crash_gap_start": self._crash_gap_start,
             "crash_gap_end": self._crash_gap_end,
             "gap_minutes": self._crash_gap_minutes,
@@ -1474,6 +1484,44 @@ class PaperTradingEngine:
                 _log.warning("process_health_loop: error — %r", exc)
             await asyncio.sleep(_SNAPSHOT_INTERVAL)
 
+    def _merge_chain_metadata_into_quotes(self, quotes: dict[str, dict]) -> None:
+        for sid, meta in self._chain_greeks.items():
+            greeks = meta.get("greeks") or {}
+            q = quotes.setdefault(sid, {})
+            if q.get("ltp") in (None, 0, 0.0) and meta.get("ltp") is not None:
+                q["ltp"] = meta.get("ltp")
+            if q.get("oi") in (None, 0) and meta.get("oi") is not None:
+                q["oi"] = meta.get("oi")
+            if q.get("volume") in (None, 0) and meta.get("volume") is not None:
+                q["volume"] = meta.get("volume")
+            q.setdefault("ts", _ts_str())
+            q["iv"] = meta.get("iv")
+            q["delta"] = greeks.get("delta")
+            q["theta"] = greeks.get("theta")
+            q["gamma"] = greeks.get("gamma")
+            q["vega"] = greeks.get("vega")
+            q["rho"] = greeks.get("rho")
+            if meta.get("top_bid") is not None:
+                q.setdefault("top_bid", meta.get("top_bid"))
+            if meta.get("top_ask") is not None:
+                q.setdefault("top_ask", meta.get("top_ask"))
+            if meta.get("bid_qty") is not None:
+                q.setdefault("bid_qty", meta.get("bid_qty"))
+            if meta.get("ask_qty") is not None:
+                q.setdefault("ask_qty", meta.get("ask_qty"))
+
+    def _write_chain_metadata(self, durable: bool = False) -> None:
+        if not self._chain_greeks:
+            return
+        payload = {
+            "written_at": _ts_str(),
+            "session_date": self._session_date.isoformat(),
+            "contracts": self._chain_greeks,
+        }
+        _write_atomic(self._snapshot_dir / "latest_chain_metadata.json", payload, sync=False)
+        if durable:
+            _write_atomic(self._durable_dir / "latest_chain_metadata.json", payload)
+
     def _write_feed_state(self) -> None:
         # Quote freshness only covers option IDs carried on the quote/full feed.
         # NSE option fills use the separate 20-depth collector, so zero sampled
@@ -1506,12 +1554,8 @@ class PaperTradingEngine:
                 # Quantities not available from type-8 feed; set to 0
                 quotes[sid]["bid_qty"] = tob.get("bid_qty", 0)
                 quotes[sid]["ask_qty"] = tob.get("ask_qty", 0)
-        # Attach IV and greeks from chain_greeks cache
-        for sid, meta in self._chain_greeks.items():
-            if sid in quotes:
-                quotes[sid]["iv"] = meta.get("iv")
-                quotes[sid]["delta"] = (meta.get("greeks") or {}).get("delta")
-                quotes[sid]["theta"] = (meta.get("greeks") or {}).get("theta")
+        self._merge_chain_metadata_into_quotes(quotes)
+        self._write_chain_metadata(durable=False)
         if quotes:
             _write_atomic(self._snapshot_dir / "latest_quotes.json", {"written_at": _ts_str(), "quotes": quotes}, sync=False)
 
@@ -1824,17 +1868,15 @@ class PaperTradingEngine:
         for sid, tob in self._last_tob.items():
             if sid not in quotes:
                 quotes[sid] = {"ltp": tob.get("ltp", 0.0), "oi": 0, "volume": 0, "ts": tob.get("ts", pd.Timestamp.now(tz="Asia/Kolkata")).isoformat()}
-        for sid, meta in self._chain_greeks.items():
-            if sid in quotes:
-                quotes[sid]["iv"] = meta.get("iv")
-                quotes[sid]["delta"] = (meta.get("greeks") or {}).get("delta")
-                quotes[sid]["theta"] = (meta.get("greeks") or {}).get("theta")
+        self._merge_chain_metadata_into_quotes(quotes)
+        self._write_chain_metadata(durable=True)
         if imap and quotes:
             _write_atomic(self._durable_dir / "latest_eod_snapshot.json", {
                 "written_at": _ts_str(),
                 "session_date": self._session_date.isoformat(),
                 "instruments": imap,
                 "quotes": quotes,
+                "chain_metadata": self._chain_greeks,
             })
             _log.info("eod_snapshot: written %d instruments, %d quotes", len(imap), len(quotes))
 
@@ -1854,6 +1896,8 @@ class PaperTradingEngine:
             "open_positions": len(self._open_positions),
             "session_date": self._session_date.isoformat(),
             "resumed_after_crash": self._resumed_after_crash,
+            "resumed_after_manual_restart": self._resumed_after_manual_restart,
+            "restart_reason": self._restart_reason,
             "crash_gap_start": self._crash_gap_start,
             "crash_gap_end": self._crash_gap_end,
             "gap_minutes": self._crash_gap_minutes,
@@ -1879,6 +1923,8 @@ class PaperTradingEngine:
             "session_date": self._session_date.isoformat(),
             "written_at": _ts_str(),
             "resumed_after_crash": self._resumed_after_crash,
+            "resumed_after_manual_restart": self._resumed_after_manual_restart,
+            "restart_reason": self._restart_reason,
             "crash_gap_start": self._crash_gap_start,
             "crash_gap_end": self._crash_gap_end,
             "gap_minutes": self._crash_gap_minutes,
@@ -1906,6 +1952,8 @@ class PaperTradingEngine:
             "charges": round(total_charges, 2),
             "net_pnl": round(total_net, 2),
             "resumed_after_crash": self._resumed_after_crash,
+            "resumed_after_manual_restart": self._resumed_after_manual_restart,
+            "restart_reason": self._restart_reason,
             "crash_gap_start": self._crash_gap_start,
             "crash_gap_end": self._crash_gap_end,
             "gap_minutes": self._crash_gap_minutes,
@@ -1921,17 +1969,20 @@ class PaperTradingEngine:
             f"**Charges:** ₹{total_charges:,.2f}",
             f"**Net PnL:** ₹{total_net:,.2f}",
             f"**Resumed after crash:** {str(self._resumed_after_crash).lower()}",
+            f"**Resumed after manual restart:** {str(self._resumed_after_manual_restart).lower()}",
             "",
             "## Trade Detail",
             "",
         ]
-        if self._resumed_after_crash:
+        if self._resumed_after_crash or self._resumed_after_manual_restart:
             lines.extend([
-                "## Crash Recovery",
+                "## Restart Recovery",
                 "",
                 "```json",
                 json.dumps({
-                    "resumed_after_crash": True,
+                    "resumed_after_crash": self._resumed_after_crash,
+                    "resumed_after_manual_restart": self._resumed_after_manual_restart,
+                    "restart_reason": self._restart_reason,
                     "crash_gap_start": self._crash_gap_start,
                     "crash_gap_end": self._crash_gap_end,
                     "gap_minutes": self._crash_gap_minutes,

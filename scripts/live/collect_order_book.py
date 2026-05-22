@@ -75,10 +75,10 @@ _PACKET_SIZE = _HEADER_SIZE + _LEVELS * _LEVEL_SIZE   # 332
 _MAX_PER_CONN = 50
 _DEFAULT_ATM_OFFSET_RANGE = 20
 _DEFAULT_MAX_DEPTH_CONNECTIONS = 5
-_FLUSH_INTERVAL = 60        # seconds
+_FLUSH_INTERVAL = 15        # seconds
 _RECONNECT_DELAY = 5        # seconds between reconnect attempts
 _PING_INTERVAL = 10         # seconds between server pings
-_WRITER_QUEUE_MAX_ITEMS = 20_000
+_WRITER_QUEUE_MAX_ITEMS = 100_000
 _WRITER_STOP_TIMEOUT = 10.0
 _WRITER_DROP_LOG_INTERVAL = 30.0
 
@@ -99,7 +99,7 @@ def _live_root() -> Path:
     if live_path != expected:
         raise RuntimeError(
             f"data/live resolves to {live_path}, expected {expected}. "
-            "Collector aborts to protect root filesystem."
+            "Collector aborts to protect writable live storage."
         )
     return live_path
 
@@ -336,36 +336,47 @@ class _WriterThread:
         self._flush_seq += 1
         seq = self._flush_seq
         minute_bucket = datetime.now().strftime("%H%M")
+        all_rows: list[dict] = []
         for ikey, rows in rows_by_ikey.items():
-            if not rows:
-                continue
-            df = pd.DataFrame(rows)
-            # Tick-level depth parquet — append-only, no reads during market hours
-            out_path = self._norm_dir / f"{ikey}_{minute_bucket}_{seq:04d}.parquet"
-            tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-            pq.write_table(pa.Table.from_pandas(df), str(tmp_path), compression="snappy")
-            tmp_path.replace(out_path)
-            # 1-min OHLCV derived from these ticks — also append-only
-            self._write_1min(df, ikey, minute_bucket, seq)
+            for row in rows:
+                row_with_key = dict(row)
+                row_with_key["instrument_key"] = ikey
+                all_rows.append(row_with_key)
+        if not all_rows:
+            return
+        df = pd.DataFrame(all_rows)
+        out_path = self._norm_dir / f"depth_{minute_bucket}_{seq:04d}.parquet"
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        pq.write_table(pa.Table.from_pandas(df), str(tmp_path), compression="snappy")
+        tmp_path.replace(out_path)
+        self._write_1min(df, minute_bucket, seq)
 
-    def _write_1min(self, df: pd.DataFrame, ikey: str, minute_bucket: str, seq: int) -> None:
+    def _write_1min(self, df: pd.DataFrame, minute_bucket: str, seq: int) -> None:
         df2 = df.copy()
         df2["timestamp"] = _parse_depth_timestamps(df2["timestamp"])
         bad_rows = int(df2["timestamp"].isna().sum())
         if bad_rows:
-            _log.warning("depth_writer: dropping %d rows with unparseable timestamps for %s", bad_rows, ikey)
+            _log.warning("depth_writer: dropping %d rows with unparseable timestamps", bad_rows)
             df2 = df2.dropna(subset=["timestamp"])
         if df2.empty:
             return
-        df2 = df2.set_index("timestamp").sort_index()
-        if "mid" not in df2.columns:
+        if "mid" not in df2.columns or "instrument_key" not in df2.columns:
             return
-        agg = df2["mid"].resample("1min").ohlc()
-        agg["volume"] = df2["total_bid_qty"].resample("1min").sum()
-        agg["spread_pct_mean"] = df2["spread_pct"].resample("1min").mean()
-        out_path = self._dir_1min / f"{ikey}_{minute_bucket}_{seq:04d}.parquet"
+        frames: list[pd.DataFrame] = []
+        for ikey, group in df2.groupby("instrument_key", sort=False):
+            group = group.set_index("timestamp").sort_index()
+            agg = group["mid"].resample("1min").ohlc()
+            agg["volume"] = group["total_bid_qty"].resample("1min").sum()
+            agg["spread_pct_mean"] = group["spread_pct"].resample("1min").mean()
+            agg = agg.reset_index()
+            agg["instrument_key"] = ikey
+            frames.append(agg)
+        if not frames:
+            return
+        out_df = pd.concat(frames, ignore_index=True)
+        out_path = self._dir_1min / f"depth_1min_{minute_bucket}_{seq:04d}.parquet"
         tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-        pq.write_table(pa.Table.from_pandas(agg.reset_index()), str(tmp_path), compression="snappy")
+        pq.write_table(pa.Table.from_pandas(out_df), str(tmp_path), compression="snappy")
         tmp_path.replace(out_path)
 
     def stop(self) -> None:
@@ -598,11 +609,14 @@ class DepthCollector:
             asyncio.create_task(self._connection_loop(url, batch, conn_idx))
             for conn_idx, batch in enumerate(batches)
         ]
-        await self._stop_event.wait()
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        self._writer.stop()
+        try:
+            await self._stop_event.wait()
+        finally:
+            self._stop_event.set()
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._writer.stop()
 
     async def _connection_loop(self, url: str, sids: list[str], conn_idx: int) -> None:
         """Reconnect loop for one depth websocket connection."""
@@ -917,20 +931,33 @@ async def collect_order_book(
         raise
     finally:
         collector.stop()
-        for task in tasks:
+        collector_task = tasks[0]
+        if not collector_task.done():
+            try:
+                await asyncio.wait_for(collector_task, timeout=_WRITER_STOP_TIMEOUT + 5.0)
+            except asyncio.TimeoutError:
+                _log.error("collect_order_book: collector stop timed out; cancelling task")
+                collector_task.cancel()
+        for task in tasks[1:]:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.to_thread(
-            _write_collector_state,
-            live_root,
-            date_str,
-            "stopped",
-            all_sids,
-            configured_symbols,
-            failed_symbols,
-            collector.writer_status(),
-        )
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    _write_collector_state,
+                    live_root,
+                    date_str,
+                    "stopped",
+                    all_sids,
+                    configured_symbols,
+                    failed_symbols,
+                    collector.writer_status(),
+                ),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            _log.error("collect_order_book: stopped-state write timed out")
 
 
 if __name__ == "__main__":

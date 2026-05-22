@@ -65,6 +65,13 @@ class _ChainEntry:
     ticker: str
     greeks: dict = field(default_factory=dict)
     iv: float | None = None
+    ltp: float | None = None
+    oi: int = 0
+    volume: int = 0
+    top_bid: float | None = None
+    top_ask: float | None = None
+    bid_qty: int = 0
+    ask_qty: int = 0
 
 
 def _as_float(value, default: float = 0.0) -> float:
@@ -134,6 +141,13 @@ def _option_field(opt: dict, lower_name: str, pascal_name: str, default=None):
     if lower_name in opt:
         return opt.get(lower_name)
     return opt.get(pascal_name, default)
+
+
+def _first_option_field(opt: dict, *names: str, default=None):
+    for name in names:
+        if name in opt:
+            return opt.get(name)
+    return default
 
 
 class LiveDhanContractResolver:
@@ -271,6 +285,49 @@ class LiveDhanContractResolver:
             )
             greeks = _option_field(opt, "greeks", "Greeks", {}) or {}
             iv = _option_field(opt, "implied_volatility", "ImpliedVolatility", None)
+            ltp = _first_option_field(opt, "last_price", "ltp", "LTP", "LastPrice", default=None)
+            oi = _first_option_field(opt, "oi", "open_interest", "OpenInterest", "OI", default=0)
+            volume = _first_option_field(opt, "volume", "Volume", "total_traded_volume", default=0)
+            top_bid = _first_option_field(
+                opt,
+                "top_bid_price",
+                "best_bid_price",
+                "bid_price",
+                "TopBidPrice",
+                "BestBidPrice",
+                "BidPrice",
+                default=None,
+            )
+            top_ask = _first_option_field(
+                opt,
+                "top_ask_price",
+                "best_ask_price",
+                "ask_price",
+                "TopAskPrice",
+                "BestAskPrice",
+                "AskPrice",
+                default=None,
+            )
+            bid_qty = _first_option_field(
+                opt,
+                "top_bid_quantity",
+                "best_bid_quantity",
+                "bid_quantity",
+                "TopBidQuantity",
+                "BestBidQuantity",
+                "BidQuantity",
+                default=0,
+            )
+            ask_qty = _first_option_field(
+                opt,
+                "top_ask_quantity",
+                "best_ask_quantity",
+                "ask_quantity",
+                "TopAskQuantity",
+                "BestAskQuantity",
+                "AskQuantity",
+                default=0,
+            )
             entry = _ChainEntry(
                 security_id=sid,
                 strike=strike,
@@ -279,6 +336,13 @@ class LiveDhanContractResolver:
                 ticker=str(ticker),
                 greeks=dict(greeks) if isinstance(greeks, dict) else {},
                 iv=_as_float(iv, default=0.0) if iv is not None else None,
+                ltp=_as_float(ltp, default=0.0) if ltp is not None else None,
+                oi=_as_int(oi),
+                volume=_as_int(volume),
+                top_bid=_as_float(top_bid, default=0.0) if top_bid is not None else None,
+                top_ask=_as_float(top_ask, default=0.0) if top_ask is not None else None,
+                bid_qty=_as_int(bid_qty),
+                ask_qty=_as_int(ask_qty),
             )
             key = (expiry.isoformat(), strike, ot)
             new_chain[key] = entry
@@ -392,7 +456,7 @@ class LiveDhanContractResolver:
         return [entry.security_id for entry in sorted(entries, key=lambda e: (e.strike, e.option_type.value))]
 
     def chain_metadata(self, security_ids: list[str] | None = None) -> dict[str, dict]:
-        """Return IV/Greeks diagnostics keyed by Dhan security id."""
+        """Return option-chain diagnostics keyed by Dhan security id."""
         wanted = set(security_ids) if security_ids is not None else None
         with self._chain_lock:
             entries = list(self._id_to_contract.items())
@@ -400,7 +464,17 @@ class LiveDhanContractResolver:
         for sid, entry in entries:
             if wanted is not None and sid not in wanted:
                 continue
-            out[sid] = {"greeks": entry.greeks, "iv": entry.iv}
+            out[sid] = {
+                "greeks": entry.greeks,
+                "iv": entry.iv,
+                "ltp": entry.ltp,
+                "oi": entry.oi,
+                "volume": entry.volume,
+                "top_bid": entry.top_bid,
+                "top_ask": entry.top_ask,
+                "bid_qty": entry.bid_qty,
+                "ask_qty": entry.ask_qty,
+            }
         return out
 
     def instrument_map(self) -> dict[str, dict]:

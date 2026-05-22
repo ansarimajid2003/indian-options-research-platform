@@ -142,6 +142,13 @@ def _scrub_message(text: str) -> str:
     return text
 
 
+def _telegram_text(text: str) -> str:
+    text = _scrub_message(text)
+    if len(text) <= 4000:
+        return text
+    return text[:3990] + "\n[truncated]"
+
+
 def _jwt_expiry(token: str) -> datetime | None:
     try:
         parts = token.split(".")
@@ -1192,8 +1199,7 @@ class HealthMonitor:
         url = f"https://api.telegram.org/bot{self._tg_token}/sendMessage"
         payload: dict[str, str | int] = {
             "chat_id": self._tg_chat,
-            "text": _scrub_message(text),
-            "parse_mode": "HTML",
+            "text": _telegram_text(text),
         }
         if self._tg_thread:
             payload["message_thread_id"] = int(self._tg_thread)
@@ -1300,7 +1306,6 @@ async def _alarm_drill() -> bool:
                 payload: dict[str, str | int] = {
                     "chat_id": tg_chat,
                     "text": "[TEST] Health monitor alarm drill - Telegram alerts working.",
-                    "parse_mode": "HTML",
                 }
                 if tg_thread:
                     payload["message_thread_id"] = int(tg_thread)
