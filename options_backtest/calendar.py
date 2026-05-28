@@ -370,13 +370,22 @@ NSE_HOLIDAYS: frozenset[date] = frozenset({
     date(2025, 11,  5),  # Gurunanak Jayanti (approx)
     date(2025, 12, 25),  # Christmas
     # ── 2026 ──────────────────────────────────────────────────────────────────
+    # NSE/FAOP/71777, dated 2025-12-12. Weekend holidays are handled by the
+    # weekday check and are not listed here unless a special session exists.
     date(2026, 1, 26),   # Republic Day
-    date(2026, 3,  3),   # Holi (approx)
-    date(2026, 4,  3),   # Good Friday (approx)
+    date(2026, 3,  3),   # Holi
+    date(2026, 3, 26),   # Shri Ram Navami
+    date(2026, 3, 31),   # Shri Mahavir Jayanti
+    date(2026, 4,  3),   # Good Friday
     date(2026, 4, 14),   # Dr Ambedkar Jayanti
     date(2026, 5,  1),   # Maharashtra Day
-    date(2026, 8, 17),   # Independence Day (observed; Aug 15 2026 is Saturday)
+    date(2026, 5, 28),   # Bakri Id
+    date(2026, 6, 26),   # Muharram
+    date(2026, 9, 14),   # Ganesh Chaturthi
     date(2026, 10,  2),  # Gandhi Jayanti
+    date(2026, 10, 20),  # Dussehra
+    date(2026, 11, 10),  # Diwali-Balipratipada
+    date(2026, 11, 24),  # Guru Nanak Jayanti
     date(2026, 12, 25),  # Christmas
 })
 

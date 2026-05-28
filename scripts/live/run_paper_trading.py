@@ -24,7 +24,7 @@ import logging
 import os
 import sys
 import threading
-from datetime import date
+from datetime import date, datetime, time as dt_time
 from pathlib import Path
 
 _repo_root = Path(__file__).parents[2]
@@ -35,7 +35,8 @@ from options_backtest.calendar import is_trading_day
 from options_backtest.depth_cache import DepthCache
 from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
 from options_backtest.paper_engine import PaperTradingEngine
-from scripts.live.collect_order_book import collect_order_book
+from scripts.live.collect_order_book import collect_order_book, _depth_collection_settings
+from scripts.live.market_calendar import decision_payload, market_session_decision
 from scripts.live.paper_json_to_ledger import write_paper_reports
 from scripts.live.renew_token import check_token_expiry, renew_token, write_token_file
 
@@ -48,6 +49,10 @@ _log = logging.getLogger(__name__)
 _POST_REPORT_HARD_EXIT_SECONDS = 45.0
 _ANCILLARY_SHUTDOWN_TIMEOUT_SECONDS = 20.0
 _PAPER_REPORT_TIMEOUT_SECONDS = 30.0
+_COLLECTOR_RETRY_SECONDS = 30.0
+_COLLECTOR_RETRY_CUTOFF = dt_time(9, 18, 30)
+_COLLECTOR_RECONCILE_START = dt_time(9, 16, 0)
+_COLLECTOR_RECONCILE_INTERVAL_SECONDS = 15.0
 
 
 def _resolve_live_root() -> Path:
@@ -112,6 +117,53 @@ def _load_restart_reason(live_root: Path, today: date) -> dict | None:
     return data
 
 
+def _write_market_closed_artifacts(live_root: Path, today: date, decision: object) -> None:
+    """Leave a small durable trace when the daily runner skips a market holiday."""
+    payload = decision_payload(decision)
+    durable_dir = resolve_durable_dir(live_root)
+    snapshot_dir = resolve_snapshot_dir(live_root)
+    process_payload = {
+        "session_date": today.isoformat(),
+        "phase": "market_closed",
+        "pid": os.getpid(),
+        "open_positions": 0,
+        "restart_reason": None,
+        "resumed_after_crash": False,
+        "resumed_after_manual_restart": False,
+        "calendar_decision": payload,
+        "written_at": datetime.now().isoformat(),
+    }
+    for target in (snapshot_dir / "latest_process_health.json", durable_dir / "latest_process_health.json"):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(process_payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    calendar_state = durable_dir / "latest_market_calendar_decision.json"
+    calendar_state.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    report_dir = live_root / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"{today:%Y%m%d}_market_closed_summary.md"
+    description = payload.get("description") or payload.get("reason") or "market closed"
+    report_path.write_text(
+        "\n".join(
+            [
+                f"# {today:%Y-%m-%d} Market Closed",
+                "",
+                f"- Exchange: {payload.get('exchange')}",
+                f"- Segment: {payload.get('segment')}",
+                f"- Reason: {payload.get('reason')}",
+                f"- Description: {description}",
+                f"- Source: {payload.get('source')}",
+                f"- Cache: {payload.get('cache_path')}",
+                "",
+                "The live paper runner exited before Dhan token checks, websocket connects, or paper entries.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 async def _cancel_tasks(tasks: list[asyncio.Task], timeout: float) -> bool:
     pending = [task for task in tasks if not task.done()]
     for task in pending:
@@ -124,6 +176,76 @@ async def _cancel_tasks(tasks: list[asyncio.Task], timeout: float) -> bool:
     except asyncio.TimeoutError:
         _log.error("orchestrator: ancillary shutdown timed out after %.1fs", timeout)
         return False
+
+
+def _seconds_until(today: date, target_time: dt_time, now: datetime | None = None) -> float:
+    target = datetime.combine(today, target_time)
+    current = now or datetime.now()
+    return max(0.0, (target - current).total_seconds())
+
+
+def _collector_retry_allowed(today: date, now: datetime | None = None) -> bool:
+    return _seconds_until(today, _COLLECTOR_RETRY_CUTOFF, now=now) > 0.0
+
+
+def _collector_retry_delay(today: date, now: datetime | None = None) -> float:
+    remaining = _seconds_until(today, _COLLECTOR_RETRY_CUTOFF, now=now)
+    if remaining <= 0.0:
+        return 0.0
+    return min(_COLLECTOR_RETRY_SECONDS, remaining)
+
+
+async def _collector_supervisor(
+    profile: dict,
+    today: date,
+    live_root: Path,
+    depth_cache: DepthCache,
+    access_token: str,
+    client_id: str,
+    reconcile_symbols: list[str] | None = None,
+) -> None:
+    """Keep the depth collector trying until the pre-entry readiness cutoff."""
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            await collect_order_book(
+                profile=profile,
+                session_date=today,
+                depth_cache=depth_cache,
+                access_token=access_token,
+                client_id=client_id,
+                live_root=live_root,
+                reconcile_symbols=reconcile_symbols,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not _collector_retry_allowed(today):
+                _log.exception(
+                    "orchestrator: collector failed after retry cutoff; leaving engine gates to fail safe: %r",
+                    exc,
+                )
+                return
+            delay = _collector_retry_delay(today)
+            _log.exception(
+                "orchestrator: collector attempt %d failed before entry; retrying in %.0fs: %r",
+                attempt,
+                delay,
+                exc,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        if not _collector_retry_allowed(today):
+            _log.warning("orchestrator: collector exited after retry cutoff; not restarting it")
+            return
+        delay = _collector_retry_delay(today)
+        _log.warning(
+            "orchestrator: collector exited before entry cutoff; retrying in %.0fs",
+            delay,
+        )
+        await asyncio.sleep(delay)
 
 
 def _start_post_report_hard_exit_timer(enabled: bool, exit_code: int = 0) -> threading.Timer | None:
@@ -200,53 +322,86 @@ async def _reconcile_collector(
     depth_cache: DepthCache,
     access_token: str,
     client_id: str,
+    collector_task: asyncio.Task | None = None,
 ) -> None:
-    """At 09:17, check if collector missed symbols that engine loaded; retry them."""
-    from datetime import time as _time, datetime as _datetime
-    from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
+    """Before entry, replace the collector if engine chains expose missed symbols."""
+    initial_wait = _seconds_until(today, _COLLECTOR_RECONCILE_START)
+    if initial_wait > 0.0:
+        await asyncio.sleep(initial_wait)
 
-    reconcile_at = _time(9, 17)
-    now = _datetime.now()
-    target = _datetime.combine(today, reconcile_at)
-    if now < target:
-        await asyncio.sleep((target - now).total_seconds())
+    current_collector = collector_task
+    while _collector_retry_allowed(today):
+        target_symbols = _collector_reconciliation_symbols(profile, live_root, today)
+        if not target_symbols:
+            delay = min(_COLLECTOR_RECONCILE_INTERVAL_SECONDS, _collector_retry_delay(today))
+            if delay <= 0.0:
+                break
+            await asyncio.sleep(delay)
+            continue
 
-    state_path = resolve_durable_dir(live_root) / "latest_depth_collector_state.json"
-    if not state_path.exists():
-        return
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except Exception:
-        return
-    failed = set(state.get("failed_symbols", []))
-    if not failed:
-        return
+        _log.info("orchestrator: reconciling collector symbols by replacement: %s", target_symbols)
+        if current_collector is not None and not current_collector.done():
+            _log.warning("orchestrator: stopping current collector before reconciliation replacement")
+            current_collector.cancel()
+            await asyncio.gather(current_collector, return_exceptions=True)
 
-    imap_path = resolve_snapshot_dir(live_root) / "latest_instrument_map.json"
-    if not imap_path.exists():
-        return
-    try:
-        imap = json.loads(imap_path.read_text(encoding="utf-8"))
-    except Exception:
-        return
-
-    loaded_symbols = set()
-    for sid, info in imap.get("instruments", {}).items():
-        loaded_symbols.add(info.get("symbol"))
-    missing = [s for s in failed if s in loaded_symbols]
-    if missing:
-        _log.info("orchestrator: reconciling missing collector symbols: %s", missing)
-        await collect_order_book(
+        await _collector_supervisor(
             profile=profile,
-            session_date=today,
+            today=today,
+            live_root=live_root,
             depth_cache=depth_cache,
             access_token=access_token,
             client_id=client_id,
-            live_root=live_root,
-            reconcile_symbols=missing,
+            reconcile_symbols=target_symbols,
         )
-    else:
-        _log.info("orchestrator: no reconciliation needed (engine did not load failed symbols)")
+        return
+
+    _log.info("orchestrator: no collector reconciliation needed before cutoff")
+
+
+def _collector_reconciliation_symbols(
+    profile: dict,
+    live_root: Path,
+    today: date,
+    state: dict | None = None,
+) -> list[str]:
+    """Return the full depth-owned symbol set to recover after collector misses.
+
+    If any depth-owned symbol failed in the collector but later appears in the
+    engine instrument map, replace the collector with the full loaded depth
+    universe. Replacing avoids two collectors writing the same snapshots and
+    keeps already-loaded symbols such as NIFTY subscribed after recovery.
+    """
+    from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
+
+    if state is None:
+        state_path = resolve_durable_dir(live_root) / "latest_depth_collector_state.json"
+        if not state_path.exists():
+            return []
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    failed = set(state.get("failed_symbols", []))
+    if not failed:
+        return []
+
+    imap_path = resolve_snapshot_dir(live_root) / "latest_instrument_map.json"
+    if not imap_path.exists():
+        return []
+    try:
+        imap = json.loads(imap_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    loaded_symbols = set()
+    for info in imap.get("instruments", {}).values():
+        loaded_symbols.add(info.get("symbol"))
+    if not (failed & loaded_symbols):
+        return []
+
+    depth_symbols, _offset_range, _max_connections = _depth_collection_settings(profile)
+    return [symbol for symbol in depth_symbols if symbol in loaded_symbols]
 
 
 async def _run_live(
@@ -274,18 +429,18 @@ async def _run_live(
         engine.resume_from_checkpoint(checkpoint, restart_reason=_load_restart_reason(live_root, today))
 
     collector_task = asyncio.create_task(
-        collect_order_book(
+        _collector_supervisor(
             profile=profile,
-            session_date=today,
+            today=today,
+            live_root=live_root,
             depth_cache=depth_cache,
             access_token=access_token,
             client_id=client_id,
-            live_root=live_root,
         )
     )
     engine_task = asyncio.create_task(engine.run())
     reconcile_task = asyncio.create_task(
-        _reconcile_collector(profile, today, live_root, depth_cache, access_token, client_id)
+        _reconcile_collector(profile, today, live_root, depth_cache, access_token, client_id, collector_task)
     )
     all_tasks = [collector_task, engine_task, reconcile_task]
 
@@ -325,12 +480,15 @@ async def _run_live(
                 _log.info("orchestrator: ancillary tasks stopped; live run complete")
                 return
             if collector_task in done:
-                exc = collector_task.exception()
-                if exc is not None:
-                    _log.error("orchestrator: collector failed with exception: %r", exc)
-                    # Do NOT cancel engine — collector failure is no longer fatal
+                if collector_task.cancelled():
+                    _log.info("orchestrator: collector cancelled for reconciliation replacement")
                 else:
-                    _log.info("orchestrator: collector exited cleanly — engine continues")
+                    exc = collector_task.exception()
+                    if exc is not None:
+                        _log.error("orchestrator: collector failed with exception: %r", exc)
+                        # Do NOT cancel engine — collector failure is no longer fatal
+                    else:
+                        _log.info("orchestrator: collector exited cleanly — engine continues")
                 all_tasks.remove(collector_task)
                 continue
             if reconcile_task in done:
@@ -351,6 +509,24 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="30-second dry run, no websockets")
     parser.add_argument("--hard-exit", action="store_true", help="Force interpreter exit after live cleanup for systemd one-shot runs")
     args = parser.parse_args()
+
+    profile = _load_profile(args.profile)
+    today = date.today()
+    live_root = _resolve_live_root()
+
+    if not args.dry_run:
+        decision = market_session_decision(live_root, today, refresh=True, fail_closed=True)
+        if not decision.is_trading_day:
+            _write_market_closed_artifacts(live_root, today, decision)
+            _log.info(
+                "orchestrator: %s is not a live trading day (%s/%s %s: %s) - exiting",
+                today,
+                decision.exchange,
+                decision.segment,
+                decision.source,
+                decision.description or decision.reason,
+            )
+            sys.exit(0)
 
     access_token = os.environ.get("DHAN_ACCESS_TOKEN", "")
     client_id = os.environ.get("DHAN_CLIENT_ID", "")

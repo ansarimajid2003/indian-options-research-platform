@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import struct
+import threading
 import time as _time
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -75,12 +76,15 @@ _DEPTH_MAX_AGE = 5
 _MAX_ENTRY_QUOTE_AGE_MS = _OPTION_MAX_AGE * 1000
 _MAX_ENTRY_SPREAD_PCT = 20.0
 _MIN_ENTRY_CREDIT = 0.0
+_ATOMIC_WRITE_LOCKS: dict[Path, threading.Lock] = {}
+_ATOMIC_WRITE_LOCKS_GUARD = threading.Lock()
 
 # Timing constants (IST)
 _T_CONNECT = time(9, 0)
 _T_CHECK_FEED = time(9, 10)
 _T_CHAIN_FETCH = time(9, 15)
 _T_RESOLVE_CHECK = time(9, 17)
+_T_PRE_ENTRY_GATE = time(9, 18, 30)
 _T_ENTRY = time(9, 20)
 _T_EXIT = time(15, 20)
 _T_STALE_DEADLINE = time(15, 25)
@@ -108,13 +112,30 @@ def _ts_str() -> str:
 
 
 def _write_atomic(path: Path, data: dict, sync: bool = True) -> None:
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        f.write(json.dumps(data, indent=2, default=str))
-        f.flush()
-        if sync:
-            os.fsync(f.fileno())
-    tmp.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{_time.time_ns()}.tmp"
+    )
+    target = path.resolve()
+    with _ATOMIC_WRITE_LOCKS_GUARD:
+        lock = _ATOMIC_WRITE_LOCKS.setdefault(target, threading.Lock())
+    with lock:
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                f.write(json.dumps(data, indent=2, default=str))
+                f.flush()
+                if sync:
+                    os.fsync(f.fileno())
+            for attempt in range(5):
+                try:
+                    tmp.replace(path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    _time.sleep(0.01 * (attempt + 1))
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def _vix_bucket(vix_val: float) -> str:
@@ -446,6 +467,12 @@ class PaperTradingEngine:
         # 09:17 — resolve check (log any leg that can't be resolved)
         await _sleep_until(_T_RESOLVE_CHECK, self._session_date)
         await self._resolve_check()
+
+        await _sleep_until(_T_PRE_ENTRY_GATE, self._session_date)
+        try:
+            await asyncio.to_thread(self._write_pre_entry_gate)
+        except Exception as exc:
+            _log.exception("pre_entry_gate: failed: %r", exc)
 
         # 09:20 — entry
         await _sleep_until(_T_ENTRY, self._session_date)
@@ -883,6 +910,150 @@ class PaperTradingEngine:
             return True
         self._log_signal("skip", "ALL", status.reason)
         return False
+
+    def _write_pre_entry_gate(self) -> None:
+        now_ts = pd.Timestamp.now(tz="Asia/Kolkata")
+        strat_cfg = self._profile.get("strategy", {})
+        leg_specs = [
+            (strat_cfg.get("short_call_offset", 2), OptionType.CALL, "short_call", Side.SELL),
+            (strat_cfg.get("long_call_offset", 8), OptionType.CALL, "long_call", Side.BUY),
+            (strat_cfg.get("short_put_offset", -2), OptionType.PUT, "short_put", Side.SELL),
+            (strat_cfg.get("long_put_offset", -8), OptionType.PUT, "long_put", Side.BUY),
+        ]
+        symbols: list[dict] = []
+        blocked_symbols: list[str] = []
+
+        for symbol, resolver in self._resolvers.items():
+            sym_cfg = self._profile.get("symbols", {}).get(symbol, {})
+            rec: dict[str, Any] = {
+                "symbol": symbol,
+                "depth_source": sym_cfg.get("depth_source", "dhan_20depth"),
+                "status": "unknown",
+                "legs": [],
+            }
+            expiry_type = sym_cfg.get("expiry_type", "week")
+            try:
+                expiry = expiry_on_or_after(symbol, self._session_date, expiry_type=expiry_type)
+                dte = (expiry - self._session_date).days
+                rec["expiry"] = expiry.isoformat()
+                rec["dte"] = dte
+            except Exception as exc:
+                rec["status"] = "expiry_resolution_failed"
+                rec["error"] = str(exc)
+                blocked_symbols.append(symbol)
+                symbols.append(rec)
+                self._log_signal("gate", symbol, "pre_entry_expiry_resolution_failed")
+                continue
+
+            min_dte = int(sym_cfg.get("min_dte", 1))
+            max_dte = sym_cfg.get("max_dte")
+            if dte < min_dte:
+                rec["status"] = "skipped_by_dte"
+                rec["reason"] = "dte_below_min"
+                symbols.append(rec)
+                continue
+            if max_dte is not None and dte > int(max_dte):
+                rec["status"] = "skipped_by_dte"
+                rec["reason"] = "dte_above_max"
+                symbols.append(rec)
+                continue
+
+            chain_rec = self._chain_status.get(symbol, {})
+            if chain_rec.get("status") != "loaded":
+                rec["status"] = "chain_not_loaded"
+                rec["reason"] = chain_rec.get("error") or chain_rec.get("reason") or "missing_chain_status"
+                blocked_symbols.append(symbol)
+                symbols.append(rec)
+                self._log_signal("gate", symbol, "pre_entry_chain_not_loaded")
+                continue
+
+            if rec["depth_source"] != "dhan_20depth":
+                rec["status"] = "top_of_book_deferred"
+                symbols.append(rec)
+                continue
+
+            lots = int(sym_cfg.get("lots", 1))
+            quantity = lots * lot_size(symbol, self._session_date)
+            global_cfg = self._profile.get("global", {})
+            max_entry_spread_pct = float(sym_cfg.get(
+                "max_entry_spread_pct",
+                global_cfg.get("max_entry_spread_pct", _MAX_ENTRY_SPREAD_PCT),
+            ))
+            rec["quantity"] = quantity
+            rec["max_entry_spread_pct"] = max_entry_spread_pct
+            ready_legs = 0
+            total_legs = 0
+            for offset, ot, role, side in leg_specs:
+                leg: dict[str, Any] = {"role": role, "offset": offset, "side": side.value}
+                total_legs += 1
+                try:
+                    contract = resolver.resolve_atm_offset(now_ts, offset, ot)
+                    sid = resolver.security_id_for(contract)
+                    if sid is None:
+                        raise KeyError(f"no security_id for {contract}")
+                    leg["security_id"] = sid
+                    leg["ticker"] = contract.ticker
+                    leg["strike"] = contract.strike
+                    snap = self._depth_cache.snapshot(sid)
+                    if snap is None:
+                        leg["ready"] = False
+                        leg["reason"] = "missing_bid_or_ask"
+                    else:
+                        bid_age_ms = int((now_ts - snap.bid_ts).total_seconds() * 1000)
+                        ask_age_ms = int((now_ts - snap.ask_ts).total_seconds() * 1000)
+                        fresh = self._depth_cache.is_ready(sid, max_age_seconds=_DEPTH_MAX_AGE)
+                        spread_pct = round(snap.spread_pct * 100, 2)
+                        spread_ok = spread_pct <= max_entry_spread_pct
+                        executable_price = self._depth_cache.executable_price(sid, side, quantity)
+                        depth_ok = executable_price is not None
+                        ready = fresh and spread_ok and depth_ok
+                        leg.update({
+                            "ready": ready,
+                            "bid": snap.best_bid,
+                            "ask": snap.best_ask,
+                            "bid_age_ms": bid_age_ms,
+                            "ask_age_ms": ask_age_ms,
+                            "spread_pct": spread_pct,
+                            "executable_price": round(executable_price, 2) if executable_price is not None else None,
+                        })
+                        if ready:
+                            ready_legs += 1
+                        elif not fresh:
+                            leg["reason"] = "stale_depth"
+                        elif not spread_ok:
+                            leg["reason"] = "wide_spread"
+                        elif not depth_ok:
+                            leg["reason"] = "insufficient_quantity"
+                except (StaleQuoteError, KeyError) as exc:
+                    leg["ready"] = False
+                    leg["reason"] = "leg_resolution_failed"
+                    leg["error"] = str(exc)
+                rec["legs"].append(leg)
+
+            rec["ready_legs"] = ready_legs
+            rec["total_legs"] = total_legs
+            if ready_legs == total_legs:
+                rec["status"] = "ready"
+            else:
+                rec["status"] = "blocked_depth_not_ready"
+                blocked_symbols.append(symbol)
+                self._log_signal(
+                    "gate",
+                    symbol,
+                    "pre_entry_depth_not_ready",
+                    ready_legs=ready_legs,
+                    total_legs=total_legs,
+                )
+            symbols.append(rec)
+
+        payload = {
+            "session_date": self._session_date.isoformat(),
+            "written_at": _ts_str(),
+            "status": "blocked" if blocked_symbols else "pass",
+            "blocked_symbols": blocked_symbols,
+            "symbols": symbols,
+        }
+        _write_atomic(self._snapshot_dir / "latest_pre_entry_gate.json", payload, sync=False)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Entry

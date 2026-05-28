@@ -40,13 +40,14 @@ _repo_root = Path(__file__).parents[2]
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-from options_backtest.calendar import is_trading_day as _is_trading_day
+from options_backtest.calendar import expiry_on_or_after, is_trading_day as _static_is_trading_day
 from options_backtest.clock_sync import (
     clock_sync_status as _clock_sync_status,
     parse_timesync_offset as _parse_timesync_offset,
     remediate_clock_sync as _remediate_clock_sync,
 )
 from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
+from scripts.live.market_calendar import market_session_decision
 from scripts.live.renew_token import renew_token as _do_renew_token, write_token_file as _write_token_file
 
 _DEFAULT_TOKEN_FILE = _repo_root / ".env.live"
@@ -57,6 +58,7 @@ _log = logging.getLogger(__name__)
 _CRITICAL_INTERVAL = 15.0
 _SLOW_INTERVAL = 60.0
 _JSONL_ALERT_REPEAT_INTERVAL = 600.0  # only re-write a recurring alert every 10 min
+_RESOLVED_JSONL_MIN_DURATION_SECONDS = 300.0
 _HEARTBEAT_INTERVAL_MARKET = 60.0
 # Healthchecks.io currently has this check configured with a 1-minute period.
 # Keep off-hours pings comfortably inside that window to avoid UP/DOWN flapping.
@@ -81,6 +83,12 @@ _CLOCK_BOOT_GRACE_SECONDS = 300.0
 _CLOCK_REMEDIATION_INTERVAL_SECONDS = 1800.0
 
 _ALERT_THROTTLE: dict[tuple[str, str, str], float] = {}
+_LIVE_CALENDAR_ROOT: Path | None = None
+
+
+def _set_live_calendar_root(live_root: Path) -> None:
+    global _LIVE_CALENDAR_ROOT
+    _LIVE_CALENDAR_ROOT = live_root
 
 
 def _now_ist() -> datetime:
@@ -93,6 +101,15 @@ def _today_ist() -> date:
 
 def _ist_time() -> time:
     return _now_ist().time()
+
+
+def _is_trading_day(day: date) -> bool:
+    if _LIVE_CALENDAR_ROOT is None:
+        return _static_is_trading_day(day)
+    decision = market_session_decision(_LIVE_CALENDAR_ROOT, day, refresh=False, fail_closed=False)
+    if decision.source == "weekday_fallback":
+        return _static_is_trading_day(day)
+    return decision.is_trading_day
 
 
 def _is_market_hours() -> bool:
@@ -234,6 +251,7 @@ class HealthMonitor:
     def __init__(self, profile: dict, live_root: Path) -> None:
         self._profile = profile
         self._live_root = live_root
+        _set_live_calendar_root(live_root)
         self._snapshot_dir = resolve_snapshot_dir(live_root)
         self._durable_dir = resolve_durable_dir(live_root)
         self._session_date = _today_ist()
@@ -713,6 +731,9 @@ class HealthMonitor:
             return None
         ok = True
         for symbol in expected:
+            if self._symbol_dte_excluded_today(symbol):
+                await self._clear_alert("chain_fetch", f"chain_not_loaded_{symbol.lower()}")
+                continue
             rec = chain_status.get(symbol, {})
             reason = f"chain_not_loaded_{symbol.lower()}"
             if rec.get("status") != "loaded":
@@ -1030,6 +1051,27 @@ class HealthMonitor:
         ]
         return sorted(expected)
 
+    def _symbol_dte_excluded_today(self, symbol: str) -> bool:
+        cfg = self._profile.get("symbols", {}).get(symbol, {})
+        if not isinstance(cfg, dict):
+            return False
+        try:
+            expiry = expiry_on_or_after(
+                symbol,
+                self._session_date,
+                expiry_type=cfg.get("expiry_type", "week"),
+            )
+        except Exception:
+            return False
+        dte = (expiry - self._session_date).days
+        min_dte = int(cfg.get("min_dte", 1))
+        max_dte = cfg.get("max_dte")
+        if dte < min_dte:
+            return True
+        if max_dte is not None and dte > int(max_dte):
+            return True
+        return False
+
     async def _clear_chain_alerts(self) -> None:
         for symbol in self._expected_trading_symbols():
             await self._clear_alert("chain_fetch", f"chain_not_loaded_{symbol.lower()}")
@@ -1169,7 +1211,14 @@ class HealthMonitor:
         matching = [key for key, record in self._active_alerts.items() if record["component"] == component and record["reason"] == reason]
         for key in matching:
             record = self._active_alerts.pop(key)
-            self._alert_jsonl_write_times.pop(key, None)  # reset so next occurrence logs again immediately
+            first_seen_str = record.get("first_seen")
+            alert_duration = 0.0
+            if first_seen_str:
+                first_seen_dt = _parse_ts(first_seen_str)
+                if first_seen_dt:
+                    alert_duration = (_now_ist() - first_seen_dt).total_seconds()
+            if alert_duration < _RESOLVED_JSONL_MIN_DURATION_SECONDS:
+                continue
             resolved = {
                 "ts": _now_ist().isoformat(),
                 "severity": "resolved",
@@ -1180,17 +1229,7 @@ class HealthMonitor:
             self._alerts_path.parent.mkdir(parents=True, exist_ok=True)
             with self._alerts_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(resolved) + "\n")
-            # Only send RECOVERED telegram if the alert was active long enough to have
-            # generated a real alert telegram in the first place (> 5 min). Startup
-            # bounces and transient glitches (<5 min) are silently resolved in the JSONL.
-            _MIN_ALERT_DURATION_FOR_RECOVERY = 300.0
-            first_seen_str = record.get("first_seen")
-            alert_duration = 0.0
-            if first_seen_str:
-                first_seen_dt = _parse_ts(first_seen_str)
-                if first_seen_dt:
-                    alert_duration = (_now_ist() - first_seen_dt).total_seconds()
-            if alert_duration >= _MIN_ALERT_DURATION_FOR_RECOVERY:
+            if alert_duration >= _RESOLVED_JSONL_MIN_DURATION_SECONDS:
                 await self._send_telegram(f"[RECOVERED] {component}/{reason}: {record['message']}", severity="info")
 
     async def _send_telegram(self, text: str, severity: str = "info") -> None:

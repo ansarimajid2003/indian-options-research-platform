@@ -81,6 +81,8 @@ _PING_INTERVAL = 10         # seconds between server pings
 _WRITER_QUEUE_MAX_ITEMS = 100_000
 _WRITER_STOP_TIMEOUT = 10.0
 _WRITER_DROP_LOG_INTERVAL = 30.0
+_ATOMIC_WRITE_LOCKS: dict[Path, threading.Lock] = {}
+_ATOMIC_WRITE_LOCKS_GUARD = threading.Lock()
 
 # NSE options universe for 20-depth; concrete width comes from live config.
 _MAJOR_NSE_INDEX_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
@@ -427,11 +429,27 @@ def _write_gap_sentinel(live_root: Path, date_str: str, symbol: str, gap_start: 
 
 def _write_atomic_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        f.write(json.dumps(data, indent=2, default=str))
-        f.flush()
-    tmp.replace(path)
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{_time.time_ns()}.tmp"
+    )
+    target = path.resolve()
+    with _ATOMIC_WRITE_LOCKS_GUARD:
+        lock = _ATOMIC_WRITE_LOCKS.setdefault(target, threading.Lock())
+    with lock:
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                f.write(json.dumps(data, indent=2, default=str))
+                f.flush()
+            for attempt in range(5):
+                try:
+                    tmp.replace(path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    _time.sleep(0.01 * (attempt + 1))
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def _write_depth_cache_snapshot(
@@ -865,9 +883,20 @@ async def collect_order_book(
 
     if not all_sids:
         print("[collect_order_book] WARNING: no depth instruments discovered — collector has nothing to subscribe")
-        _write_collector_state(live_root, date_str, "running", all_sids, configured_symbols, failed_symbols)
-        # Keep running so the snapshot loop writes empty depth state; engine may still trade SENSEX
-        depth_connections = 0
+        if _write_restart_gap_if_needed(live_root, date_str):
+            print("[collect_order_book] restart gap sentinel written")
+        _write_depth_cache_snapshot(live_root, date_str, depth_cache, all_sids, all_meta)
+        _write_collector_state(
+            live_root,
+            date_str,
+            "degraded_no_instruments",
+            all_sids,
+            configured_symbols,
+            failed_symbols,
+        )
+        # Return instead of running an empty snapshot loop. Reconciliation owns
+        # the later recovery collector and must not race another writer.
+        return
     else:
         depth_connections = (len(all_sids) + _MAX_PER_CONN - 1) // _MAX_PER_CONN
         if depth_connections > max_depth_connections:
@@ -884,18 +913,6 @@ async def collect_order_book(
     if _write_restart_gap_if_needed(live_root, date_str):
         print("[collect_order_book] restart gap sentinel written")
     _write_collector_state(live_root, date_str, "running", all_sids, configured_symbols, failed_symbols)
-    if not all_sids:
-        # Nothing to collect — just run the snapshot loop so depth state stays fresh
-        await _depth_snapshot_loop(
-            live_root,
-            date_str,
-            depth_cache,
-            all_sids,
-            all_meta,
-            configured_symbols=configured_symbols,
-            failed_symbols=failed_symbols,
-        )
-        return
 
     collector = DepthCollector(
         symbol="NSE_MAJOR_INDICES",
