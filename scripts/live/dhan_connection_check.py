@@ -21,12 +21,21 @@ import json
 import os
 import sys
 import time as _time
+from pathlib import Path
 
-import requests
 import websockets
 
-_EXPIRY_LIST_URL = "https://api.dhan.co/v2/optionchain/expirylist"
-_OPTION_CHAIN_URL = "https://api.dhan.co/v2/optionchain"
+# Make the project importable when run as a standalone script.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from options_backtest.dhan_client import (  # noqa: E402  (sys.path bootstrap)
+    DhanCredentials,
+    DhanHTTPClient,
+    DhanRESTError,
+)
+
 _LIVE_FEED_URL_TMPL = (
     "wss://api-feed.dhan.co"
     "?version=2&token={token}&clientId={client_id}&authType=2"
@@ -68,59 +77,29 @@ def check_token(token: str, client_id: str) -> bool:
         return False
 
 
-def check_rest(token: str, client_id: str) -> bool:
+def check_rest(client: DhanHTTPClient) -> bool:
     try:
-        resp = requests.post(
-            _EXPIRY_LIST_URL,
-            json={"UnderlyingScrip": _NIFTY_SCRIP, "UnderlyingSeg": _NIFTY_SEGMENT},
-            headers={"access-token": token, "client-id": client_id},
-            timeout=10,
-        )
-        body = resp.json()
-        # v2 API returns {"data": [...]} directly; no top-level status field
-        expiries = body.get("data", [])
-        if resp.status_code == 200 and isinstance(expiries, list) and expiries:
-            first = expiries[0]
-            print(
-                f"PASS  rest_optchain : {len(expiries)} expiries  first={first}"
-            )
+        expiries = client.fetch_expiry_list(_NIFTY_SCRIP, _NIFTY_SEGMENT)
+        if expiries:
+            print(f"PASS  rest_optchain : {len(expiries)} expiries  first={expiries[0]}")
             return True
-        print(f"FAIL  rest_optchain : http={resp.status_code}  body={str(body)[:120]!r}")
+        print("FAIL  rest_optchain : empty expirylist")
+        return False
+    except DhanRESTError as exc:
+        print(f"FAIL  rest_optchain : http={exc.status_code}  body={str(exc.body)[:120]!r}")
         return False
     except Exception as exc:
         print(f"FAIL  rest_optchain : {exc}")
         return False
 
 
-def _find_nifty_option_security_id(token: str, client_id: str) -> str:
-    headers = {
-        "access-token": token,
-        "client-id": client_id,
-        "Content-Type": "application/json",
-    }
-    exp_resp = requests.post(
-        _EXPIRY_LIST_URL,
-        json={"UnderlyingScrip": _NIFTY_SCRIP, "UnderlyingSeg": _NIFTY_SEGMENT},
-        headers=headers,
-        timeout=10,
-    )
-    exp_resp.raise_for_status()
-    expiries = exp_resp.json().get("data", [])
+def _find_nifty_option_security_id(client: DhanHTTPClient) -> str:
+    expiries = client.fetch_expiry_list(_NIFTY_SCRIP, _NIFTY_SEGMENT)
     if not expiries:
         raise RuntimeError("no NIFTY expiries returned")
-    _time.sleep(3.1)
-    chain_resp = requests.post(
-        _OPTION_CHAIN_URL,
-        json={
-            "UnderlyingScrip": _NIFTY_SCRIP,
-            "UnderlyingSeg": _NIFTY_SEGMENT,
-            "Expiry": expiries[0],
-        },
-        headers=headers,
-        timeout=10,
-    )
-    chain_resp.raise_for_status()
-    raw = chain_resp.json().get("data", {})
+    # Rate limiter inside DhanHTTPClient handles the 3 s spacing between
+    # expirylist and option_chain automatically.
+    raw = client.fetch_option_chain(_NIFTY_SCRIP, _NIFTY_SEGMENT, expiries[0])
     if isinstance(raw, dict):
         oc = raw.get("oc", {})
         spot = float(raw.get("last_price", 0) or 0)
@@ -172,10 +151,10 @@ async def check_live_feed(token: str, client_id: str) -> bool:
         return False
 
 
-async def check_depth(token: str, client_id: str) -> bool:
+async def check_depth(client: DhanHTTPClient, token: str, client_id: str) -> bool:
     url = _DEPTH_URL_TMPL.format(token=token, client_id=client_id)
     try:
-        option_sid = await asyncio.to_thread(_find_nifty_option_security_id, token, client_id)
+        option_sid = await asyncio.to_thread(_find_nifty_option_security_id, client)
         sub = {
             "RequestCode": 23,
             "InstrumentCount": 1,
@@ -209,12 +188,16 @@ async def _run() -> int:
         print(f"FAIL  env           : {', '.join(missing)} not set")
         return 1
 
-    results = [
-        check_token(token, client_id),
-        check_rest(token, client_id),
-        await check_live_feed(token, client_id),
-        await check_depth(token, client_id),
-    ]
+    client = DhanHTTPClient(DhanCredentials(access_token=token, client_id=client_id))
+    try:
+        results = [
+            check_token(token, client_id),
+            check_rest(client),
+            await check_live_feed(token, client_id),
+            await check_depth(client, token, client_id),
+        ]
+    finally:
+        client.close()
 
     passed = sum(results)
     total = len(results)

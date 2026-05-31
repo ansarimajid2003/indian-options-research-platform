@@ -35,7 +35,12 @@ from options_backtest.calendar import is_trading_day
 from options_backtest.depth_cache import DepthCache
 from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
 from options_backtest.paper_engine import PaperTradingEngine
-from scripts.live.collect_order_book import collect_order_book, _depth_collection_settings
+from scripts.live.collect_order_book import (
+    DepthCollector,
+    _build_subscription_universe,
+    _depth_collection_settings,
+    collect_order_book,
+)
 from scripts.live.market_calendar import decision_payload, market_session_decision
 from scripts.live.paper_json_to_ledger import write_paper_reports
 from scripts.live.renew_token import check_token_expiry, renew_token, write_token_file
@@ -53,6 +58,13 @@ _COLLECTOR_RETRY_SECONDS = 30.0
 _COLLECTOR_RETRY_CUTOFF = dt_time(9, 18, 30)
 _COLLECTOR_RECONCILE_START = dt_time(9, 16, 0)
 _COLLECTOR_RECONCILE_INTERVAL_SECONDS = 15.0
+# Restart-grace: time TCP CLOSE_WAIT typically takes to release on Linux
+# (~60 s default). If a previous PID for the same session was alive within
+# this window, the current PID sleeps the remainder before opening Dhan
+# websockets. Without this, the new sockets often trip Dhan's per-client_id
+# active-socket cap (disconnect code 805 — "active websocket connections
+# exceeded") because the kernel still owns the previous sockets.
+_RESTART_GRACE_SECONDS = 60.0
 
 
 def _resolve_live_root() -> Path:
@@ -98,8 +110,55 @@ def _check_health_monitor_running(live_root: Path) -> bool:
     return health_path.exists()
 
 
+def _compute_restart_grace_seconds(live_root: Path, today: date, *, now: datetime | None = None) -> float:
+    """Return seconds to sleep before opening Dhan websockets.
+
+    Returns 0.0 unless ``latest_process_health.json`` shows a previous PID
+    for *today's* session that was alive within ``_RESTART_GRACE_SECONDS``.
+    In that case returns the time remaining until the previous write +
+    grace period — i.e. until Dhan-side connection slots are likely free.
+
+    Time source defaults to ``datetime.now()`` so the function is unit-
+    testable by injecting ``now``.
+    """
+    path = resolve_snapshot_dir(live_root) / "latest_process_health.json"
+    if not path.exists():
+        return 0.0
+    try:
+        ph = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0.0
+    if ph.get("session_date") != today.isoformat():
+        return 0.0
+    if ph.get("phase") == "complete":
+        return 0.0
+    prev_pid = ph.get("pid")
+    if prev_pid == os.getpid():
+        return 0.0
+    written_at_iso = ph.get("written_at")
+    if not written_at_iso:
+        return 0.0
+    try:
+        written_at = datetime.fromisoformat(written_at_iso)
+    except ValueError:
+        return 0.0
+    current = now or datetime.now()
+    # The previous write may carry a timezone-aware iso string.
+    if written_at.tzinfo is not None and current.tzinfo is None:
+        written_at = written_at.replace(tzinfo=None)
+    elapsed = (current - written_at).total_seconds()
+    remaining = _RESTART_GRACE_SECONDS - elapsed
+    return max(0.0, remaining)
+
+
 def _load_restart_reason(live_root: Path, today: date) -> dict | None:
-    """Return a same-day operator restart reason, if one was written before restart."""
+    """Return a same-day operator restart reason, if one was written before restart.
+
+    The file is consumed once: on success this function unlinks
+    ``restart_reason.json`` so a subsequent restart in the same session
+    does not re-read a stale reason. Previously the file persisted for
+    the rest of the session and any later restart inherited it.
+    """
     path = resolve_durable_dir(live_root) / "restart_reason.json"
     if not path.exists():
         return None
@@ -110,10 +169,22 @@ def _load_restart_reason(live_root: Path, today: date) -> dict | None:
         return None
     session_date = data.get("session_date")
     if session_date and session_date != today.isoformat():
+        # Cross-session leftover — clean it up so it doesn't poison
+        # tomorrow's startup either.
+        try:
+            path.unlink()
+        except OSError:
+            pass
         return None
     reason = str(data.get("reason") or "").strip()
     if not reason:
         return None
+    # One-shot consumption: remove the file so any subsequent restart in
+    # the same session does not reuse this reason.
+    try:
+        path.unlink()
+    except OSError as exc:
+        _log.warning("restart_reason: could not unlink after consumption - %r", exc)
     return data
 
 
@@ -203,8 +274,15 @@ async def _collector_supervisor(
     access_token: str,
     client_id: str,
     reconcile_symbols: list[str] | None = None,
+    on_collector_ready: "Callable[[DepthCollector], None] | None" = None,
 ) -> None:
-    """Keep the depth collector trying until the pre-entry readiness cutoff."""
+    """Keep the depth collector trying until the pre-entry readiness cutoff.
+
+    ``on_collector_ready`` is forwarded into ``collect_order_book`` so the
+    orchestrator can capture the running ``DepthCollector`` instance and
+    later call ``expand_universe`` instead of spawning a second collector
+    (Phase D2 — see ``docs/design/may2026_live_refactor.md``).
+    """
     attempt = 0
     while True:
         attempt += 1
@@ -217,6 +295,7 @@ async def _collector_supervisor(
                 client_id=client_id,
                 live_root=live_root,
                 reconcile_symbols=reconcile_symbols,
+                on_collector_ready=on_collector_ready,
             )
         except asyncio.CancelledError:
             raise
@@ -323,13 +402,21 @@ async def _reconcile_collector(
     access_token: str,
     client_id: str,
     collector_task: asyncio.Task | None = None,
+    collector_holder: "list[DepthCollector] | None" = None,
 ) -> None:
-    """Before entry, replace the collector if engine chains expose missed symbols."""
+    """Before entry, expand the running collector if engine chains expose missed symbols.
+
+    Previously this *replaced* the collector by cancelling the running
+    task and starting a second one. The two collectors shared parquet
+    output directories and raced on temp paths (2026-05-22 +
+    2026-05-25). Now we call ``DepthCollector.expand_universe`` on the
+    already-running instance, which triggers an in-place reconfigure of
+    its websocket connections without spawning a second writer thread.
+    """
     initial_wait = _seconds_until(today, _COLLECTOR_RECONCILE_START)
     if initial_wait > 0.0:
         await asyncio.sleep(initial_wait)
 
-    current_collector = collector_task
     while _collector_retry_allowed(today):
         target_symbols = _collector_reconciliation_symbols(profile, live_root, today)
         if not target_symbols:
@@ -339,24 +426,106 @@ async def _reconcile_collector(
             await asyncio.sleep(delay)
             continue
 
-        _log.info("orchestrator: reconciling collector symbols by replacement: %s", target_symbols)
-        if current_collector is not None and not current_collector.done():
-            _log.warning("orchestrator: stopping current collector before reconciliation replacement")
-            current_collector.cancel()
-            await asyncio.gather(current_collector, return_exceptions=True)
+        live_collector = collector_holder[0] if (collector_holder and collector_holder) else None
+        if live_collector is None:
+            # No collector running — fall back to launching one. This
+            # path runs at startup when chain discovery failed and the
+            # original ``collect_order_book`` returned with
+            # ``degraded_no_instruments`` (no DepthCollector ever
+            # constructed).
+            _log.warning(
+                "orchestrator: no running collector to expand; starting one with reconcile symbols %s",
+                target_symbols,
+            )
+            await _collector_supervisor(
+                profile=profile,
+                today=today,
+                live_root=live_root,
+                depth_cache=depth_cache,
+                access_token=access_token,
+                client_id=client_id,
+                reconcile_symbols=target_symbols,
+                on_collector_ready=(
+                    (lambda c: collector_holder.__setitem__(0, c))
+                    if collector_holder is not None
+                    else None
+                ),
+            )
+            return
 
-        await _collector_supervisor(
-            profile=profile,
-            today=today,
-            live_root=live_root,
-            depth_cache=depth_cache,
-            access_token=access_token,
-            client_id=client_id,
-            reconcile_symbols=target_symbols,
+        # Compute the additional instruments the running collector needs
+        # to subscribe and call expand_universe — no second collector.
+        added_sids, added_meta = _additional_instruments(
+            profile, target_symbols, access_token, client_id, today
+        )
+        if not added_sids:
+            _log.info("orchestrator: reconcile target_symbols have no new instruments to add")
+            return
+        added = live_collector.expand_universe(added_sids, added_meta)
+        _log.info(
+            "orchestrator: expand_universe added %d instruments (target_symbols=%s)",
+            added,
+            target_symbols,
         )
         return
 
     _log.info("orchestrator: no collector reconciliation needed before cutoff")
+
+
+def _additional_instruments(
+    profile: dict,
+    target_symbols: list[str],
+    access_token: str,
+    client_id: str,
+    today: date,
+) -> tuple[list[str], dict[str, dict]]:
+    """Resolve the new (security_id, meta) pairs for ``target_symbols``.
+
+    Mirrors the discovery path in ``collect_order_book`` but does not
+    construct a ``DepthCollector`` — the caller will hand the results to
+    the running collector via ``expand_universe``.
+    """
+    from options_backtest.live_resolver import LiveDhanContractResolver
+
+    depth_symbols, atm_offset_range, _ = _depth_collection_settings(profile)
+    universe_sids: list[str] = []
+    universe_meta: dict[str, dict] = {}
+    for symbol in target_symbols:
+        if symbol not in depth_symbols:
+            continue
+        sym_cfg = profile.get("symbols", {}).get(symbol, {})
+        scrip_id = sym_cfg.get("dhan_scrip_id")
+        segment = sym_cfg.get("dhan_segment", "IDX_I")
+        if scrip_id is None:
+            continue
+        try:
+            resolver = LiveDhanContractResolver(
+                symbol=symbol,
+                access_token=access_token,
+                client_id=client_id,
+                spot_security_id=str(scrip_id),
+                vix_security_id=str(profile.get("vix", {}).get("dhan_scrip_id", 21)),
+            )
+            expiries = resolver.fetch_expiry_list(scrip_id, segment)
+            valid_expiries = [e for e in expiries if e >= today]
+            if not valid_expiries:
+                continue
+            sids, id_to_meta = _build_subscription_universe(
+                symbol,
+                resolver,
+                valid_expiries[0],
+                scrip_id,
+                segment,
+                atm_offset_range=atm_offset_range,
+            )
+            for sid in sids:
+                if sid in universe_meta:
+                    continue
+                universe_sids.append(sid)
+                universe_meta[sid] = id_to_meta[sid]
+        except Exception as exc:
+            _log.warning("orchestrator: reconcile discovery for %s failed: %r", symbol, exc)
+    return universe_sids, universe_meta
 
 
 def _collector_reconciliation_symbols(
@@ -428,6 +597,18 @@ async def _run_live(
                   len(checkpoint.get("open_positions", [])))
         engine.resume_from_checkpoint(checkpoint, restart_reason=_load_restart_reason(live_root, today))
 
+    # collector_holder lets the reconciler reach the running
+    # DepthCollector via ``expand_universe`` (Phase D2). It's a single-
+    # element list so a closure capture mutates the orchestrator's view
+    # without a global.
+    collector_holder: list[DepthCollector] = []
+
+    def _capture_collector(c: "DepthCollector") -> None:
+        if collector_holder:
+            collector_holder[0] = c
+        else:
+            collector_holder.append(c)
+
     collector_task = asyncio.create_task(
         _collector_supervisor(
             profile=profile,
@@ -436,11 +617,16 @@ async def _run_live(
             depth_cache=depth_cache,
             access_token=access_token,
             client_id=client_id,
+            on_collector_ready=_capture_collector,
         )
     )
     engine_task = asyncio.create_task(engine.run())
     reconcile_task = asyncio.create_task(
-        _reconcile_collector(profile, today, live_root, depth_cache, access_token, client_id, collector_task)
+        _reconcile_collector(
+            profile, today, live_root, depth_cache,
+            access_token, client_id, collector_task,
+            collector_holder=collector_holder,
+        )
     )
     all_tasks = [collector_task, engine_task, reconcile_task]
 
@@ -564,6 +750,19 @@ def main() -> None:
         if not _check_health_monitor_running(live_root):
             _log.warning("orchestrator: health monitor not detected — proceeding anyway")
         access_token = _ensure_fresh_token(access_token, client_id)
+
+        # Sleep for the remainder of the restart grace window so any
+        # websocket sockets from a previous PID can drain on Dhan's side.
+        grace = _compute_restart_grace_seconds(live_root, today)
+        if grace > 0.0:
+            _log.warning(
+                "orchestrator: previous PID for today's session wrote process_health %.1fs ago; "
+                "sleeping %.1fs before opening Dhan websockets to clear active-connection cap",
+                _RESTART_GRACE_SECONDS - grace,
+                grace,
+            )
+            import time as _t
+            _t.sleep(grace)
 
     _log.info("orchestrator: profile=%s date=%s live_root=%s dry_run=%s",
               args.profile, today, live_root, args.dry_run)

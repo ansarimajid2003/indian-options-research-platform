@@ -17,6 +17,11 @@ import pandas as pd
 
 from options_backtest.depth_cache import DepthCache, DepthLevel
 from options_backtest.calendar import is_trading_day
+from options_backtest.dhan_client import (
+    DhanCredentials,
+    DhanHTTPClient,
+    reset_dhan_client,
+)
 from options_backtest.live_resolver import LiveDhanContractResolver
 from options_backtest.clock_sync import clock_sync_status
 from options_backtest.paper_engine import PaperTradingEngine
@@ -105,41 +110,46 @@ class LivePaperTests(unittest.TestCase):
         self.assertEqual(regular.source, "official_cache")
 
     def test_resolver_accepts_current_dhan_option_chain_shape(self) -> None:
-        body = {
-            "data": {
-                "last_price": 20010.0,
-                "oc": {
-                    "19950.000000": {
-                        "ce": {"security_id": 111, "greeks": {"delta": 0.6}, "implied_volatility": 10.5},
-                        "pe": {"security_id": 112, "greeks": {"delta": -0.4}, "implied_volatility": 11.5},
+        # The chain payload is now returned by the shared ``DhanHTTPClient``.
+        # We inject a stub via ``reset_dhan_client`` so the resolver uses it
+        # instead of hitting the network.
+        data_block = {
+            "last_price": 20010.0,
+            "oc": {
+                "19950.000000": {
+                    "ce": {"security_id": 111, "greeks": {"delta": 0.6}, "implied_volatility": 10.5},
+                    "pe": {"security_id": 112, "greeks": {"delta": -0.4}, "implied_volatility": 11.5},
+                },
+                "20000.000000": {
+                    "ce": {
+                        "security_id": 121,
+                        "greeks": {"delta": 0.5},
+                        "implied_volatility": 12.5,
+                        "last_price": 84.25,
+                        "oi": 123450,
+                        "volume": 987,
                     },
-                    "20000.000000": {
-                        "ce": {
-                            "security_id": 121,
-                            "greeks": {"delta": 0.5},
-                            "implied_volatility": 12.5,
-                            "last_price": 84.25,
-                            "oi": 123450,
-                            "volume": 987,
-                        },
-                        "pe": {"security_id": 122, "greeks": {"delta": -0.5}, "implied_volatility": 13.5},
-                    },
-                    "20050.000000": {
-                        "ce": {"security_id": 131},
-                        "pe": {"security_id": 132},
-                    },
+                    "pe": {"security_id": 122, "greeks": {"delta": -0.5}, "implied_volatility": 13.5},
+                },
+                "20050.000000": {
+                    "ce": {"security_id": 131},
+                    "pe": {"security_id": 132},
                 },
             },
-            "status": "success",
         }
-        resolver = LiveDhanContractResolver(
-            symbol="NIFTY",
-            access_token="token",
-            client_id="client",
-            spot_security_id="13",
-        )
-        with patch("options_backtest.live_resolver.requests.post", return_value=_Resp(body)):
+        client = DhanHTTPClient(DhanCredentials(access_token="t", client_id="c"))
+        client.fetch_option_chain = lambda *_, **__: data_block
+        reset_dhan_client(client)
+        try:
+            resolver = LiveDhanContractResolver(
+                symbol="NIFTY",
+                access_token="token",
+                client_id="client",
+                spot_security_id="13",
+            )
             sids = resolver.refresh_option_chain(date(2026, 5, 12), 13)
+        finally:
+            reset_dhan_client(None)
 
         self.assertEqual(len(sids), 6)
         self.assertEqual(resolver.chain_atm_strike(), 20000)
@@ -1513,33 +1523,38 @@ class PositionMarkTests(unittest.TestCase):
                 client_id="client",
                 live_root=live_root,
             )
-            engine._ensure_dirs()
-            engine._open_positions = [
-                _OpenPosition(
-                    symbol="NIFTY",
-                    expiry=date(2026, 5, 26),
-                    lots=1,
-                    lot_sz=75,
-                    entry_time=datetime(2026, 5, 21, 9, 20, tzinfo=ZoneInfo("Asia/Kolkata")),
-                    legs=[
-                        {"leg_role": "short_call", "side": "SELL", "security_id": "101", "quantity": 75, "entry_fill": {"quantity": 75}},
-                        {"leg_role": "long_call", "side": "BUY", "security_id": "102", "quantity": 75, "entry_fill": {"quantity": 75}},
-                        {"leg_role": "short_put", "side": "SELL", "security_id": "103", "quantity": 75, "entry_fill": {"quantity": 75}},
-                        {"leg_role": "long_put", "side": "BUY", "security_id": "104", "quantity": 75, "entry_fill": {"quantity": 75}},
-                    ],
-                    entry_credit=15000.0,
-                    entry_charges=100.0,
-                )
-            ]
+            try:
+                engine._ensure_dirs()
+                engine._open_positions = [
+                    _OpenPosition(
+                        symbol="NIFTY",
+                        expiry=date(2026, 5, 26),
+                        lots=1,
+                        lot_sz=75,
+                        entry_time=datetime(2026, 5, 21, 9, 20, tzinfo=ZoneInfo("Asia/Kolkata")),
+                        legs=[
+                            {"leg_role": "short_call", "side": "SELL", "security_id": "101", "quantity": 75, "entry_fill": {"quantity": 75}},
+                            {"leg_role": "long_call", "side": "BUY", "security_id": "102", "quantity": 75, "entry_fill": {"quantity": 75}},
+                            {"leg_role": "short_put", "side": "SELL", "security_id": "103", "quantity": 75, "entry_fill": {"quantity": 75}},
+                            {"leg_role": "long_put", "side": "BUY", "security_id": "104", "quantity": 75, "entry_fill": {"quantity": 75}},
+                        ],
+                        entry_credit=15000.0,
+                        entry_charges=100.0,
+                    )
+                ]
 
-            engine._write_equity_tick()
-            tick = json.loads((live_root / "snapshots" / "latest_equity_tick.json").read_text())
+                engine._write_equity_tick()
+                tick = json.loads((live_root / "snapshots" / "latest_equity_tick.json").read_text())
 
-            self.assertEqual(tick["total_gross_pnl"], 2550.0)
-            self.assertLess(tick["total_net_pnl"], tick["total_gross_pnl"])
-            history = live_root / "equity_ticks" / "20260521.jsonl"
-            self.assertTrue(history.exists())
-            self.assertEqual(len(history.read_text().splitlines()), 1)
+                self.assertEqual(tick["total_gross_pnl"], 2550.0)
+                self.assertLess(tick["total_net_pnl"], tick["total_gross_pnl"])
+                history = live_root / "equity_ticks" / "20260521.jsonl"
+                self.assertTrue(history.exists())
+                self.assertEqual(len(history.read_text().splitlines()), 1)
+            finally:
+                # Close before TemporaryDirectory unlinks event_log/*.sqlite
+                # (Windows refuses to remove a file held by an open handle).
+                engine.close()
 
 
 class DashboardBridgeLiveEquityTests(unittest.TestCase):

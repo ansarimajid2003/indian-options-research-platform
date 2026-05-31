@@ -44,6 +44,8 @@ _log = logging.getLogger(__name__)
 # Adjust import path when running as module vs standalone
 try:
     from options_backtest.depth_cache import DepthCache, DepthLevel
+    from options_backtest.dhan_client import DhanCredentials, get_dhan_client
+    from options_backtest.dhan_instruments import NSE_INDEX_DEPTH_SYMBOLS
     from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
     from options_backtest.live_resolver import LiveDhanContractResolver
     from options_backtest.schemas import OptionType
@@ -52,6 +54,8 @@ except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).parents[2]))
     from options_backtest.depth_cache import DepthCache, DepthLevel
+    from options_backtest.dhan_client import DhanCredentials, get_dhan_client
+    from options_backtest.dhan_instruments import NSE_INDEX_DEPTH_SYMBOLS
     from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
     from options_backtest.live_resolver import LiveDhanContractResolver
     from options_backtest.schemas import OptionType
@@ -63,16 +67,29 @@ _DEPTH_WS_URL = (
     "?token={token}&clientId={client_id}&authType=2"
 )
 _SUB_CODE = 23
+_UNSUB_CODE = 12     # RequestCode 12 — clean disconnect (per SDK marketfeed.py:186-194)
 _BID_CODE = 41
 _ASK_CODE = 51
 _DISCONNECT_CODE = 50
-_HEADER_FMT = "<hBBiI"   # msg_len(int16), feed_code(uint8), exch_seg(uint8), security_id(int32), reserved(uint32)
+_HEADER_FMT = "<hBBiI"   # msg_len(int16), feed_code(uint8), exch_seg(uint8), security_id(int32), reserved/disconnect_code(uint32)
 _LEVEL_FMT = "<dII"      # price(float64), qty(uint32), orders(uint32)
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)   # 12
 _LEVEL_SIZE = struct.calcsize(_LEVEL_FMT)     # 16
 _LEVELS = 20
 _PACKET_SIZE = _HEADER_SIZE + _LEVELS * _LEVEL_SIZE   # 332
 _MAX_PER_CONN = 50
+
+# Fatal disconnect codes — do NOT reconnect after these. Mirrors the
+# live-feed handling in options_backtest/paper_engine.py and the SDK's
+# documented codes in third_party/DhanHQ-py/src/dhanhq/fulldepth.py:358-376.
+_FATAL_DISCONNECT_CODES = {805, 806, 807, 808, 809}
+_DISCONNECT_REASONS = {
+    805: "No. of active websocket connections exceeded",
+    806: "Subscribe to Data APIs to continue",
+    807: "Access token is expired",
+    808: "Invalid client id",
+    809: "Authentication failed",
+}
 _DEFAULT_ATM_OFFSET_RANGE = 20
 _DEFAULT_MAX_DEPTH_CONNECTIONS = 5
 _FLUSH_INTERVAL = 15        # seconds
@@ -85,7 +102,9 @@ _ATOMIC_WRITE_LOCKS: dict[Path, threading.Lock] = {}
 _ATOMIC_WRITE_LOCKS_GUARD = threading.Lock()
 
 # NSE options universe for 20-depth; concrete width comes from live config.
-_MAJOR_NSE_INDEX_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
+# Single source of truth lives in options_backtest.dhan_instruments; we
+# materialise as ``list`` here because legacy code paths mutate it.
+_MAJOR_NSE_INDEX_SYMBOLS = list(NSE_INDEX_DEPTH_SYMBOLS)
 _NSE_SYMBOLS = _MAJOR_NSE_INDEX_SYMBOLS  # Backward-compatible alias for the shadowed legacy coroutine.
 
 
@@ -159,10 +178,23 @@ def _iter_packets(raw: bytes):
 
 
 def _disconnect_code(raw: bytes) -> int | None:
-    if len(raw) >= 14:
-        _msg_len, feed_code, _exch_seg, _security_id, _reserved = struct.unpack_from(_HEADER_FMT, raw, 0)
+    """Return the disconnect code from a depth-feed disconnect packet.
+
+    The SDK (``third_party/DhanHQ-py/src/dhanhq/fulldepth.py:358-376``)
+    reads the code from the 4-byte ``reserved`` field at byte offset 8
+    inside the 12-byte ``<hBBiI>`` header. Previously this implementation
+    read a trailing 2-byte int at offset 12, which is into the first
+    level's price field and yielded garbage — so 805 ("active websocket
+    connections exceeded") was being silently swallowed.
+
+    Returning the code lets callers treat 805/807/808/809 as fatal and
+    abort the reconnect loop (mirrors live-feed behaviour in
+    ``options_backtest/paper_engine.py``).
+    """
+    if len(raw) >= _HEADER_SIZE:
+        _msg_len, feed_code, _exch_seg, _security_id, reserved = struct.unpack_from(_HEADER_FMT, raw, 0)
         if feed_code == _DISCONNECT_CODE:
-            return struct.unpack_from("<h", raw, 12)[0]
+            return int(reserved)
     return None
 
 
@@ -227,6 +259,13 @@ class _WriterThread:
         self._last_drop_log = 0.0
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._loop, daemon=True)
+        # Unique suffix appended to every parquet temp file. Without
+        # this, two ``_WriterThread`` instances writing to the same
+        # ``order_book/YYYYMMDD/`` directory race on
+        # ``depth_<bucket>_<seq>.parquet.tmp`` and the loser's
+        # ``replace()`` raises FileNotFoundError. This was the exact
+        # bug observed on 2026-05-22 and 2026-05-25.
+        self._tmp_suffix = f".{os.getpid()}.{id(self)}.{_time.time_ns()}.tmp"
         self._thread.start()
 
     def enqueue_raw(self, raw: bytes) -> bool:
@@ -348,7 +387,7 @@ class _WriterThread:
             return
         df = pd.DataFrame(all_rows)
         out_path = self._norm_dir / f"depth_{minute_bucket}_{seq:04d}.parquet"
-        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        tmp_path = out_path.with_suffix(out_path.suffix + self._tmp_suffix)
         pq.write_table(pa.Table.from_pandas(df), str(tmp_path), compression="snappy")
         tmp_path.replace(out_path)
         self._write_1min(df, minute_bucket, seq)
@@ -377,7 +416,7 @@ class _WriterThread:
             return
         out_df = pd.concat(frames, ignore_index=True)
         out_path = self._dir_1min / f"depth_1min_{minute_bucket}_{seq:04d}.parquet"
-        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        tmp_path = out_path.with_suffix(out_path.suffix + self._tmp_suffix)
         pq.write_table(pa.Table.from_pandas(out_df), str(tmp_path), compression="snappy")
         tmp_path.replace(out_path)
 
@@ -608,9 +647,52 @@ class DepthCollector:
         self._stop_event = asyncio.Event()
         self._started_at: str | None = None
         self._backpressure_instruments: set[str] = set()
+        # Set to True on a fatal disconnect (805/807/808/809). Used by the
+        # reconnect loop to abort cleanly instead of looping a 5-second
+        # reconnect against an unrecoverable Dhan-side error.
+        self._fatal_disconnect: bool = False
+        self._fatal_reason: str | None = None
+        # Signalled when ``expand_universe`` adds instruments; the outer
+        # run loop notices and reconfigures connections cleanly without
+        # spawning a second collector instance (which previously raced
+        # on shared .tmp paths — see 2026-05-22 / 2026-05-25 audits).
+        self._universe_change_event = asyncio.Event()
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def fatal_disconnect(self) -> str | None:
+        """Return the human-readable fatal disconnect reason, if any."""
+        return self._fatal_reason
+
+    def expand_universe(self, security_ids: list[str], id_to_meta: dict[str, dict]) -> int:
+        """Add new instruments to the subscription set.
+
+        Triggers a clean reconfigure: ``run`` notices the
+        ``_universe_change_event``, gracefully closes its current
+        websocket connections (sending RequestCode 12 unsubscribes),
+        and reopens with the merged universe. The ``_WriterThread`` and
+        ``DepthCache`` persist across reconfigure so no parquet temp
+        path is contested.
+
+        Returns the count of newly-added instruments (0 if all already
+        subscribed). Idempotent.
+        """
+        added = 0
+        for sid in security_ids:
+            if sid in self._id_to_meta:
+                continue
+            self._security_ids.append(sid)
+            self._id_to_meta[sid] = id_to_meta.get(sid, {})
+            added += 1
+        if added:
+            _log.info(
+                "depth_collector: expand_universe scheduling reconfigure: +%d instruments (total=%d)",
+                added,
+                len(self._security_ids),
+            )
+            self._universe_change_event.set()
+        return added
 
     def writer_status(self) -> dict:
         return self._writer.status()
@@ -618,27 +700,58 @@ class DepthCollector:
     async def run(self) -> None:
         self._started_at = _now_ist().isoformat()
         url = _DEPTH_WS_URL.format(token=self._token, client_id=self._client_id)
-        # Split security_ids into batches of ≤50
-        batches = [
-            self._security_ids[i : i + _MAX_PER_CONN]
-            for i in range(0, len(self._security_ids), _MAX_PER_CONN)
-        ]
-        tasks = [
-            asyncio.create_task(self._connection_loop(url, batch, conn_idx))
-            for conn_idx, batch in enumerate(batches)
-        ]
         try:
-            await self._stop_event.wait()
+            # Outer reconfigure loop. Each iteration starts a fresh set
+            # of websocket connections for the current ``_security_ids``
+            # universe. On ``expand_universe`` the
+            # ``_universe_change_event`` fires and we cancel + rebuild.
+            while not self._stop_event.is_set() and not self._fatal_disconnect:
+                self._universe_change_event.clear()
+                batches = [
+                    self._security_ids[i : i + _MAX_PER_CONN]
+                    for i in range(0, len(self._security_ids), _MAX_PER_CONN)
+                ]
+                tasks = [
+                    asyncio.create_task(self._connection_loop(url, batch, conn_idx))
+                    for conn_idx, batch in enumerate(batches)
+                ]
+                stop_task = asyncio.create_task(self._stop_event.wait())
+                change_task = asyncio.create_task(self._universe_change_event.wait())
+                done, _pending = await asyncio.wait(
+                    {stop_task, change_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Tear down current connection set cleanly. ``cancel()``
+                # propagates ``CancelledError`` into ``_connection_loop``
+                # which exits before sending RequestCode 12; that's fine
+                # because the connection itself is closed in the websockets
+                # context-manager exit. The connection-cap concern is met
+                # by the next iteration's startup grace.
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                stop_task.cancel()
+                change_task.cancel()
+                if self._stop_event.is_set() or self._fatal_disconnect:
+                    break
+                _log.info(
+                    "depth_collector: reconfigure complete, new universe size=%d",
+                    len(self._security_ids),
+                )
         finally:
             self._stop_event.set()
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
             self._writer.stop()
 
     async def _connection_loop(self, url: str, sids: list[str], conn_idx: int) -> None:
-        """Reconnect loop for one depth websocket connection."""
-        while not self._stop_event.is_set():
+        """Reconnect loop for one depth websocket connection.
+
+        Aborts on a fatal disconnect (``_fatal_disconnect`` set by
+        ``_handle_packet`` when a 805/807/808/809 packet arrives). This
+        mirrors the live-feed handling in ``paper_engine.py`` and
+        prevents the 5-second reconnect loop from hammering Dhan after an
+        unrecoverable error.
+        """
+        while not self._stop_event.is_set() and not self._fatal_disconnect:
             disconnect_time: str | None = None
             try:
                 async with websockets.connect(
@@ -652,15 +765,50 @@ class DepthCollector:
                     async for raw in ws:
                         if isinstance(raw, bytes):
                             await self._handle_packet(raw)
-                        if self._stop_event.is_set():
+                        if self._stop_event.is_set() or self._fatal_disconnect:
                             break
+                    # Best-effort clean disconnect (RequestCode 12) on
+                    # graceful exit. Failures here are non-fatal.
+                    if not self._fatal_disconnect:
+                        try:
+                            await self._send_unsubscribe(ws, sids)
+                        except Exception:
+                            pass
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 disconnect_time = _now_ist().isoformat()
                 print(f"[depth_collector] conn={conn_idx} symbol={self.symbol} error={exc!r} — reconnecting in {_RECONNECT_DELAY}s")
+            if self._fatal_disconnect:
+                print(
+                    f"[depth_collector] conn={conn_idx} symbol={self.symbol} "
+                    f"fatal disconnect ({self._fatal_reason!r}) — aborting reconnect"
+                )
+                break
             if not self._stop_event.is_set():
                 await asyncio.sleep(_RECONNECT_DELAY)
+
+    async def _send_unsubscribe(self, ws, sids: list[str]) -> None:
+        """Send RequestCode=12 unsubscribe before closing.
+
+        Per SDK ``marketfeed.py:186-194`` and ``fulldepth.py:132-137`` the
+        client should explicitly disconnect each subscription so Dhan
+        releases the server-side connection slot. This matters across
+        process restarts: without it, the old sockets stay in CLOSE_WAIT
+        for up to ~60 s and the next process hits 805 ("active websocket
+        connections exceeded").
+        """
+        for i in range(0, len(sids), _MAX_PER_CONN):
+            batch = sids[i : i + _MAX_PER_CONN]
+            payload = {
+                "RequestCode": _UNSUB_CODE,
+                "InstrumentCount": len(batch),
+                "InstrumentList": [
+                    {"ExchangeSegment": "NSE_FNO", "SecurityId": sid}
+                    for sid in batch
+                ],
+            }
+            await ws.send(json.dumps(payload))
 
     async def _subscribe(self, ws, sids: list[str]) -> None:
         # 20-depth limit: 50 instruments per subscription batch
@@ -682,7 +830,18 @@ class DepthCollector:
         for packet in _iter_packets(raw):
             code = _disconnect_code(packet)
             if code is not None:
-                raise RuntimeError(f"Dhan depth disconnect code={code}")
+                reason = _DISCONNECT_REASONS.get(code, "unknown")
+                if code in _FATAL_DISCONNECT_CODES:
+                    self._fatal_disconnect = True
+                    self._fatal_reason = f"{code}: {reason}"
+                    _log.error(
+                        "depth_collector: fatal disconnect code=%d (%s) — aborting reconnect",
+                        code,
+                        reason,
+                    )
+                else:
+                    _log.warning("depth_collector: disconnect code=%d (%s) — will reconnect", code, reason)
+                raise RuntimeError(f"Dhan depth disconnect code={code} ({reason})")
             parsed = _parse_packet(packet)
             if parsed is None:
                 continue
@@ -798,12 +957,18 @@ async def collect_order_book(
     live_root: Path | None = None,
     dry_run: bool = False,
     reconcile_symbols: list[str] | None = None,
+    on_collector_ready: Optional[Callable[["DepthCollector"], None]] = None,
 ) -> None:
     """Collect configured major-index 20-depth data in pooled 50-instrument batches.
 
     Args:
         reconcile_symbols: If provided, subscribe depth for these symbols only
             (used by the engine's 09:17 reconciliation pass).
+        on_collector_ready: Optional callback invoked once the
+            ``DepthCollector`` instance is constructed. The orchestrator
+            captures it so the reconciler can call
+            ``collector.expand_universe(...)`` instead of spawning a
+            second collector.
     """
     if live_root is None:
         live_root = _live_root()
@@ -924,6 +1089,11 @@ async def collect_order_book(
         live_root=live_root,
         date_str=date_str,
     )
+    if on_collector_ready is not None:
+        try:
+            on_collector_ready(collector)
+        except Exception:
+            _log.exception("collect_order_book: on_collector_ready callback failed")
     _write_depth_cache_snapshot(live_root, date_str, depth_cache, all_sids, all_meta)
     tasks = [
         asyncio.create_task(collector.run()),

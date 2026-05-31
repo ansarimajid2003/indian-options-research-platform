@@ -1,0 +1,45 @@
+[Unit]
+# Phase E1 of the May-2026 refactor: collapses live-paper.service +
+# dashboard-api.service into a single uvicorn process. The FastAPI
+# app's lifespan starts a supervisor task that wakes daily at 08:45
+# IST, runs the paper engine through EOD, then sleeps until tomorrow.
+# Dashboard remains served by the same process 24x7.
+#
+# Replaces both:
+#   - live-paper.service (paper engine, timer-driven)
+#   - dashboard-api.service (FastAPI/uvicorn read-only viewer)
+#
+# Health monitor stays a separate process (health-monitor.service).
+Description=Wing-6 Live Stack (paper engine + dashboard API)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+User=root
+WorkingDirectory=/DATA/live-paper/indian-markets
+EnvironmentFile=/DATA/live-paper/indian-markets/.env.live
+Environment=LIVE_ROOT=/media/WD-Storage/indian-markets-live
+Environment=IM_SNAPSHOT_DIR=/run/im-snapshots
+Environment=RUN_ENGINE_IN_PROCESS=1
+Environment=LIVE_PROFILE=wing6_4x1_all_vix_filtered
+ExecStartPre=/bin/mkdir -p /run/im-snapshots
+ExecStartPre=/DATA/live-paper/indian-markets/.venv/bin/python scripts/live/clock_sync.py --remediate --wait --timeout 180 --max-offset 2.0
+ExecStart=/DATA/live-paper/indian-markets/.venv/bin/uvicorn \
+    scripts.live.api.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --log-level info \
+    --no-access-log
+# Soft + hard memory caps inherited from live-paper.service so a runaway
+# engine queue can't push the host into OOM. Hardware investigation
+# (May 2026) found the host already swapping ~2.4 GiB at idle.
+MemoryHigh=2500M
+MemoryMax=3500M
+OOMPolicy=stop
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

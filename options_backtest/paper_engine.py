@@ -23,12 +23,15 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import requests
 
 from .broker_sim import ChargesConfig, FillModel
 from .calendar import expiry_on_or_after, lot_size
 from .clock_sync import clock_sync_status
 from .depth_cache import DepthCache
+from .dhan_client import DhanCredentials, get_dhan_client
+from .dhan_instruments import all_idx_security_ids, all_idx_security_ids_int
+from .engine_metrics import MetricsServer
+from .live_event_log import EventLog, EventType
 from .live_paths import resolve_durable_dir, resolve_snapshot_dir
 from .live_resolver import LiveDhanContractResolver, StaleQuoteError
 from .schemas import Contract, OptionType, Side
@@ -43,9 +46,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _FEED_URL = "wss://api-feed.dhan.co?version=2&token={token}&clientId={client_id}&authType=2"
 _REQUEST_CODE_FULL = 21
 _REQUEST_CODE_TICKER = 15
+_REQUEST_CODE_UNSUB = 12   # Clean disconnect — per SDK marketfeed.py:186-194
 
-# Dhan REST LTP endpoint — fallback for IDX/VIX that may not stream via websocket
-_DHAN_LTP_URL = "https://api.dhan.co/v2/marketfeed/ltp"
+# LTP REST fallback for IDX/VIX that may not stream via websocket.
+# The actual HTTP call goes through ``self._dhan_client.fetch_ltp_batch``
+# which enforces 1 req/sec via the shared rate limiter.
 _VIX_REST_POLL_INTERVAL = 30.0
 
 # Binary packet layout (little-endian)
@@ -316,6 +321,14 @@ class PaperTradingEngine:
         self._live_root = live_root
         self._date_str = session_date.strftime("%Y%m%d")
 
+        # Shared DhanHTTPClient — single rate-limited session for every
+        # REST call originating in this process. Constructed lazily by
+        # ``get_dhan_client`` so tests can pre-install a mock via
+        # ``reset_dhan_client``.
+        self._dhan_client = get_dhan_client(
+            DhanCredentials(access_token=access_token, client_id=client_id)
+        )
+
         # Per-symbol resolvers keyed by symbol name
         self._resolvers: dict[str, LiveDhanContractResolver] = {}
 
@@ -336,6 +349,13 @@ class PaperTradingEngine:
 
         # Last parsed type-8 top-of-book per security_id (for SENSEX fallback)
         self._last_tob: dict[str, dict] = {}
+
+        # Most recent successful market-data tick across all security_ids.
+        # Used as the *crash gap start* on restart: the gap begins at the
+        # last tick we successfully processed, not at the last snapshot
+        # we wrote (which can lag by up to one snapshot interval and so
+        # under-reports the gap).
+        self._last_tick_at: pd.Timestamp | None = None
 
         # Live spot bar builder: closed bars + currently-open bar per symbol
         self._spot_bars: dict[str, list[dict]] = {sym: [] for sym in _SPOT_SID_TO_SYMBOL.values()}
@@ -361,6 +381,32 @@ class PaperTradingEngine:
         self._crash_gap_start: str | None = None
         self._crash_gap_end: str | None = None
         self._crash_gap_minutes: float | None = None
+
+        # Append-only event log — canonical state for this session.
+        # Legacy JSON / JSONL files (paper_trades/, signals.jsonl,
+        # equity_ticks/) continue to be written for the dashboard, but
+        # the sqlite log is the authoritative source. On resume we
+        # prefer the log over the JSON checkpoint when both exist.
+        #
+        # Constructed lazily on first append so unit tests that
+        # instantiate the engine without running the loop do not lock a
+        # SQLite file that the tempdir teardown cannot unlink on
+        # Windows. Call ``self._ensure_event_log()`` before any
+        # ``log_*`` call.
+        self._event_log_dir = live_root / "event_log"
+        self._event_log: EventLog | None = None
+
+        # In-process metrics endpoint — replaces the previous
+        # "filesystem-mtime-as-liveness" pattern. The health monitor and
+        # dashboard read engine state over HTTP from
+        # ``http://127.0.0.1:8001/health`` and ``/metrics``. Started
+        # inside ``run()`` so unit tests that instantiate the engine but
+        # don't run the loop do not bind a port.
+        metrics_cfg = profile.get("metrics", {}) if isinstance(profile, dict) else {}
+        self._metrics_host = str(metrics_cfg.get("host", "127.0.0.1"))
+        self._metrics_port = int(metrics_cfg.get("port", 8001))
+        self._metrics_enabled = bool(metrics_cfg.get("enabled", True))
+        self._metrics_server: MetricsServer | None = None
 
         # Initialise per-symbol resolvers
         self._build_resolvers()
@@ -408,9 +454,19 @@ class PaperTradingEngine:
         self._restart_reason = reason or None
         self._resumed_after_manual_restart = is_manual
         self._resumed_after_crash = not is_manual
-        self._crash_gap_start = checkpoint.get("written_at")
+        # Prefer ``last_tick_at`` (the actual last successful market-data
+        # event) over ``written_at`` (the last snapshot mtime, which lags
+        # by up to one snapshot interval) so the gap window includes the
+        # interval between last-tick and last-snapshot.
+        self._crash_gap_start = checkpoint.get("last_tick_at") or checkpoint.get("written_at")
         self._crash_gap_end = _ts_str()
         self._crash_gap_minutes = self._compute_gap_minutes(self._crash_gap_start, self._crash_gap_end)
+        log = self._ensure_event_log()
+        if log is not None:
+            try:
+                log.log_restart(self._restart_reason, self._crash_gap_minutes)
+            except Exception:
+                _log.exception("event_log: log_restart failed")
         _log.info(
             "RESUME MODE: loaded %d open positions from checkpoint restart_reason=%s gap_start=%s gap_end=%s gap_minutes=%s",
             len(self._open_positions),
@@ -419,6 +475,65 @@ class PaperTradingEngine:
             self._crash_gap_end,
             self._crash_gap_minutes,
         )
+
+    def _ensure_event_log(self) -> EventLog | None:
+        """Lazy-open the SQLite event log.
+
+        Returns ``None`` if construction fails (logged once); the engine
+        continues without an event log so a transient sqlite error
+        does not block trading.
+        """
+        if self._event_log is not None:
+            return self._event_log
+        try:
+            self._event_log_dir.mkdir(parents=True, exist_ok=True)
+            self._event_log = EventLog.open(
+                self._event_log_dir / f"{self._date_str}.sqlite",
+                session_date=self._session_date.isoformat(),
+            )
+        except Exception:
+            _log.exception("event_log: could not open SQLite log; continuing without it")
+            self._event_log = None
+        return self._event_log
+
+    def close(self) -> None:
+        """Release engine-owned resources (event log).
+
+        Idempotent; safe to call multiple times. Live orchestrator calls
+        this on shutdown; tests can call it from ``addCleanup`` to free
+        the SQLite file handle so tempdir teardown succeeds on Windows.
+
+        The metrics HTTP server is stopped from ``_stop_metrics_async``
+        (asyncio-aware) at session close; ``close()`` itself is
+        synchronous.
+        """
+        if self._event_log is not None:
+            try:
+                self._event_log.close()
+            except Exception:
+                _log.exception("event_log: close failed")
+            self._event_log = None
+
+    async def _stop_metrics_async(self) -> None:
+        """Tear down the metrics HTTP server. Idempotent."""
+        if self._metrics_server is not None:
+            try:
+                await self._metrics_server.stop()
+            except Exception:
+                _log.exception("metrics_server: stop failed")
+            self._metrics_server = None
+
+    def _set_phase(self, phase: str) -> None:
+        """Set the engine phase and record a phase transition in the event log."""
+        if self._phase == phase:
+            return
+        self._phase = phase
+        log = self._ensure_event_log()
+        if log is not None:
+            try:
+                log.log_phase(phase)
+            except Exception:
+                _log.exception("event_log: log_phase(%s) failed", phase)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Main run loop
@@ -430,12 +545,36 @@ class PaperTradingEngine:
 
         _log.info("paper_engine: starting session_date=%s", self._session_date)
 
-        self._phase = "waiting_preopen"
+        self._set_phase("waiting_preopen")
+        log = self._ensure_event_log()
+        if log is not None:
+            try:
+                log.log_session_open(
+                    profile_name=self._profile.get("name", ""),
+                    pid=os.getpid(),
+                )
+            except Exception:
+                _log.exception("event_log: log_session_open failed")
+        # Start the in-process metrics HTTP server. Failures here are
+        # non-fatal — the engine still runs, the health monitor falls
+        # back to filesystem-mtime checks.
+        if self._metrics_enabled:
+            try:
+                self._metrics_server = MetricsServer(
+                    engine_health_fn=self.health_snapshot,
+                    engine_metrics_fn=self.metrics_snapshot,
+                    host=self._metrics_host,
+                    port=self._metrics_port,
+                )
+                await self._metrics_server.start()
+            except Exception:
+                _log.exception("metrics_server: failed to start; continuing without HTTP metrics")
+                self._metrics_server = None
         snapshot_task = asyncio.create_task(self._snapshot_loop())
         health_task = asyncio.create_task(self._process_health_loop())
 
         await _sleep_until(_T_CONNECT, self._session_date)
-        self._phase = "connecting"
+        self._set_phase("connecting")
         feed_task = asyncio.create_task(self._feed_loop())
         vix_rest_task = asyncio.create_task(self._vix_rest_loop())
 
@@ -461,7 +600,7 @@ class PaperTradingEngine:
 
         # 09:15 — fetch option chains and subscribe
         await _sleep_until(_T_CHAIN_FETCH, self._session_date)
-        self._phase = "chain_fetch"
+        self._set_phase("chain_fetch")
         await self._fetch_chains_and_subscribe()
 
         # 09:17 — resolve check (log any leg that can't be resolved)
@@ -476,7 +615,7 @@ class PaperTradingEngine:
 
         # 09:20 — entry
         await _sleep_until(_T_ENTRY, self._session_date)
-        self._phase = "entry"
+        self._set_phase("entry")
 
         # Skip entry if we resumed from checkpoint, or if restarting mid-session
         # (> 5 min past entry window — fills at this time are not representative)
@@ -492,11 +631,11 @@ class PaperTradingEngine:
             await self._enter_all_symbols()
 
         # 09:21–15:19 — monitor (mark-to-market snapshots only)
-        self._phase = "monitoring"
+        self._set_phase("monitoring")
         await _sleep_until(_T_EXIT, self._session_date)
 
         # 15:20 — time exit
-        self._phase = "exit"
+        self._set_phase("exit")
         await self._exit_all_positions(reason="time_exit", forced_stale=False)
 
         # 15:25 — stale exit deadline
@@ -507,7 +646,7 @@ class PaperTradingEngine:
 
         # 15:31 — flush + EOD report
         await _sleep_until(_T_EOD, self._session_date)
-        self._phase = "eod"
+        self._set_phase("eod")
         await self._run_eod_step("eod_report", self._generate_eod_report)
         # Critical EOD artifacts first: these keep the dashboard/session audit
         # coherent even when optional archival work is disabled or slow.
@@ -522,7 +661,16 @@ class PaperTradingEngine:
             await self._run_eod_step("spot_history", self._finalize_spot_history)
         else:
             _log.info("eod_step: spot_history skipped append_live_spot_history=false")
-        self._phase = "complete"
+        self._set_phase("complete")
+        # Stop the metrics server *before* closing the event log so any
+        # final /metrics request returns a coherent payload.
+        await self._stop_metrics_async()
+        if self._event_log is not None:
+            try:
+                self._event_log.log_session_close("complete")
+            except Exception:
+                _log.exception("event_log: log_session_close failed")
+            self.close()
         self._feed_connected = False
         await self._run_eod_step("feed_state_complete", self._write_feed_state)
         await self._run_eod_step("process_health_complete", self._write_process_health)
@@ -553,12 +701,13 @@ class PaperTradingEngine:
                     self._ws = ws
                     self._feed_connected = True
                     _log.info("live_feed: connected")
-                    await self._subscribe_instruments(ws, self._core_subscriptions())
+                    core = self._core_subscriptions()
+                    await self._subscribe_instruments(ws, core)
                     await self._subscribe_idx_as_ticker(ws)
                     if self._subscribed_ids:
                         core_keys = {
                             (inst["ExchangeSegment"], str(inst["SecurityId"]))
-                            for inst in self._core_subscriptions()
+                            for inst in core
                         }
                         queued = [
                             inst for inst in self._subscribed_ids
@@ -566,11 +715,22 @@ class PaperTradingEngine:
                         ]
                         if queued:
                             await self._subscribe_instruments(ws, queued)
-                    async for raw in ws:
-                        if isinstance(raw, bytes):
-                            self._handle_feed_packet(raw)
-                        if self._stop_event.is_set():
-                            break
+                    try:
+                        async for raw in ws:
+                            if isinstance(raw, bytes):
+                                self._handle_feed_packet(raw)
+                            if self._stop_event.is_set():
+                                break
+                    finally:
+                        # Best-effort clean unsubscribe (RequestCode 12)
+                        # before the websocket context exits. Releases the
+                        # Dhan-side connection slot so the next process
+                        # doesn't trip 805 on reconnect.
+                        if not self._fatal_disconnect:
+                            try:
+                                await self._unsubscribe_all(ws)
+                            except Exception:
+                                pass
             except asyncio.CancelledError:
                 break
             except websockets.ConnectionClosed as exc:
@@ -599,6 +759,10 @@ class PaperTradingEngine:
     def _handle_feed_packet(self, raw: bytes) -> None:
         if not raw:
             return
+        # Mark the tick time. Even a malformed packet that we discard is
+        # evidence that the websocket is live, so we record it as a tick
+        # for liveness/gap-measurement purposes.
+        self._last_tick_at = pd.Timestamp.now(tz="Asia/Kolkata")
         ptype = raw[0]
 
         if ptype == _TYPE_DISCONNECT:
@@ -689,18 +853,35 @@ class PaperTradingEngine:
             }
             await ws.send(json.dumps(sub))
 
+    async def _unsubscribe_all(self, ws) -> None:
+        """Send RequestCode=12 (clean disconnect) for every subscribed instrument.
+
+        Sent before the websocket context exits so Dhan releases the
+        server-side connection slot promptly. Without this, the previous
+        socket lingers in CLOSE_WAIT for up to ~60 s and the next
+        process's reconnect can trip 805 (active websocket connections
+        exceeded).
+
+        Reference: third_party/DhanHQ-py/src/dhanhq/marketfeed.py:186-194
+        """
+        instruments = list(self._subscribed_ids) + list(self._core_subscriptions())
+        if not instruments:
+            return
+        batch_size = 100
+        for i in range(0, len(instruments), batch_size):
+            batch = instruments[i : i + batch_size]
+            payload = {
+                "RequestCode": _REQUEST_CODE_UNSUB,
+                "InstrumentCount": len(batch),
+                "InstrumentList": batch,
+            }
+            await ws.send(json.dumps(payload))
+
     def _core_subscriptions(self) -> list[dict]:
         """Spot indices + VIX; subscribe immediately on every websocket connect."""
-        spot_ids = {
-            "NIFTY": "13",
-            "FINNIFTY": "27",
-            "MIDCPNIFTY": "442",
-            "SENSEX": "51",
-            "BANKNIFTY": "25",
-        }
         instruments = [
             {"ExchangeSegment": _SEG_IDX, "SecurityId": sid}
-            for sid in spot_ids.values()
+            for sid in all_idx_security_ids(include_vix=False)
         ]
         instruments.append({"ExchangeSegment": _SEG_IDX, "SecurityId": self._vix_security_id})
         return instruments
@@ -709,7 +890,7 @@ class PaperTradingEngine:
         """Belt-and-suspenders: subscribe IDX_I as Ticker(15) alongside Full(21).
         Dhan may send Quote(4) or nothing at all for Full on IDX_I instruments —
         Ticker guarantees at least an LTP tick."""
-        idx_sids = ["13", "27", "442", "51", "25", self._vix_security_id]
+        idx_sids = all_idx_security_ids(include_vix=False) + [self._vix_security_id]
         sub = {
             "RequestCode": _REQUEST_CODE_TICKER,
             "InstrumentCount": len(idx_sids),
@@ -722,22 +903,11 @@ class PaperTradingEngine:
         _log.info("live_feed: subscribed IDX_I as Ticker(15) fallback")
 
     def _fetch_core_ltp_rest(self) -> None:
-        """Fetch core IDX LTPs via REST — fallback when websocket doesn't deliver for IDX_I/VIX."""
+        """Fetch core IDX LTPs via the shared DhanHTTPClient — fallback when
+        the websocket doesn't deliver for IDX_I/VIX."""
         try:
-            payload = {
-                "IDX_I": [13, 27, 442, 51, 25, int(self._vix_security_id)],
-                "dhanClientId": self._client_id,
-            }
-            headers = {
-                "access-token": self._access_token,
-                "client-id": self._client_id,
-                "Content-Type": "application/json",
-            }
-            resp = requests.post(_DHAN_LTP_URL, json=payload, headers=headers, timeout=8)
-            if resp.status_code != 200:
-                _log.warning("core_ltp_rest: HTTP %d", resp.status_code)
-                return
-            body = resp.json()
+            ids = all_idx_security_ids_int(include_vix=False) + [int(self._vix_security_id)]
+            body = self._dhan_client.fetch_ltp_batch({"IDX_I": ids})
             idx_data = body.get("data", body).get("IDX_I", {}) if isinstance(body, dict) else {}
             if not idx_data:
                 _log.warning("core_ltp_rest: empty IDX_I in response: %s", str(body)[:200])
@@ -1263,6 +1433,12 @@ class PaperTradingEngine:
             self._open_positions.append(pos)
             await asyncio.to_thread(self._write_checkpoint)
             self._write_signal_record("entry", symbol, vix=vix_val, dte=dte, bucket=effective_vix_bucket)
+            log = self._ensure_event_log()
+            if log is not None:
+                try:
+                    log.log_entry(pos.to_dict())
+                except Exception:
+                    _log.exception("event_log: log_entry failed")
             _log.info("entry: %s ENTERED expiry=%s dte=%d credit=%.2f legs=%d", symbol, expiry, dte, entry_credit, len(legs))
 
     def _entry_credit_is_acceptable(self, entry_credit: float, require_positive_credit: bool = True) -> bool:
@@ -1519,6 +1695,12 @@ class PaperTradingEngine:
             trade_dict = self._finalize_trade(pos)
             self._completed_trades.append(trade_dict)
             self._log_signal("exit", pos.symbol, reason=reason)
+            log = self._ensure_event_log()
+            if log is not None:
+                try:
+                    log.log_exit(trade_dict)
+                except Exception:
+                    _log.exception("event_log: log_exit failed")
             _log.info("exit: %s reason=%s net_pnl=%.2f", pos.symbol, reason, trade_dict.get("net_pnl", 0))
 
         self._open_positions = still_open
@@ -1893,6 +2075,12 @@ class PaperTradingEngine:
             history_dir.mkdir(parents=True, exist_ok=True)
             with (history_dir / f"{self._date_str}.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps(tick, default=str) + "\n")
+            log = self._ensure_event_log()
+            if log is not None:
+                try:
+                    log.log_equity_tick(tick)
+                except Exception:
+                    _log.exception("event_log: log_equity_tick failed")
 
     def _merged_quote_snapshot(self) -> dict[str, dict]:
         quotes: dict[str, dict] = {}
@@ -2060,10 +2248,31 @@ class PaperTradingEngine:
             _write_atomic(self._snapshot_dir / "latest_instrument_map.json", {"written_at": _ts_str(), "instruments": imap}, sync=False)
 
     def _write_process_health(self) -> None:
-        health = {
+        _write_atomic(self._snapshot_dir / "latest_process_health.json", self.health_snapshot(), sync=False)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # HTTP /health and /metrics payloads
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Compact health payload — single source of truth, no file mtime.
+
+        Returned by the in-process ``/health`` endpoint AND written to
+        ``latest_process_health.json`` for the legacy file-mtime path.
+        Health monitor and dashboard prefer the HTTP route; the file
+        remains a fallback for the cold-start window.
+        """
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        last_tick_age = None
+        if self._last_tick_at is not None:
+            last_tick_age = (now - self._last_tick_at).total_seconds()
+        return {
             "written_at": _ts_str(),
+            "alive": not self._stop_event.is_set(),
             "pid": os.getpid(),
             "phase": self._phase,
+            "feed_connected": self._feed_connected,
+            "fatal_disconnect": self._fatal_disconnect,
             "open_positions": len(self._open_positions),
             "session_date": self._session_date.isoformat(),
             "resumed_after_crash": self._resumed_after_crash,
@@ -2072,8 +2281,29 @@ class PaperTradingEngine:
             "crash_gap_start": self._crash_gap_start,
             "crash_gap_end": self._crash_gap_end,
             "gap_minutes": self._crash_gap_minutes,
+            "last_tick_age_seconds": last_tick_age,
+            "last_tick_at": self._last_tick_at.isoformat() if self._last_tick_at is not None else None,
         }
-        _write_atomic(self._snapshot_dir / "latest_process_health.json", health, sync=False)
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        """Richer state for the dashboard and ad-hoc debugging.
+
+        Includes everything the dashboard needs to render the live page
+        without falling back to file-mtime reads: open positions, the
+        latest equity tick, per-symbol chain status, and the completed-
+        trades list.
+        """
+        base = self.health_snapshot()
+        base["chain_status"] = dict(self._chain_status)
+        base["depth_ready_count"] = sum(
+            1 for sid in self._depth_cache.keys() if self._depth_cache.is_ready(sid, max_age_seconds=_DEPTH_MAX_AGE)
+        ) if hasattr(self._depth_cache, "keys") else None
+        base["completed_trades"] = len(self._completed_trades)
+        # Open positions — serialised dicts the dashboard can render
+        # directly. Same shape as the legacy ``latest_open_positions.json``.
+        base["positions"] = [p.to_dict() for p in self._open_positions]
+        base["trades"] = list(self._completed_trades)
+        return base
 
     def _is_quote_fresh(self, sid: str) -> bool:
         # Check depth cache first (NSE symbols), then last_tob fallback (SENSEX)
@@ -2093,6 +2323,7 @@ class PaperTradingEngine:
         checkpoint = {
             "session_date": self._session_date.isoformat(),
             "written_at": _ts_str(),
+            "last_tick_at": self._last_tick_at.isoformat() if self._last_tick_at is not None else None,
             "resumed_after_crash": self._resumed_after_crash,
             "resumed_after_manual_restart": self._resumed_after_manual_restart,
             "restart_reason": self._restart_reason,
@@ -2194,6 +2425,14 @@ class PaperTradingEngine:
         self._signals_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self._signals_path, "a") as f:
             f.write(json.dumps(record) + "\n")
+        # Mirror to the SQLite event log so a single replay can rebuild
+        # the full signal stream without parsing the legacy JSONL.
+        log = self._ensure_event_log()
+        if log is not None:
+            try:
+                log.log_signal(record)
+            except Exception:
+                _log.exception("event_log: log_signal failed")
 
     def _write_signal_record(self, event: str, symbol: str, **kwargs) -> None:
         self._log_signal(event, symbol, reason=event, **kwargs)
@@ -2203,7 +2442,7 @@ class PaperTradingEngine:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _ensure_dirs(self) -> None:
-        for subdir in ("paper_trades", "reports", "logs", "snapshots", "alerts", "equity_ticks"):
+        for subdir in ("paper_trades", "reports", "logs", "snapshots", "alerts", "equity_ticks", "event_log"):
             (self._live_root / subdir).mkdir(parents=True, exist_ok=True)
 
     def _setup_file_logging(self) -> None:

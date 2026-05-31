@@ -15,13 +15,18 @@ import argparse
 import json
 import os
 import sys
-import time as _time
 from datetime import datetime
+from pathlib import Path
 
-import requests
+# Make project importable when run as a standalone script.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-_EXPIRY_URL = "https://api.dhan.co/v2/optionchain/expirylist"
-_CHAIN_URL = "https://api.dhan.co/v2/optionchain"
+from options_backtest.dhan_client import (  # noqa: E402
+    DhanCredentials,
+    DhanHTTPClient,
+)
 
 _SYMBOLS = {
     "NIFTY":       {"scrip": 13, "seg": "IDX_I", "step": 50},
@@ -31,34 +36,14 @@ _SYMBOLS = {
 }
 
 
-def _headers(token: str, client_id: str) -> dict:
-    return {
-        "access-token": token,
-        "client-id": client_id,
-        "Content-Type": "application/json",
-    }
+def fetch_expiry_list(client: DhanHTTPClient, scrip: int, seg: str) -> list[str]:
+    """Shared-client wrapper kept for backwards compatibility with the CLI."""
+    return client.fetch_expiry_list(scrip, seg)
 
 
-def fetch_expiry_list(token: str, client_id: str, scrip: int, seg: str) -> list[str]:
-    resp = requests.post(
-        _EXPIRY_URL,
-        json={"UnderlyingScrip": scrip, "UnderlyingSeg": seg},
-        headers=_headers(token, client_id),
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json().get("data", [])
-
-
-def fetch_chain(token: str, client_id: str, scrip: int, seg: str, expiry: str) -> dict:
-    resp = requests.post(
-        _CHAIN_URL,
-        json={"UnderlyingScrip": scrip, "UnderlyingSeg": seg, "Expiry": expiry},
-        headers=_headers(token, client_id),
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()
+def fetch_chain(client: DhanHTTPClient, scrip: int, seg: str, expiry: str) -> dict:
+    """Return raw ``data`` block from /optionchain. Shape matches the v2 API."""
+    return {"data": client.fetch_option_chain(scrip, seg, expiry)}
 
 
 def _fmt_row(label: str, ltp: float, bid: float, ask: float, oi: int, iv: float) -> str:
@@ -190,14 +175,16 @@ def main() -> int:
     print(f"\nDhan option-chain snapshot — {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
     print(f"(market closed: showing last-available snapshot)")
 
+    client = DhanHTTPClient(DhanCredentials(access_token=token, client_id=client_id))
+
     raw_dumped = False
     for sym in symbols:
         cfg = _SYMBOLS[sym]
-        _time.sleep(3)  # Dhan rate limit: one unique request every 3 seconds
 
-        # Expiry list
+        # Rate limiting is enforced inside DhanHTTPClient (1 req / 3 s
+        # for expirylist, 1 req / sec for option_chain). No manual sleeps.
         try:
-            expiries = fetch_expiry_list(token, client_id, cfg["scrip"], cfg["seg"])
+            expiries = fetch_expiry_list(client, cfg["scrip"], cfg["seg"])
         except Exception as exc:
             print(f"\n{sym}: FAIL fetching expiry list — {exc}")
             continue
@@ -209,11 +196,8 @@ def main() -> int:
         nearest = expiries[0]
         print(f"\n{sym}: {len(expiries)} expiries  nearest={nearest}")
 
-        _time.sleep(3)
-
-        # Option chain
         try:
-            chain = fetch_chain(token, client_id, cfg["scrip"], cfg["seg"], nearest)
+            chain = fetch_chain(client, cfg["scrip"], cfg["seg"], nearest)
         except Exception as exc:
             print(f"  {sym}: FAIL fetching chain — {exc}")
             continue
@@ -226,6 +210,7 @@ def main() -> int:
 
         print_chain_snapshot(sym, chain, args.strikes)
 
+    client.close()
     print()
     return 0
 

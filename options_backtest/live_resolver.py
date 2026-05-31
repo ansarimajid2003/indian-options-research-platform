@@ -20,15 +20,13 @@ from datetime import date, datetime
 from typing import Optional
 
 import pandas as pd
-import requests
 
 from .calendar import get_instrument_spec
+from .dhan_client import DhanCredentials, DhanHTTPClient, get_dhan_client
 from .schemas import Contract, OptionType
 
 _log = logging.getLogger(__name__)
 _IST = "Asia/Kolkata"
-_OPTION_CHAIN_URL = "https://api.dhan.co/v2/optionchain"
-_EXPIRY_LIST_URL = "https://api.dhan.co/v2/optionchain/expirylist"
 
 # Freshness limits per the plan (seconds)
 _SPOT_MAX_AGE = 5
@@ -171,12 +169,20 @@ class LiveDhanContractResolver:
         client_id: str,
         spot_security_id: str,
         vix_security_id: str = "21",
+        *,
+        dhan_client: DhanHTTPClient | None = None,
     ) -> None:
         self.symbol = symbol
         self._access_token = access_token
         self._client_id = client_id
         self._spot_security_id = spot_security_id
         self._vix_security_id = vix_security_id
+
+        # Shared rate-limited Dhan REST client. Construct via the process
+        # singleton unless the caller passed one explicitly (test override).
+        self._dhan_client = dhan_client or get_dhan_client(
+            DhanCredentials(access_token=access_token, client_id=client_id)
+        )
 
         spec = get_instrument_spec(symbol)
         self._strike_step = spec.strike_step
@@ -249,23 +255,14 @@ class LiveDhanContractResolver:
         Fetch option chain from Dhan REST and populate the chain cache.
 
         Returns a list of security_ids that should be subscribed to the live feed.
-        Rate limited: call once per expiry, not in a tight loop.
+        Rate limited globally by ``DhanHTTPClient`` (1 req/sec for /optionchain).
         """
-        headers = {
-            "access-token": self._access_token,
-            "client-id": self._client_id,
-            "Content-Type": "application/json",
-        }
-        body = {
-            "UnderlyingScrip": scrip_id,
-            "UnderlyingSeg": segment,
-            "Expiry": expiry.strftime("%Y-%m-%d"),
-        }
-        resp = requests.post(_OPTION_CHAIN_URL, json=body, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-
-        underlying_ltp, option_rows = _normalise_option_chain_rows(data.get("data", []))
+        data = self._dhan_client.fetch_option_chain(
+            scrip_id=int(scrip_id),
+            segment=segment,
+            expiry=expiry.strftime("%Y-%m-%d"),
+        )
+        underlying_ltp, option_rows = _normalise_option_chain_rows(data)
         if not option_rows:
             raise ValueError(f"Empty option chain for {self.symbol} expiry {expiry}")
 
@@ -358,20 +355,12 @@ class LiveDhanContractResolver:
         return security_ids
 
     def fetch_expiry_list(self, scrip_id: int, segment: str = "IDX_I") -> list[date]:
-        """Return active expiry dates for the symbol from Dhan REST."""
-        headers = {
-            "access-token": self._access_token,
-            "client-id": self._client_id,
-        }
-        body = {"UnderlyingScrip": scrip_id, "UnderlyingSeg": segment}
-        resp = requests.post(_EXPIRY_LIST_URL, json=body, headers=headers, timeout=10)
-        resp.raise_for_status()
-        body = resp.json()
-        raw = body.get("data", [])
-        # v2 returns data as a flat list of "YYYY-MM-DD" strings (confirmed May 2026)
-        # Defensively also handle {"Expirylist": [...]} shape from older SDK versions
-        if isinstance(raw, dict):
-            raw = raw.get("Expirylist", [])
+        """Return active expiry dates for the symbol from Dhan REST.
+
+        Rate limited globally by ``DhanHTTPClient`` (1 req / 3 sec for
+        /optionchain/expirylist).
+        """
+        raw = self._dhan_client.fetch_expiry_list(scrip_id=int(scrip_id), segment=segment)
         expiries = []
         for e in raw:
             try:

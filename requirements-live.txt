@@ -6,3 +6,10 @@ requests>=2.31
 sentry-sdk>=2.0
 streamlit>=1.30
 plotly>=5.18
+# aiohttp drives the in-process /metrics + /health endpoint on the
+# paper engine and the HTTP probes from the health monitor.
+aiohttp>=3.9
+# FastAPI + uvicorn host the dashboard API which is collapsed into
+# the same uvicorn process that runs the paper engine (Phase E1).
+fastapi>=0.110
+uvicorn[standard]>=0.27

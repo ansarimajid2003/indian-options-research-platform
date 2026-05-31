@@ -232,12 +232,60 @@ class DashboardBridge:
     asyncio.get_event_loop().run_in_executor for async contexts.
     """
 
-    def __init__(self, live_root: Path) -> None:
+    def __init__(self, live_root: Path, engine_metrics_url: str | None = None) -> None:
         self._root = live_root
         self._snapshot_dir = resolve_snapshot_dir(live_root)
         self._durable_dir = resolve_durable_dir(live_root)
         # {cache_key: (expiry_monotonic, value)}
         self._cache: dict[str, tuple[float, Any]] = {}
+        # ── HTTP path to the engine's in-process /metrics (Phase E1) ─
+        # When set, ``_read_engine_metrics`` is preferred over file
+        # mtime reads for live state. Falls back to file reads on any
+        # error (connection refused, timeout, non-200). Configurable
+        # via env so tests and dev can disable.
+        self._engine_metrics_url = (
+            engine_metrics_url
+            or os.environ.get("ENGINE_METRICS_URL")
+            or "http://127.0.0.1:8001/metrics"
+        )
+        self._engine_metrics_enabled = bool(
+            os.environ.get("ENGINE_METRICS_ENABLED", "1").strip().lower()
+            not in ("0", "false", "no", "")
+        )
+        self._engine_metrics_cache: tuple[float, dict | None] | None = None
+        # Short TTL — the engine writes snapshots on a ~5 s cadence and
+        # we want at most one HTTP round trip per route call burst.
+        self._engine_metrics_ttl_seconds = 2.0
+        self._engine_metrics_timeout_seconds = 0.5
+
+    # ── In-process engine /metrics HTTP probe (Phase E1) ─────────────────────
+
+    def _read_engine_metrics(self) -> dict | None:
+        """Return the engine's ``/metrics`` payload, cached for ~2 s.
+
+        Returns ``None`` if the endpoint is unreachable or disabled.
+        Importing ``requests`` lazily keeps this module importable in
+        environments where ``requests`` isn't installed (the bridge is
+        also exercised by lightweight unit tests).
+        """
+        if not self._engine_metrics_enabled:
+            return None
+        now = _time.monotonic()
+        cached = self._engine_metrics_cache
+        if cached is not None and now < cached[0]:
+            return cached[1]
+        payload: dict | None = None
+        try:
+            import requests  # local import — cheap when cached
+            resp = requests.get(self._engine_metrics_url, timeout=self._engine_metrics_timeout_seconds)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    payload = data
+        except Exception:
+            payload = None
+        self._engine_metrics_cache = (now + self._engine_metrics_ttl_seconds, payload)
+        return payload
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -297,11 +345,20 @@ class DashboardBridge:
 
     def get_session_status(self) -> SessionStatus:
         def _load() -> SessionStatus:
+            # Phase E1: prefer the engine's in-process /metrics HTTP
+            # endpoint. A response means the engine's asyncio loop is
+            # alive — there is no mtime-vs-liveness ambiguity. Fall
+            # back to file reads when the endpoint is unreachable.
+            engine = self._read_engine_metrics()
             ph = self._read_json(self._snap("latest_process_health.json"))
             fs = self._read_json(self._snap("latest_feed_state.json"))
             dc = self._read_json(self._snap("latest_depth_cache.json"))
 
-            session_date_str = (ph or {}).get("session_date", date.today().isoformat())
+            session_date_str = (
+                (engine or {}).get("session_date")
+                or (ph or {}).get("session_date")
+                or date.today().isoformat()
+            )
             try:
                 today = date.fromisoformat(session_date_str)
             except ValueError:
@@ -319,18 +376,36 @@ class DashboardBridge:
                     snapshot_age_s=self._file_age_s(self._snap("latest_depth_cache.json")),
                 )
 
+            engine_phase = (
+                (engine or {}).get("phase")
+                or (ph or {}).get("phase")
+                or "offline"
+            )
+            engine_pid = (engine or {}).get("pid") if engine else (ph or {}).get("pid")
+            open_count = (
+                (engine or {}).get("open_positions")
+                if engine
+                else (ph or {}).get("open_positions", 0)
+            )
+            feed_connected = (
+                (engine or {}).get("feed_connected")
+                if engine and "feed_connected" in engine
+                else (fs or {}).get("connected", False)
+            )
+            written_at = (engine or {}).get("written_at") or (ph or {}).get("written_at")
+
             return SessionStatus(
                 session_date=session_date_str,
                 market_status=_market_status(today),
-                engine_phase=(ph or {}).get("phase", "offline"),
-                engine_pid=(ph or {}).get("pid"),
-                open_position_count=(ph or {}).get("open_positions", 0),
-                feed_connected=(fs or {}).get("connected", False),
+                engine_phase=engine_phase,
+                engine_pid=engine_pid,
+                open_position_count=open_count or 0,
+                feed_connected=bool(feed_connected),
                 feed_subscribed_count=(fs or {}).get("subscribed_count", 0),
                 quote_freshness_pct=(fs or {}).get("quote_freshness_pct", 0.0),
                 depth=depth_summary,
                 process_health_age_s=self._file_age_s(self._snap("latest_process_health.json")),
-                written_at=(ph or {}).get("written_at"),
+                written_at=written_at,
             )
 
         result = self._cached("session_status", _TTL_LIVE, _load)
@@ -354,7 +429,16 @@ class DashboardBridge:
 
     def get_open_positions(self) -> list[PositionRow]:
         def _load() -> list[PositionRow]:
-            data = self._read_json(self._snap("latest_open_positions.json"))
+            # Phase E1: prefer the engine's in-process /metrics. The
+            # ``positions`` array is the same shape as
+            # latest_open_positions.json's ``open_positions``.
+            engine = self._read_engine_metrics()
+            engine_positions = (engine or {}).get("positions") if engine else None
+            data: dict
+            if engine_positions is not None:
+                data = {"open_positions": engine_positions}
+            else:
+                data = self._read_json(self._snap("latest_open_positions.json")) or {}
             if not data:
                 return []
             # Merge with live position marks if available

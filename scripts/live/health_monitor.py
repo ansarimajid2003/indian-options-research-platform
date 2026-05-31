@@ -82,6 +82,15 @@ _PARQUET_FLUSH_MAX_AGE_SECONDS = 180.0
 _CLOCK_BOOT_GRACE_SECONDS = 300.0
 _CLOCK_REMEDIATION_INTERVAL_SECONDS = 1800.0
 
+# In-process /health endpoint exposed by the paper engine. A 200 here is
+# an *unambiguous* liveness signal — the engine's asyncio loop responded
+# to a real HTTP request. The mtime-of-latest_process_health.json check
+# remains as a fallback for the cold-start window before the server has
+# bound to its port, and for environments where the monitor and engine
+# don't share localhost (e.g. dev).
+_ENGINE_HEALTH_URL = os.environ.get("ENGINE_HEALTH_URL", "http://127.0.0.1:8001/health")
+_ENGINE_HEALTH_TIMEOUT_SECONDS = 2.0
+
 _ALERT_THROTTLE: dict[tuple[str, str, str], float] = {}
 _LIVE_CALENDAR_ROOT: Path | None = None
 
@@ -490,6 +499,23 @@ class HealthMonitor:
         except Exception as exc:
             _log.error("slow checks failed unexpectedly: %r", exc)
 
+    async def _probe_engine_http_health(self) -> bool:
+        """Return True if the engine's /health endpoint returns 200.
+
+        Network errors and non-200 responses both return False — the
+        caller treats False as "fall back to mtime check", not "engine
+        is dead". A real engine-dead signal comes from the mtime check
+        plus systemctl, which is the legacy path.
+        """
+        timeout = aiohttp.ClientTimeout(total=_ENGINE_HEALTH_TIMEOUT_SECONDS)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(_ENGINE_HEALTH_URL) as resp:
+                    return resp.status == 200
+        except Exception:
+            # Connection refused, DNS, timeout, etc. — all "not reachable".
+            return False
+
     async def _check_runner_process(self) -> bool | None:
         """
         Liveness check. Does NOT restart anything — systemd's Restart=on-failure
@@ -520,10 +546,16 @@ class HealthMonitor:
             self._service_became_active_mono = now_mono
         self._service_was_active = systemd_active
 
-        snapshot_active = False
+        # First try the in-process /health endpoint. A 200 here is the
+        # only liveness signal that is *not* derivable from filesystem
+        # mtime — the engine actually answered a network request. If the
+        # endpoint is unreachable we fall back to the mtime check, which
+        # remains valid during the boot window before the engine has
+        # bound its port.
+        snapshot_active = await self._probe_engine_http_health()
         snapshot_age: float | None = None
         health_path = self._snapshot_dir / "latest_process_health.json"
-        if health_path.exists():
+        if not snapshot_active and health_path.exists():
             try:
                 data = json.loads(health_path.read_text(encoding="utf-8"))
                 written_at = _parse_ts(data.get("written_at"))
