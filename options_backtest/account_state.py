@@ -330,6 +330,7 @@ def update_account_ledger(
 
     state = {
         "latest_row": latest,
+        "starting_capital": round(margin_model.starting_capital, 2),
         "all_time_net_pnl": round(all_time_net_pnl, 2),
         "current_balance": round(current_balance, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
