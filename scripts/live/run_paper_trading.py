@@ -31,6 +31,7 @@ _repo_root = Path(__file__).parents[2]
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
+from options_backtest.account_state import update_account_ledger
 from options_backtest.calendar import is_trading_day
 from options_backtest.depth_cache import DepthCache
 from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
@@ -54,6 +55,7 @@ _log = logging.getLogger(__name__)
 _POST_REPORT_HARD_EXIT_SECONDS = 45.0
 _ANCILLARY_SHUTDOWN_TIMEOUT_SECONDS = 20.0
 _PAPER_REPORT_TIMEOUT_SECONDS = 30.0
+_ACCOUNT_LEDGER_TIMEOUT_SECONDS = 15.0
 _COLLECTOR_RETRY_SECONDS = 30.0
 _COLLECTOR_RETRY_CUTOFF = dt_time(9, 18, 30)
 _COLLECTOR_RECONCILE_START = dt_time(9, 16, 0)
@@ -653,6 +655,22 @@ async def _run_live(
                     except asyncio.TimeoutError:
                         _log.error("orchestrator: paper report conversion timed out after %.1fs", _PAPER_REPORT_TIMEOUT_SECONDS)
                         keep_watchdog = True
+                    # Independent of report conversion: ledger reads trades_json directly,
+                    # so a report timeout must not skip the account-state update.
+                    try:
+                        latest = await asyncio.wait_for(
+                            asyncio.to_thread(update_account_ledger, live_root, today),
+                            timeout=_ACCOUNT_LEDGER_TIMEOUT_SECONDS,
+                        )
+                        _log.info(
+                            "orchestrator: account ledger updated closing_balance=%.2f net_pnl=%.2f",
+                            float(latest["closing_balance"]),
+                            float(latest["net_pnl"]),
+                        )
+                    except asyncio.TimeoutError:
+                        _log.error("orchestrator: account ledger update timed out after %.1fs", _ACCOUNT_LEDGER_TIMEOUT_SECONDS)
+                    except Exception:
+                        _log.error("orchestrator: account ledger update failed", exc_info=True)
                 try:
                     clean_shutdown = await _cancel_tasks(
                         [t for t in all_tasks if t is not engine_task],

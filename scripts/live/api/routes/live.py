@@ -16,6 +16,8 @@ from typing import Any
 from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 
 from ..models import (
+    AccountLedgerRowModel,
+    AccountStateModel,
     AlertEntryModel,
     AlertStateModel,
     ClosedTradeModel,
@@ -205,6 +207,44 @@ def get_equity_curve(
         except (ValueError, IndexError):
             session_date = _date.today()
     return [_equity_model(p) for p in _bridge(request).get_equity_curve(session_date)]
+
+
+@router.get("/account", response_model=AccountStateModel, summary="Persistent account state (balance, drawdown, margin)")
+def get_account(request: Request) -> AccountStateModel:
+    data = _bridge(request).get_account_state() or {}
+    return AccountStateModel(
+        current_balance=data.get("current_balance"),
+        starting_capital=data.get("starting_capital"),
+        all_time_net_pnl=data.get("all_time_net_pnl") or 0.0,
+        max_drawdown_pct=data.get("max_drawdown_pct") or 0.0,
+        total_sessions=data.get("total_sessions") or 0,
+        total_trades=data.get("total_trades") or 0,
+        margin_source=data.get("margin_source"),
+        latest_row=data.get("latest_row"),
+    )
+
+
+@router.get("/account-ledger", response_model=list[AccountLedgerRowModel], summary="All-time daily equity ledger")
+def get_account_ledger(request: Request) -> list[AccountLedgerRowModel]:
+    rows = _bridge(request).get_account_ledger() or []
+    out: list[AccountLedgerRowModel] = []
+    for r in rows:
+        out.append(AccountLedgerRowModel(
+            session_date=str(r.get("session_date", "")),
+            trades=r.get("trades") or 0,
+            net_pnl=r.get("net_pnl") or 0.0,
+            gross_pnl=r.get("gross_pnl") or 0.0,
+            charges=r.get("charges") or 0.0,
+            opening_balance=r.get("opening_balance") or 0.0,
+            closing_balance=r.get("closing_balance") or 0.0,
+            peak_balance=r.get("peak_balance") or 0.0,
+            drawdown_pct=r.get("drawdown_pct") or 0.0,
+            peak_margin_used=r.get("peak_margin_used") or 0.0,
+            peak_buying_power_pct=r.get("peak_buying_power_pct") or 0.0,
+            margin_breach=bool(r.get("margin_breach", False)),
+            per_symbol=r.get("per_symbol"),
+        ))
+    return out
 
 
 @router.get("/closed-positions", response_model=list[ClosedTradeModel], summary="Today's closed paper trades")

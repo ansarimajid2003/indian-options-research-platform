@@ -87,6 +87,35 @@ class EquityPointModel(BaseModel):
     cumulative_net_pnl: float
 
 
+# ── Account state ───────────────────────────────────────────────────────────
+
+class AccountStateModel(BaseModel):
+    current_balance: float | None
+    starting_capital: float | None
+    all_time_net_pnl: float
+    max_drawdown_pct: float
+    total_sessions: int
+    total_trades: int
+    margin_source: str | None = None
+    latest_row: dict | None = None
+
+
+class AccountLedgerRowModel(BaseModel):
+    session_date: str
+    trades: int
+    net_pnl: float
+    gross_pnl: float
+    charges: float
+    opening_balance: float
+    closing_balance: float
+    peak_balance: float
+    drawdown_pct: float
+    peak_margin_used: float
+    peak_buying_power_pct: float
+    margin_breach: bool
+    per_symbol: dict | None = None
+
+
 # ── Signal log ────────────────────────────────────────────────────────────────
 
 class SignalLogModel(BaseModel):

@@ -73,6 +73,7 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{100,}")
 _TTL_LIVE = 3.0
 _TTL_TRADES = 5.0
 _TTL_HIST = 60.0
+_TTL_ACCOUNT = 30.0
 _TTL_BACKTESTS = 120.0
 _BACKTEST_INDEX_VERSION = 3
 
@@ -539,6 +540,52 @@ class DashboardBridge:
             return sorted(points_by_ts.values(), key=lambda p: p.ts)
 
         result = self._cached(f"equity_{date_str}", _TTL_LIVE, _load)
+        return result if result is not None else []
+
+    # ── Account state (persistent equity / margin ledger) ────────────────────
+
+    def get_account_state(self) -> dict:
+        def _load() -> dict:
+            # Lives under live_root/account/, not a snapshot dir.
+            data = self._read_json(self._root / "account" / "latest_account_state.json")
+            if not data:
+                return {
+                    "current_balance": None,
+                    "starting_capital": None,
+                    "all_time_net_pnl": 0.0,
+                    "max_drawdown_pct": 0.0,
+                    "total_sessions": 0,
+                    "total_trades": 0,
+                    "latest_row": None,
+                }
+            return data
+
+        result = self._cached("account_state", _TTL_ACCOUNT, _load)
+        return result if result is not None else {
+            "current_balance": None,
+            "starting_capital": None,
+            "all_time_net_pnl": 0.0,
+            "max_drawdown_pct": 0.0,
+            "total_sessions": 0,
+            "total_trades": 0,
+            "latest_row": None,
+        }
+
+    def get_account_ledger(self) -> list[dict]:
+        def _load() -> list[dict]:
+            path = self._root / "account" / "account_ledger.jsonl"
+            if not path.exists():
+                return []
+            rows: list[dict] = []
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        rows.append(json.loads(line))
+            except Exception:
+                return []
+            return rows
+
+        result = self._cached("account_ledger", _TTL_ACCOUNT, _load)
         return result if result is not None else []
 
     # ── Closed trades (today's completed positions) ──────────────────────────

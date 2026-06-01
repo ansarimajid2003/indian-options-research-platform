@@ -1,0 +1,10 @@
+{
+  "_comment": "Two-tier margin model. Tier1 (broker_snapshot): if account/kotak_limits_{date}.json exists, use broker's real MarginUsed/Net. Tier2 (calibrated_formula): defined-risk + Nov-2024 hedged floor. CALIBRATE hedged_floor_per_lot from real Kotak margin_required/SPAN calculator. Values are 2026 research ESTIMATES, not exact.",
+  "starting_capital": 1000000.0,
+  "per_index": {
+    "NIFTY":      {"hedged_floor_per_lot": 45000.0, "expiry_elm_pct": 0.02, "expiry_elm_dte": 0},
+    "FINNIFTY":   {"hedged_floor_per_lot": 40000.0, "expiry_elm_pct": 0.02, "expiry_elm_dte": 0},
+    "MIDCPNIFTY": {"hedged_floor_per_lot": 40000.0, "expiry_elm_pct": 0.02, "expiry_elm_dte": 0},
+    "SENSEX":     {"hedged_floor_per_lot": 50000.0, "expiry_elm_pct": 0.02, "expiry_elm_dte": 2}
+  }
+}

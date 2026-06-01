@@ -318,6 +318,7 @@ function App() {
   const [positions,     setPositions]     = useState([]);
   const [closedTrades,  setClosedTrades]  = useState([]);
   const [equity,        setEquity]        = useState([]);
+  const [account,       setAccount]       = useState(null);
   const [signalLog,  setSignalLog]  = useState([]);
   const [alerts,     setAlerts]     = useState([]);
   const [session,    setSession]    = useState(null);
@@ -381,8 +382,10 @@ function App() {
       getJson('/api/live/equity-curve'),
       getJson('/api/live/signal-log'),
       getJson('/api/live/alerts'),
-    ]).then(([sess, pos, closed, eq, sig, al]) => {
+      getJson('/api/live/account'),
+    ]).then(([sess, pos, closed, eq, sig, al, acct]) => {
       if (sess) setSession(sess);
+      if (acct) setAccount(acct);
 
       // Always replace state with API response (even if empty array)
       setPositions(Array.isArray(pos) ? pos.map(adaptPosition) : []);
@@ -473,6 +476,9 @@ function App() {
     const id = setInterval(() => {
       getJson('/api/live/closed-positions').then(closed => {
         if (Array.isArray(closed)) setClosedTrades(closed);
+      });
+      getJson('/api/live/account').then(acct => {
+        if (acct) setAccount(acct);
       });
     }, 30000);
     return () => clearInterval(id);
@@ -581,6 +587,7 @@ function App() {
               <PositionsPanel positions={positions} closedTrades={closedTrades} />
               <EquityCurvePanel seriesRef={seriesRef} equityState={equity}
                 accentColor={tweaks.accentColor} />
+              <AccountStatePanel account={account} />
               <SpotChartsRow spotData={spotData} marketClosed={marketClosed} />
               <OptionChainPanel chainData={chainData} chainMeta={chainMeta} chainLoaded={chainLoaded} marketClosed={marketClosed} session={session} />
               <SignalLogPanel entries={signalLog} />

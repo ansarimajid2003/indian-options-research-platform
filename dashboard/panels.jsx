@@ -753,4 +753,53 @@ const OptionChainPanel = React.memo(function OptionChainPanel({ chainData, chain
   );
 });
 
-Object.assign(window, { PositionsPanel, EquityCurvePanel, SignalLogPanel, DepthHealthPanel, StoragePanel, AlertsPanel, SpotChartsRow, OptionChainPanel });
+// ── Account state ──────────────────────────────────────────────────────
+const AccountStatePanel = React.memo(function AccountStatePanel({ account }) {
+  const hasHistory = account && (account.total_sessions ?? 0) > 0 && account.current_balance != null;
+  const row = (account && account.latest_row) || {};
+  const netPnl = account?.all_time_net_pnl ?? 0;
+  const dd = account?.max_drawdown_pct ?? 0;
+  const bpUtil = row.peak_buying_power_pct ?? null;
+  const breach = !!row.margin_breach;
+
+  return (
+    <div className="panel span-equity">
+      <div className="panel-header">
+        <div className="panel-title">Account State <span className="count">PERSISTENT · ALL-TIME</span></div>
+        <div className="panel-actions">
+          {breach
+            ? <span className="badge critical"><span className="dot"/>MARGIN BREACH</span>
+            : <span className="badge ok"><span className="dot"/>OK</span>}
+        </div>
+      </div>
+      {!hasHistory ? (
+        <EmptyState icon="◷" title="NO ACCOUNT HISTORY YET" sub="Populates after the first EOD ledger update" />
+      ) : (
+        <div className="eq-summary" style={{flexWrap:'wrap', gap:'18px'}}>
+          <div>
+            <div className="lbl">Current Balance</div>
+            <div className="val">{fmtINR(account.current_balance, {noSign:true})}</div>
+            <div className="delta muted">start {fmtINR(account.starting_capital, {noSign:true})}</div>
+          </div>
+          <div>
+            <div className="lbl">All-time Net P&L</div>
+            <div className={`val ${netPnl >= 0 ? 'pos' : 'neg'}`}>{fmtINR(netPnl)}</div>
+            <div className="delta muted">{account.total_trades ?? 0} trades</div>
+          </div>
+          <div>
+            <div className="lbl">Max Drawdown</div>
+            <div className={`val ${dd < 0 ? 'neg' : ''}`}>{fmtPct(dd)}</div>
+            <div className="delta muted">{account.total_sessions ?? 0} sessions</div>
+          </div>
+          <div>
+            <div className="lbl">Peak BP Util</div>
+            <div className="val">{bpUtil != null ? fmtPct(bpUtil) : '—'}</div>
+            <div className="delta muted">{account.margin_source || 'n/a'}</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
+
+Object.assign(window, { PositionsPanel, EquityCurvePanel, SignalLogPanel, DepthHealthPanel, StoragePanel, AlertsPanel, SpotChartsRow, OptionChainPanel, AccountStatePanel });
