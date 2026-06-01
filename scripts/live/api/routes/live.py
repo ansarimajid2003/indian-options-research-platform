@@ -247,20 +247,31 @@ def get_account_ledger(request: Request) -> list[AccountLedgerRowModel]:
     return out
 
 
-@router.get("/closed-positions", response_model=list[ClosedTradeModel], summary="Today's closed paper trades")
+@router.get("/closed-positions", response_model=list[ClosedTradeModel], summary="Closed paper trades since canonical start")
 def get_closed_positions(
     request: Request,
-    date: str = Query(default="today", description="YYYYMMDD or 'today'"),
+    date: str = Query(
+        default="all",
+        description="'all' (every session since canonical start), 'today', or YYYYMMDD for a single session",
+    ),
 ) -> list[ClosedTradeModel]:
     from datetime import date as _date
+    from options_backtest.dashboard_bridge import CANONICAL_START
+
+    bridge = _bridge(request)
+    if date == "all":
+        trades = bridge.get_closed_trades_since(CANONICAL_START)
+        return [ClosedTradeModel(**t) for t in trades]
+
     if date == "today":
         session_date = _date.today()
+    elif len(date) == 8 and date.isdigit():
+        session_date = _date(int(date[:4]), int(date[4:6]), int(date[6:]))
     else:
-        try:
-            session_date = _date.fromisoformat(f"{date[:4]}-{date[4:6]}-{date[6:]}")
-        except (ValueError, IndexError):
-            session_date = _date.today()
-    trades = _bridge(request).get_closed_trades(session_date)
+        # Malformed explicit date — return empty rather than silently
+        # defaulting to today's trades.
+        return []
+    trades = bridge.get_closed_trades(session_date)
     return [ClosedTradeModel(**t) for t in trades]
 
 

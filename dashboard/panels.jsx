@@ -28,7 +28,7 @@ const PositionsPanel = React.memo(function PositionsPanel({ positions, closedTra
           <span className="count">
             {activeTab === 'open'
               ? (positions.length > 0 ? `${positions.length} · 4×1 IRON CONDOR` : 'NONE TODAY')
-              : (closedTrades.length > 0 ? `${closedTrades.length} TRADES TODAY` : 'NONE CLOSED YET')
+              : (closedTrades.length > 0 ? `${closedTrades.length} TRADES · SINCE JUN 1` : 'NONE CLOSED YET')
             }
           </span>
         </div>
@@ -129,6 +129,7 @@ const PositionsPanel = React.memo(function PositionsPanel({ positions, closedTra
             <table className="tbl">
               <thead>
                 <tr>
+                  <th className="l">Date</th>
                   <th className="l">Symbol</th>
                   <th className="l">Short CE / Long CE</th>
                   <th className="l">Short PE / Long PE</th>
@@ -143,7 +144,8 @@ const PositionsPanel = React.memo(function PositionsPanel({ positions, closedTra
               </thead>
               <tbody>
                 {closedTrades.map((t, i) => (
-                  <tr key={`${t.symbol}-${i}`} className={`pos-row ${t.net_pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}`}>
+                  <tr key={`${t.session_date || ''}-${t.symbol}-${i}`} className={`pos-row ${t.net_pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}`}>
+                    <td className="l muted" style={{fontSize:10, letterSpacing:'0.03em'}}>{(t.session_date || (t.exit_time || '').slice(0,10)) || '—'}</td>
                     <td className="l">
                       <div className="sym-cell">
                         <span className="sym">{t.symbol}</span>

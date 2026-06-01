@@ -77,6 +77,12 @@ _TTL_ACCOUNT = 30.0
 _TTL_BACKTESTS = 120.0
 _BACKTEST_INDEX_VERSION = 3
 
+# Canonical paper-trading start. The engine was substantially changed through
+# the May-2026 refactor; sessions before this date are pre-refactor and are
+# NOT counted as canonical paper-trading evidence. The account ledger and the
+# dashboard's closed-positions history both begin here.
+CANONICAL_START = date(2026, 6, 1)
+
 
 # ── Dataclasses (bridge-internal; mirrored by Pydantic models in api/models.py) ──
 
@@ -606,6 +612,7 @@ class DashboardBridge:
                 if not t.get("exit_time"):
                     continue
                 result.append({
+                    "session_date": session_date.isoformat(),
                     "symbol": t.get("symbol", ""),
                     "expiry": t.get("expiry", ""),
                     "entry_time": t.get("entry_time", ""),
@@ -628,6 +635,34 @@ class DashboardBridge:
             return result
 
         result = self._cached(f"closed_trades_{date_str}", _TTL_TRADES, _load)
+        return result if result is not None else []
+
+    def get_closed_trades_since(self, start_date: date) -> list[dict]:
+        """All closed paper trades on or after ``start_date``, newest session first.
+
+        Walks every ``paper_trades/YYYYMMDD.json`` whose date is >= ``start_date``
+        and concatenates their completed trades. Each trade carries a
+        ``session_date`` field so the dashboard can group/label across days.
+        Sorted by exit_time descending so the most recent fills lead the table.
+        """
+        def _load() -> list[dict]:
+            trades_dir = self._root / "paper_trades"
+            if not trades_dir.exists():
+                return []
+            all_trades: list[dict] = []
+            for path in sorted(trades_dir.glob("*.json")):
+                stem = path.stem
+                if not (len(stem) == 8 and stem.isdigit()):
+                    continue
+                sd = date(int(stem[:4]), int(stem[4:6]), int(stem[6:8]))
+                if sd < start_date:
+                    continue
+                all_trades.extend(self.get_closed_trades(sd))
+            all_trades.sort(key=lambda x: x.get("exit_time") or "", reverse=True)
+            return all_trades
+
+        cache_key = f"closed_trades_since_{start_date.isoformat()}"
+        result = self._cached(cache_key, _TTL_TRADES, _load)
         return result if result is not None else []
 
     # ── Signal log ───────────────────────────────────────────────────────────

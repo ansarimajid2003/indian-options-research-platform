@@ -250,6 +250,7 @@ class LivePushFrame(BaseModel):
 # ── Closed trade (today's completed positions) ────────────────────────────────
 
 class ClosedTradeModel(BaseModel):
+    session_date: str = ""
     symbol: str
     expiry: str
     entry_time: str

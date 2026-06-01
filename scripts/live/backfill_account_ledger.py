@@ -12,6 +12,11 @@ the opening==prior-closing chain, so this script is safe to re-run. With
 ``--rebuild`` (default) it truncates the ledger first for a clean replay; pass
 ``--no-rebuild`` to incrementally fold in any missing sessions instead.
 
+The canonical-start cutoff (``--start-date``, default 2026-06-01) is only
+enforced on a full ``--rebuild``. ``--no-rebuild`` folds only sessions on/after
+the cutoff into whatever ledger already exists, so any pre-cutoff rows from an
+earlier build are left in place; use ``--rebuild`` to re-anchor the period.
+
 Usage:
     python scripts/live/backfill_account_ledger.py
     python scripts/live/backfill_account_ledger.py --live-root data/live
@@ -30,14 +35,19 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from options_backtest.account_state import MarginModel, update_account_ledger
+from options_backtest.dashboard_bridge import CANONICAL_START
 
 
-def _session_dates(live_root: Path) -> list[date]:
+def _session_dates(live_root: Path, start_date: date | None = None) -> list[date]:
     """Return sorted session dates that have a paper_trades JSON file.
 
     Excludes the ``*_signals.jsonl`` sidecar files; only the daily trade
     arrays (``YYYYMMDD.json``) seed account rows. An empty ``[]`` file still
     produces a flat (0-trade) row to keep the equity chain continuous.
+
+    Sessions strictly before ``start_date`` are dropped — used to anchor the
+    canonical paper-trading period (the engine changed substantially through
+    the May-2026 refactor, so pre-refactor sessions are not canonical evidence).
     """
     trades_dir = live_root / "paper_trades"
     if not trades_dir.exists():
@@ -47,11 +57,19 @@ def _session_dates(live_root: Path) -> list[date]:
         stem = path.stem
         if not (len(stem) == 8 and stem.isdigit()):
             continue  # skip signals / non-date files
-        dates.append(date(int(stem[:4]), int(stem[4:6]), int(stem[6:8])))
+        sd = date(int(stem[:4]), int(stem[4:6]), int(stem[6:8]))
+        if start_date is not None and sd < start_date:
+            continue
+        dates.append(sd)
     return sorted(dates)
 
 
-def backfill(live_root: Path, margin_config: Path, rebuild: bool = True) -> list[dict]:
+def backfill(
+    live_root: Path,
+    margin_config: Path,
+    rebuild: bool = True,
+    start_date: date | None = None,
+) -> list[dict]:
     margin_model = MarginModel.from_config(margin_config)
     account_dir = live_root / "account"
     ledger_path = account_dir / "account_ledger.jsonl"
@@ -60,7 +78,7 @@ def backfill(live_root: Path, margin_config: Path, rebuild: bool = True) -> list
         ledger_path.unlink()
 
     rows: list[dict] = []
-    for session_date in _session_dates(live_root):
+    for session_date in _session_dates(live_root, start_date=start_date):
         row = update_account_ledger(live_root, session_date, margin_model=margin_model)
         rows.append(row)
     return rows
@@ -80,11 +98,26 @@ def main() -> None:
         action="store_false",
         help="Fold into the existing ledger instead of truncating it first",
     )
+    parser.add_argument(
+        "--start-date",
+        default=CANONICAL_START.isoformat(),
+        help=(
+            "Canonical paper-trading start (YYYY-MM-DD); sessions before this are "
+            f"excluded. Default {CANONICAL_START.isoformat()}. Pass 'all' to include every session."
+        ),
+    )
     parser.set_defaults(rebuild=True)
     args = parser.parse_args()
 
+    if args.start_date == "all":
+        start_date = None
+    else:
+        start_date = date.fromisoformat(args.start_date)
+
     live_root = Path(args.live_root)
-    rows = backfill(live_root, Path(args.margin_config), rebuild=args.rebuild)
+    rows = backfill(
+        live_root, Path(args.margin_config), rebuild=args.rebuild, start_date=start_date
+    )
 
     if not rows:
         print(f"No paper_trades sessions found under {live_root / 'paper_trades'}")
