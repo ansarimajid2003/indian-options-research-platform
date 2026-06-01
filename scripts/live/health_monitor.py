@@ -793,6 +793,14 @@ class HealthMonitor:
         for symbol, rec in by_symbol.items():
             sym_pct = float(rec.get("ready_pct", 0.0))
             reason = f"depth_ready_low_{str(symbol).lower()}"
+            # A symbol that is already excluded from today's strategy by its
+            # DTE/expiry window will never trade, so its depth readiness is
+            # irrelevant for the session. Suppress (and clear) its per-symbol
+            # depth alerts to avoid flooding the audit trail with noise about
+            # untraded instruments. Mirrors the chain-fetch guard above.
+            if self._symbol_dte_excluded_today(symbol):
+                await self._clear_alert("depth_readiness", reason)
+                continue
             sym_threshold = float(sym_configs.get(symbol, {}).get("depth_ready_threshold_pct", _DEPTH_READY_MIN_PCT))
             if sym_pct < sym_threshold:
                 await self._alert(
@@ -1251,18 +1259,27 @@ class HealthMonitor:
                     alert_duration = (_now_ist() - first_seen_dt).total_seconds()
             if alert_duration < _RESOLVED_JSONL_MIN_DURATION_SECONDS:
                 continue
+            # The stored ``record['message']`` describes the *failure* condition
+            # (e.g. "NIFTY depth ready 0.0%"), so echoing it verbatim under a
+            # "RECOVERED:" prefix is misleading — it reports the bad value, not
+            # the recovered state. Describe the clear as a state transition with
+            # how long the condition was active instead.
+            recovered_message = (
+                f"cleared {reason} after {alert_duration:.0f}s "
+                f"(was: {record['message']})"
+            )
             resolved = {
                 "ts": _now_ist().isoformat(),
                 "severity": "resolved",
                 "component": component,
                 "reason": reason,
-                "message": f"RECOVERED: {record['message']}",
+                "message": recovered_message,
             }
             self._alerts_path.parent.mkdir(parents=True, exist_ok=True)
             with self._alerts_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(resolved) + "\n")
             if alert_duration >= _RESOLVED_JSONL_MIN_DURATION_SECONDS:
-                await self._send_telegram(f"[RECOVERED] {component}/{reason}: {record['message']}", severity="info")
+                await self._send_telegram(f"[RECOVERED] {component}/{reason}: {recovered_message}", severity="info")
 
     async def _send_telegram(self, text: str, severity: str = "info") -> None:
         if not self._tg_token or not self._tg_chat or self._session is None:
