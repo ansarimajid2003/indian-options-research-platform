@@ -436,7 +436,41 @@ All suites green after the fixes: `test_event_log` 14, `test_engine_watchdog`
 `test_live_paper` 65 (incl. 3 new: systemd-unit list, durable JSONL, feed check
 satisfied by SQLite heartbeat without JSON).
 
-### Deployment
+### Deployment — DONE 2026-06-03 ~02:16 IST
 
-Deployed to zimaos on 2026-06-03 after the green re-review — see the deployment
-log appended below once complete.
+Commit `df0b08d` on `main` (fast-forwarded `660f1ce..df0b08d`; the FF also
+carried the already-server-deployed account-tracker commits, server was at
+`abad4d7`). Deploy sequence:
+
+1. Committed `df0b08d` (9 patch files + this audit), pushed `main` to the zimaos
+   bare repo (`660f1ce..df0b08d`).
+2. Server worktree fast-forwarded `abad4d7..df0b08d` cleanly (no tracked-file
+   conflicts; only untracked `data/live`, analysis scripts remained).
+3. `py_compile` of all 6 changed modules **OK** on the server Python 3.12 venv.
+4. Ran `tests.test_engine_watchdog` + `tests.test_event_log` on the server
+   venv — **20 tests OK**.
+5. `systemctl daemon-reload && systemctl restart live-stack health-monitor`.
+
+Post-restart verification (orphan-uvicorn lesson — check MainPID changed AND a
+route responds, not just `is-active`):
+
+| Check | Result |
+|---|---|
+| `live-stack` MainPID | 1923 → **1757222** (changed) |
+| `health-monitor` MainPID | 1318 → **1756947** (changed) |
+| Both `is-active` | active |
+| `NRestarts` (both) | **0** (no crash loop) |
+| `GET /api/live/session` | **HTTP 200** (new process serving, not orphan) |
+| Supervisor log | `sleeping 23305s until next pre-open 2026-06-03T08:45:00` (correct off-hours re-arm on new code) |
+| Health-monitor startup | clean, no errors/tracebacks |
+| Running commit | `df0b08d` confirmed |
+
+Off-hours, the monitor's market-hours liveness checks are dormant until 08:45,
+so the systemd-unit fix, the SQLite-first reads, and the watchdog will get their
+first live exercise at the **2026-06-03 08:45 session** — which is where to
+confirm the predicted effects (no standalone-critical mis-grouping; heartbeat
+events populating the event log; watchdog armed and quiet on a healthy run).
+
+Rollback if needed: `git -C /DATA/live-paper/indian-markets reset --hard abad4d7`
++ `systemctl restart live-stack health-monitor` (the legacy `live-paper.service`
+remains disabled-but-present for the deeper E1 rollback path).
