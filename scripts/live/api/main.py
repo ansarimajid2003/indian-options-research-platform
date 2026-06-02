@@ -76,6 +76,119 @@ def _resolve_live_root() -> Path:
     return fallback
 
 
+# ── Engine progress watchdog (defensive depth for a wedged-but-alive engine) ──
+#
+# IMPORTANT scope note: this watchdog runs IN-PROCESS, so it cannot recover a
+# full host/process freeze (the actual 2026-06-02 cause — the watchdog coroutine
+# would freeze too). It defends the *other* class: a wedged-but-alive event loop
+# where one coroutine deadlocks/blocks but the loop still schedules others, so
+# the engine stops making progress while the process stays up. systemd Restart=
+# and a UPS remain the levers for a true host freeze.
+#
+# The signal is NOT phase-age: the legitimate pre-entry phases each span a full
+# 15-min boundary gap (waiting_preopen 08:45→09:00, connecting 09:00→09:15), so
+# phase-age would false-fire constantly. Instead we use a DEADLINE: by the
+# checkpoint time the engine must have advanced PAST the early phases. If it
+# hasn't — or market-data ticks have gone stale after the feed connected — it is
+# wedged and a one-shot relaunch can still make the 09:20 entry.
+
+# Max in-process relaunches per session before deferring to systemd.
+_ENGINE_MAX_RELAUNCHES = int(os.environ.get("ENGINE_MAX_RELAUNCHES", "1"))
+
+# Wall-clock time by which a healthy engine must have advanced past the early
+# (connecting) phases. The engine reaches chain_fetch ~09:15 and writes the
+# pre-entry gate at 09:18:30; if by this deadline it is still in an early phase
+# OR ticks are stale, it is wedged. Default 09:16 leaves room to relaunch before
+# the 09:18:30 gate / 09:20 entry.
+_ENGINE_PROGRESS_DEADLINE = os.environ.get("ENGINE_PROGRESS_DEADLINE", "09:16:00")
+
+# After the feed connects, market-data ticks should flow continuously. Ticks
+# stale beyond this (once we are in/after the connecting window) indicate a
+# wedged feed/loop. Generous to avoid firing on a normal brief gap.
+_ENGINE_TICK_STALL_SECONDS = float(os.environ.get("ENGINE_TICK_STALL_SECONDS", "120"))
+
+# Latest time the watchdog may still trigger a relaunch (must leave time to
+# re-init before 09:20 entry). After this it disarms.
+_ENGINE_WATCHDOG_ARM_UNTIL = os.environ.get("ENGINE_WATCHDOG_ARM_UNTIL", "09:17:00")
+
+# Watchdog polls this often.
+_ENGINE_WATCHDOG_POLL_SECONDS = 10.0
+
+# Early phases that must be LEFT by the progress deadline. (chain_fetch is the
+# expected phase at the deadline, so it is NOT early — staying in init /
+# waiting_preopen / connecting past the deadline is the wedge signal.)
+_EARLY_PHASES = frozenset({"init", "waiting_preopen", "connecting"})
+
+
+def _parse_ist_time(value: str):
+    from datetime import time as _time_cls
+    h, m, s = (int(x) for x in value.split(":"))
+    return _time_cls(h, m, s)
+
+
+async def _engine_progress_watchdog(engine, session_date) -> bool:
+    """Return True once the engine is detected wedged before the entry window.
+
+    Wedge signals (only evaluated at/after the progress deadline, only while
+    armed, i.e. before ``_ENGINE_WATCHDOG_ARM_UNTIL``):
+      1. still in an early phase (init/waiting_preopen/connecting) past the
+         deadline — it should have reached chain_fetch by then; or
+      2. the feed has connected but market-data ticks have gone stale beyond
+         ``_ENGINE_TICK_STALL_SECONDS`` — a wedged-but-alive loop.
+
+    Returns False if cancelled or once disarmed. The caller treats a True
+    return as the one-shot relaunch signal.
+    """
+    from datetime import datetime as _datetime
+    from zoneinfo import ZoneInfo
+
+    ist = ZoneInfo("Asia/Kolkata")
+    deadline = _datetime.combine(session_date, _parse_ist_time(_ENGINE_PROGRESS_DEADLINE), tzinfo=ist)
+    arm_until = _datetime.combine(session_date, _parse_ist_time(_ENGINE_WATCHDOG_ARM_UNTIL), tzinfo=ist)
+
+    try:
+        while True:
+            await asyncio.sleep(_ENGINE_WATCHDOG_POLL_SECONDS)
+            now = _datetime.now(tz=ist)
+            if now > arm_until:
+                # Past the recoverable window — disarm. Do NOT return: a
+                # completed watchdog task would be the first-completed task in
+                # asyncio.wait and would tear down a perfectly healthy engine.
+                # Idle until cancelled at EOD teardown instead.
+                while True:
+                    await asyncio.sleep(3600)
+            if now < deadline:
+                # Too early to judge progress — pre-entry phases legitimately
+                # span 15-min gaps. Wait until the deadline.
+                continue
+            try:
+                snap = engine.health_snapshot()
+            except Exception:
+                # Couldn't read state at/after the deadline — re-check next poll.
+                continue
+            phase = snap.get("phase")
+            feed_connected = snap.get("feed_connected")
+            tick_age = snap.get("last_tick_age_seconds")
+
+            wedged_phase = phase in _EARLY_PHASES
+            wedged_ticks = (
+                bool(feed_connected)
+                and tick_age is not None
+                and tick_age >= _ENGINE_TICK_STALL_SECONDS
+            )
+            if wedged_phase or wedged_ticks:
+                log.error(
+                    "engine_watchdog: WEDGE detected at %s — phase=%s "
+                    "feed_connected=%s last_tick_age=%s (deadline=%s); signalling "
+                    "one-shot relaunch",
+                    now.time().isoformat(), phase, feed_connected, tick_age,
+                    _ENGINE_PROGRESS_DEADLINE,
+                )
+                return True
+    except asyncio.CancelledError:
+        return False
+
+
 async def _run_integrated_engine(app: FastAPI, live_root: Path) -> None:
     """Optional: run the paper engine inside the FastAPI uvicorn process.
 
@@ -145,54 +258,111 @@ async def _run_integrated_engine(app: FastAPI, live_root: Path) -> None:
             continue
         access_token = _ensure_fresh_token(access_token, client_id)
 
-        depth_cache = DepthCache()
-        engine = PaperTradingEngine(
-            profile=profile,
-            session_date=today,
-            depth_cache=depth_cache,
-            access_token=access_token,
-            client_id=client_id,
-            live_root=live_root,
-        )
-        checkpoint = _load_checkpoint(live_root, today)
-        if checkpoint is not None:
-            engine.resume_from_checkpoint(
-                checkpoint,
-                restart_reason=_load_restart_reason(live_root, today),
+        # The engine + collector run under a progress watchdog. If the engine
+        # wedges before the entry window (a coroutine deadlock: the loop still
+        # schedules but the engine stops advancing — distinct from a full host
+        # freeze, which an in-process watchdog cannot catch), the watchdog
+        # cancels both tasks and we relaunch the pair ONCE, in time to still
+        # make the 09:20 entry. A single relaunch is the cap — repeated
+        # crash-looping is left to systemd's Restart=on-failure.
+        #
+        # ``relaunch_reason`` is a dict (the shape resume_from_checkpoint
+        # expects: it reads ``.get("reason")``). None on the first attempt so
+        # the operator's restart_reason.json (consumed only when a checkpoint
+        # is actually applied — see below) is used; a dict on relaunch.
+        relaunch_reason: dict | None = None
+        for attempt in range(_ENGINE_MAX_RELAUNCHES + 1):
+            depth_cache = DepthCache()
+            engine = PaperTradingEngine(
+                profile=profile,
+                session_date=today,
+                depth_cache=depth_cache,
+                access_token=access_token,
+                client_id=client_id,
+                live_root=live_root,
             )
-
-        # Expose the live engine on app.state so dashboard routes can
-        # read in-memory state without HTTP round-trips.
-        app.state.engine = engine
-        try:
-            engine_task = asyncio.create_task(engine.run())
-            collector_task = asyncio.create_task(
-                collect_order_book(
-                    profile=profile,
-                    session_date=today,
-                    depth_cache=depth_cache,
-                    access_token=access_token,
-                    client_id=client_id,
-                    live_root=live_root,
+            checkpoint = _load_checkpoint(live_root, today)
+            if checkpoint is not None:
+                # Consume restart_reason.json (one-shot, unlinks the file) ONLY
+                # when there is a checkpoint to apply it to — otherwise the
+                # operator's reason would be silently discarded on a normal
+                # no-checkpoint startup. On a watchdog relaunch use our own
+                # reason dict instead of re-reading the (now-unlinked) file.
+                reason = relaunch_reason if relaunch_reason is not None else _load_restart_reason(live_root, today)
+                engine.resume_from_checkpoint(
+                    checkpoint,
+                    restart_reason=reason,
                 )
-            )
-            done, pending = await asyncio.wait(
-                {engine_task, collector_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for t in pending:
-                t.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for t in done:
-                exc = t.exception()
-                if exc is not None:
-                    log.exception("integrated_engine: task failed", exc_info=exc)
-        finally:
+
+            # Expose the live engine on app.state so dashboard routes can
+            # read in-memory state without HTTP round-trips.
+            app.state.engine = engine
+            stalled = False
             try:
-                engine.close()
-            except Exception:
-                pass
-            app.state.engine = None
+                engine_task = asyncio.create_task(engine.run())
+                collector_task = asyncio.create_task(
+                    collect_order_book(
+                        profile=profile,
+                        session_date=today,
+                        depth_cache=depth_cache,
+                        access_token=access_token,
+                        client_id=client_id,
+                        live_root=live_root,
+                    )
+                )
+                watchdog_task = asyncio.create_task(
+                    _engine_progress_watchdog(engine, today)
+                )
+                done, pending = await asyncio.wait(
+                    {engine_task, collector_task, watchdog_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # The watchdog completing first (returning True) is the stall
+                # signal. Any other task completing first is normal EOD or a
+                # crash — either way we tear down and do not relaunch.
+                wd_exc = watchdog_task.exception() if watchdog_task in done else None
+                stalled = (
+                    watchdog_task in done
+                    and wd_exc is None
+                    and watchdog_task.result() is True
+                )
+                if wd_exc is not None:
+                    # The safety net itself crashed — surface it, otherwise the
+                    # watchdog is silently disarmed for the session with no
+                    # diagnostic. (stalled stays False → no relaunch.)
+                    log.error("integrated_engine: watchdog task crashed", exc_info=wd_exc)
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for t in done:
+                    if t is watchdog_task:
+                        continue
+                    exc = t.exception()
+                    if exc is not None:
+                        log.exception("integrated_engine: task failed", exc_info=exc)
+            finally:
+                try:
+                    engine.close()
+                except Exception:
+                    pass
+                app.state.engine = None
+
+            if not stalled:
+                break
+            if attempt < _ENGINE_MAX_RELAUNCHES:
+                # Mark the relaunch so the fresh engine records it in the event
+                # log (restart accounting, Phase C1/C3). MUST be a dict —
+                # resume_from_checkpoint does ``(restart_reason or {}).get(...)``.
+                relaunch_reason = {"reason": "engine_stall_watchdog"}
+                log.warning(
+                    "integrated_engine: engine wedged before entry — relaunching "
+                    "(attempt %d/%d)", attempt + 1, _ENGINE_MAX_RELAUNCHES,
+                )
+            else:
+                log.error(
+                    "integrated_engine: engine stalled again after relaunch — "
+                    "giving up for today (systemd Restart handles deeper failures)"
+                )
 
 
 @asynccontextmanager

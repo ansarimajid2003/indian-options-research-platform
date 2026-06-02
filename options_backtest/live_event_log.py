@@ -44,7 +44,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-__all__ = ["EventLog", "EventType"]
+__all__ = ["EventLog", "EventType", "read_latest_events"]
 
 _log = logging.getLogger(__name__)
 
@@ -66,6 +66,16 @@ class EventType:
     ALERT = "alert"
 
     RESTART = "restart"
+
+    # Liveness heartbeats — periodic "I am alive and here is my state" events.
+    # These make the event log the canonical liveness source so the health
+    # monitor and dashboard no longer depend on tmpfs JSON-file mtimes (which
+    # are wiped on reboot and were the proximate cause of the 2026-06-02
+    # post-outage missing-snapshot alert storm). The payload mirrors the
+    # corresponding legacy JSON snapshot so consumers need minimal changes.
+    HEARTBEAT = "heartbeat"            # engine process_health snapshot
+    FEED_HEARTBEAT = "feed_heartbeat"  # live-feed state snapshot
+    DEPTH_HEARTBEAT = "depth_heartbeat"  # depth-collector cache snapshot
 
 
 _CREATE_SQL = """
@@ -247,6 +257,15 @@ class EventLog:
             {"reason": reason, "gap_minutes": gap_minutes},
         )
 
+    def log_heartbeat(self, snapshot: dict[str, Any]) -> int:
+        return self.append(EventType.HEARTBEAT, snapshot)
+
+    def log_feed_heartbeat(self, snapshot: dict[str, Any]) -> int:
+        return self.append(EventType.FEED_HEARTBEAT, snapshot)
+
+    def log_depth_heartbeat(self, snapshot: dict[str, Any]) -> int:
+        return self.append(EventType.DEPTH_HEARTBEAT, snapshot)
+
     # ─── read / projection API ────────────────────────────────────────────
 
     def iter_events(
@@ -305,6 +324,21 @@ class EventLog:
         """Return all exit payloads in order."""
         return [e["data"] for e in self.iter_events(type_=EventType.EXIT)]
 
+    def project_latest(self, type_: str) -> dict[str, Any] | None:
+        """Return the most-recent event of ``type_`` as ``{ts, seq, data}``.
+
+        Used for liveness reads (latest heartbeat of each kind). Returns
+        ``None`` if no such event exists yet.
+        """
+        row = self._conn.execute(
+            "SELECT ts, seq, data FROM events WHERE type = ? ORDER BY seq DESC LIMIT 1",
+            (type_,),
+        ).fetchone()
+        if row is None:
+            return None
+        ts, seq, payload = row
+        return {"ts": ts, "seq": seq, "data": json.loads(payload) if payload else {}}
+
     # ─── helpers ──────────────────────────────────────────────────────────
 
     def _read_max_seq(self) -> int:
@@ -327,6 +361,57 @@ class EventLog:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+
+def read_latest_events(
+    path: Path, types: Iterable[str]
+) -> dict[str, dict[str, Any] | None]:
+    """Read the latest event of each requested type from a session log, read-only.
+
+    For cross-process consumers (health monitor, dashboard bridge) that must
+    NOT take the engine's writer connection. Opens the SQLite file read-only in
+    WAL mode (concurrent with the engine's writes) and returns
+    ``{type: {ts, seq, data} | None}``. Returns all-``None`` if the file does
+    not exist yet (cold-start window before the engine creates the log).
+
+    Never raises on a missing/locked/corrupt file — returns ``None`` entries so
+    callers fall back to their legacy JSON-snapshot read path.
+    """
+    types = list(types)
+    result: dict[str, dict[str, Any] | None] = {t: None for t in types}
+    if not Path(path).exists():
+        return result
+    conn: sqlite3.Connection | None = None
+    try:
+        # immutable=0, read-only; WAL readers don't block the writer.
+        conn = sqlite3.connect(
+            f"file:{Path(path).as_posix()}?mode=ro", uri=True, timeout=2.0
+        )
+        conn.execute("PRAGMA busy_timeout=2000")
+        for t in types:
+            try:
+                row = conn.execute(
+                    "SELECT ts, seq, data FROM events WHERE type = ? ORDER BY seq DESC LIMIT 1",
+                    (t,),
+                ).fetchone()
+            except sqlite3.Error:
+                row = None
+            if row is not None:
+                ts, seq, payload = row
+                result[t] = {
+                    "ts": ts,
+                    "seq": seq,
+                    "data": json.loads(payload) if payload else {},
+                }
+    except sqlite3.Error as exc:
+        _log.debug("read_latest_events: %s unreadable (%r) — falling back", path, exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return result
 
 
 def _json_default(obj: Any) -> Any:

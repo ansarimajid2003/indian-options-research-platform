@@ -29,6 +29,7 @@ import pandas as pd
 
 from .calendar import is_trading_day as _is_trading_day, get_instrument_spec
 from .live_paths import resolve_durable_dir, resolve_snapshot_dir
+from .live_event_log import EventType, read_latest_events
 
 _REPO_ROOT = Path(__file__).parents[1]
 _DATA_ROOT = Path(os.environ.get("MARKET_DATA_ROOT", _REPO_ROOT / "data"))
@@ -294,6 +295,28 @@ class DashboardBridge:
         self._engine_metrics_cache = (now + self._engine_metrics_ttl_seconds, payload)
         return payload
 
+    def _read_event_liveness(self, session_date: date | None = None) -> dict[str, dict | None]:
+        """Latest heartbeat / feed_heartbeat / depth_heartbeat from the event log.
+
+        Canonical liveness source under Phase E1 (survives the tmpfs reboot
+        wipe). Read-only, never blocks the engine writer. Cached ~2 s. Returns
+        ``{type: data_dict | None}`` (the ``data`` payloads, not the envelope).
+        Used to backfill session status when the in-process HTTP /metrics is
+        unreachable but the engine still wrote heartbeats.
+        """
+        d = session_date or date.today()
+        key = f"event_liveness:{d.isoformat()}"
+
+        def _load() -> dict[str, dict | None]:
+            path = self._root / "event_log" / f"{d.strftime('%Y%m%d')}.sqlite"
+            latest = read_latest_events(
+                path,
+                (EventType.HEARTBEAT, EventType.FEED_HEARTBEAT, EventType.DEPTH_HEARTBEAT),
+            )
+            return {k: (v.get("data") if v else None) for k, v in latest.items()}
+
+        return self._cached(key, 2.0, _load) or {}
+
     # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _cached(self, key: str, ttl: float, loader) -> Any:
@@ -360,6 +383,16 @@ class DashboardBridge:
             ph = self._read_json(self._snap("latest_process_health.json"))
             fs = self._read_json(self._snap("latest_feed_state.json"))
             dc = self._read_json(self._snap("latest_depth_cache.json"))
+
+            # Canonical fallback: when the tmpfs JSON snapshots are absent
+            # (e.g. wiped by a reboot) but the engine wrote heartbeats, read
+            # the latest from the SQLite event log so the dashboard shows real
+            # last-known state instead of "offline".
+            if ph is None or fs is None or dc is None:
+                ev = self._read_event_liveness()
+                ph = ph or ev.get(EventType.HEARTBEAT)
+                fs = fs or ev.get(EventType.FEED_HEARTBEAT)
+                dc = dc or ev.get(EventType.DEPTH_HEARTBEAT)
 
             session_date_str = (
                 (engine or {}).get("session_date")

@@ -797,6 +797,58 @@ class LivePaperTests(unittest.TestCase):
         self.assertEqual(state["depth_collector_uptime_pct"], 0.0)
         self.assertEqual(state["full_readiness_uptime_pct"], 0.0)
 
+    def test_health_monitor_systemd_units_prefer_live_stack(self) -> None:
+        # Phase E1: the engine runs under live-stack.service. The monitor must
+        # probe it FIRST (live-paper.service is the disabled legacy fallback).
+        # Checking only live-paper made is-active always False under E1 and
+        # defeated the engine_stall grouping (root cause of the 2026-06-02
+        # standalone-critical cascade).
+        import scripts.live.health_monitor as hm
+        self.assertEqual(hm._ENGINE_SYSTEMD_UNITS[0], "live-stack.service")
+        self.assertIn("live-paper.service", hm._ENGINE_SYSTEMD_UNITS)
+
+    def test_alert_jsonl_append_is_durable_and_parseable(self) -> None:
+        from scripts.live.health_monitor import _append_jsonl_durable
+        root = Path("tmp_live_tests") / "durable_jsonl_case"
+        shutil.rmtree(root, ignore_errors=True)
+        path = root / "alerts" / "x.jsonl"
+        _append_jsonl_durable(path, {"a": 1})
+        _append_jsonl_durable(path, {"b": 2})
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(rows, [{"a": 1}, {"b": 2}])
+
+    def test_feed_check_satisfied_by_sqlite_heartbeat_without_json(self) -> None:
+        # SQLite migration: when the tmpfs JSON snapshot is absent (e.g. wiped by
+        # a reboot) but the event log has a fresh feed_heartbeat, the feed check
+        # must pass off the SQLite source — not fire feed_state_missing.
+        from options_backtest.live_event_log import EventLog, EventType
+        from scripts.live.health_monitor import _now_ist
+
+        async def run_case() -> tuple[bool | None, dict]:
+            root = Path("tmp_live_tests") / "feed_sqlite_case"
+            shutil.rmtree(root, ignore_errors=True)
+            (root / "event_log").mkdir(parents=True, exist_ok=True)
+            monitor = HealthMonitor(profile={}, live_root=root)
+            monitor._session_date = date(2026, 6, 3)
+            monitor._date_str = "20260603"
+            monitor._event_log_path = root / "event_log" / "20260603.sqlite"
+            # Write a fresh feed_heartbeat to the event log; NO JSON snapshot.
+            log = EventLog.open(monitor._event_log_path, session_date="2026-06-03")
+            log.log_feed_heartbeat({
+                "written_at": _now_ist().isoformat(),
+                "connected": True,
+                "subscribed_count": 6,
+            })
+            log.close()
+            with patch("scripts.live.health_monitor._is_feed_active", return_value=True):
+                monitor._refresh_event_liveness()
+                result = await monitor._check_feed_state()
+            return result, dict(monitor._active_alerts)
+
+        result, active = asyncio.run(run_case())
+        self.assertTrue(result)
+        self.assertEqual(active, {})
+
 
 # ── Snapshot directory routing (IM_SNAPSHOT_DIR) ──────────────────────────────
 

@@ -50,6 +50,7 @@ try:
     from options_backtest.live_resolver import LiveDhanContractResolver
     from options_backtest.schemas import OptionType
     from options_backtest.calendar import get_instrument_spec, expiry_on_or_after
+    from options_backtest.live_event_log import EventLog
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).parents[2]))
@@ -60,6 +61,7 @@ except ImportError:
     from options_backtest.live_resolver import LiveDhanContractResolver
     from options_backtest.schemas import OptionType
     from options_backtest.calendar import get_instrument_spec, expiry_on_or_after
+    from options_backtest.live_event_log import EventLog
 
 _IST = "Asia/Kolkata"
 _DEPTH_WS_URL = (
@@ -497,6 +499,7 @@ def _write_depth_cache_snapshot(
     depth_cache: DepthCache,
     security_ids: list[str],
     id_to_meta: dict[str, dict] | None = None,
+    event_log: "EventLog | None" = None,
 ) -> None:
     summary = depth_cache.readiness_summary(security_ids, max_age_seconds=5)
     now = _now_ist()
@@ -547,6 +550,14 @@ def _write_depth_cache_snapshot(
         "tob": tob_rows,
     }
     _write_atomic_json(resolve_snapshot_dir(live_root) / "latest_depth_cache.json", payload)
+    # Mirror depth liveness to the event log (canonical source; survives tmpfs
+    # reboot wipe). Optional — callers that don't own a log pass None (dry-run,
+    # tests, reconcile probes).
+    if event_log is not None:
+        try:
+            event_log.log_depth_heartbeat(payload)
+        except Exception:
+            _log.debug("event_log: log_depth_heartbeat failed", exc_info=True)
 
 
 def _write_collector_state(
@@ -600,9 +611,10 @@ async def _depth_snapshot_loop(
     configured_symbols: list[str] | None = None,
     failed_symbols: list[str] | None = None,
     interval_seconds: float = 10.0,
+    event_log: "EventLog | None" = None,
 ) -> None:
     while True:
-        await asyncio.to_thread(_write_depth_cache_snapshot, live_root, date_str, depth_cache, security_ids, id_to_meta)
+        await asyncio.to_thread(_write_depth_cache_snapshot, live_root, date_str, depth_cache, security_ids, id_to_meta, event_log)
         writer_status = writer_status_getter() if writer_status_getter else None
         await asyncio.to_thread(
             _write_collector_state,
@@ -1094,7 +1106,21 @@ async def collect_order_book(
             on_collector_ready(collector)
         except Exception:
             _log.exception("collect_order_book: on_collector_ready callback failed")
-    _write_depth_cache_snapshot(live_root, date_str, depth_cache, all_sids, all_meta)
+    # Collector-owned event-log handle for depth-liveness heartbeats. Opened
+    # read/write on the same session DB the engine writes (WAL → concurrent
+    # writers are safe). Never fatal: a failure here just means depth liveness
+    # falls back to the tmpfs JSON snapshot. Closed in the finally below.
+    depth_event_log: "EventLog | None" = None
+    try:
+        depth_event_log = EventLog.open(
+            live_root / "event_log" / f"{date_str}.sqlite",
+            session_date=session_date.isoformat(),
+        )
+    except Exception:
+        _log.debug("collect_order_book: could not open event log for depth heartbeats", exc_info=True)
+        depth_event_log = None
+
+    _write_depth_cache_snapshot(live_root, date_str, depth_cache, all_sids, all_meta, depth_event_log)
     tasks = [
         asyncio.create_task(collector.run()),
         asyncio.create_task(_depth_snapshot_loop(
@@ -1106,6 +1132,7 @@ async def collect_order_book(
             writer_status_getter=collector.writer_status,
             configured_symbols=configured_symbols,
             failed_symbols=failed_symbols,
+            event_log=depth_event_log,
         )),
     ]
     try:
@@ -1145,6 +1172,11 @@ async def collect_order_book(
             )
         except asyncio.TimeoutError:
             _log.error("collect_order_book: stopped-state write timed out")
+        if depth_event_log is not None:
+            try:
+                depth_event_log.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

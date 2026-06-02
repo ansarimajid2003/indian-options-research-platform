@@ -47,6 +47,7 @@ from options_backtest.clock_sync import (
     remediate_clock_sync as _remediate_clock_sync,
 )
 from options_backtest.live_paths import resolve_durable_dir, resolve_snapshot_dir
+from options_backtest.live_event_log import EventType, read_latest_events
 from scripts.live.market_calendar import market_session_decision
 from scripts.live.renew_token import renew_token as _do_renew_token, write_token_file as _write_token_file
 
@@ -90,6 +91,24 @@ _CLOCK_REMEDIATION_INTERVAL_SECONDS = 1800.0
 # don't share localhost (e.g. dev).
 _ENGINE_HEALTH_URL = os.environ.get("ENGINE_HEALTH_URL", "http://127.0.0.1:8001/health")
 _ENGINE_HEALTH_TIMEOUT_SECONDS = 2.0
+
+# systemd units that count as "the engine is supposed to be running". Phase E1
+# collapsed live-paper.service + dashboard-api.service into live-stack.service;
+# the engine now runs in-process under live-stack. The legacy live-paper.service
+# is retained (disabled) only for rollback. We probe live-stack FIRST and treat
+# the legacy unit as a fallback so a rollback deploy still reports correctly.
+# Checking only live-paper.service (the pre-E1 name) makes is-active always
+# False under E1, which silently defeats the engine_stall grouping below and
+# turns every stale-snapshot symptom into a standalone critical storm
+# (root cause of the 2026-06-02 standalone-critical cascade). Overridable via
+# $ENGINE_SYSTEMD_UNITS (comma-separated, first match wins).
+_ENGINE_SYSTEMD_UNITS = [
+    u.strip()
+    for u in os.environ.get(
+        "ENGINE_SYSTEMD_UNITS", "live-stack.service,live-paper.service"
+    ).split(",")
+    if u.strip()
+]
 
 _ALERT_THROTTLE: dict[tuple[str, str, str], float] = {}
 _LIVE_CALENDAR_ROOT: Path | None = None
@@ -166,6 +185,26 @@ def _scrub_message(text: str) -> str:
     text = re.sub(r"(?i)(token|clientId|client_id|access-token)=\S+", r"\1=[REDACTED]", text)
     text = re.sub(r"[A-Za-z0-9_\-]{80,}", "[REDACTED_TOKEN]", text)
     return text
+
+
+def _append_jsonl_durable(path: Path, record: dict) -> None:
+    """Append one JSON record to a JSONL file and fsync it to disk.
+
+    Power-cut durability: the 2026-06-02 outage truncated the alert JSONL tail
+    (every pre-outage alert the user saw on Telegram was lost from disk) because
+    the writes sat in the OS page cache, unsynced, when power was pulled. Flush
+    + fsync on each append so a hard power loss costs at most the in-flight line.
+    Best-effort: fsync failures (e.g. on a filesystem that doesn't support it)
+    are swallowed — the write itself still happened.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
 
 
 def _telegram_text(text: str) -> str:
@@ -269,6 +308,11 @@ class HealthMonitor:
         self._external_heartbeat_path = live_root / "alerts" / f"{self._date_str}_external_heartbeat.jsonl"
         self._alert_state_path = self._snapshot_dir / "latest_alert_state.json"
         self._uptime_summary_path = live_root / "reports" / f"{self._date_str}_uptime_summary.md"
+        self._event_log_path = live_root / "event_log" / f"{self._date_str}.sqlite"
+        # Per-tick cache of the latest liveness heartbeats from the SQLite event
+        # log (canonical source; survives the tmpfs reboot wipe that blinded the
+        # 2026-06-02 post-outage checks). Refreshed once per critical tick.
+        self._event_liveness: dict[str, dict | None] = {}
 
         self._tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self._tg_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -369,6 +413,8 @@ class HealthMonitor:
         self._alerts_path = self._live_root / "alerts" / f"{self._date_str}_alerts.jsonl"
         self._external_heartbeat_path = self._live_root / "alerts" / f"{self._date_str}_external_heartbeat.jsonl"
         self._uptime_summary_path = self._live_root / "reports" / f"{self._date_str}_uptime_summary.md"
+        self._event_log_path = self._live_root / "event_log" / f"{self._date_str}.sqlite"
+        self._event_liveness = {}
         self._alert_counts = {"critical": 0, "warning": 0, "info": 0}
         self._active_alerts = {}
         self._alert_jsonl_write_times = {}
@@ -411,6 +457,7 @@ class HealthMonitor:
             # Reset lag/stall indicators at start of each tick; sub-checks below
             # flag indicators and _emit_engine_stall emits one grouped incident.
             self._stall_indicators = {}
+            self._refresh_event_liveness()
             runner = await self._check_runner_process()
             collector = await self._check_collector_heartbeat()
             feed = await self._check_feed_state()
@@ -499,6 +546,39 @@ class HealthMonitor:
         except Exception as exc:
             _log.error("slow checks failed unexpectedly: %r", exc)
 
+    def _refresh_event_liveness(self) -> None:
+        """Refresh the per-tick cache of the latest liveness heartbeats.
+
+        Reads the latest heartbeat / feed_heartbeat / depth_heartbeat from the
+        session SQLite event log (read-only, never blocks the engine writer).
+        This is the canonical liveness source under Phase E1 — unlike the tmpfs
+        JSON snapshots it is NOT wiped on reboot, so a post-outage check sees
+        the real last-known engine state instead of a missing file.
+        """
+        try:
+            self._event_liveness = read_latest_events(
+                self._event_log_path,
+                (EventType.HEARTBEAT, EventType.FEED_HEARTBEAT, EventType.DEPTH_HEARTBEAT),
+            )
+        except Exception:
+            self._event_liveness = {}
+
+    def _liveness_age(self, event_type: str) -> tuple[dict | None, float | None]:
+        """Return (payload, age_seconds) for the latest heartbeat of a type.
+
+        ``payload`` is the heartbeat's ``data`` dict (mirror of the legacy JSON
+        snapshot), ``age_seconds`` the seconds since it was written. Returns
+        (None, None) if no such heartbeat exists (cold start / pre-migration
+        log) so callers fall back to the JSON-snapshot read path.
+        """
+        entry = (self._event_liveness or {}).get(event_type)
+        if not entry:
+            return None, None
+        data = entry.get("data") or {}
+        written_at = _parse_ts(data.get("written_at"))
+        age = (_now_ist() - written_at).total_seconds() if written_at else None
+        return data, age
+
     async def _probe_engine_http_health(self) -> bool:
         """Return True if the engine's /health endpoint returns 200.
 
@@ -532,13 +612,19 @@ class HealthMonitor:
 
         systemd_active = False
         if sys.platform != "win32" and shutil.which("systemctl"):
-            result = subprocess.run(
-                ["systemctl", "is-active", "--quiet", "live-paper.service"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            systemd_active = result.returncode == 0
+            # Phase E1: the engine runs under live-stack.service. Probe the
+            # configured units in order; any active unit means the engine is
+            # supposed to be up. (See _ENGINE_SYSTEMD_UNITS rationale.)
+            for unit in _ENGINE_SYSTEMD_UNITS:
+                result = subprocess.run(
+                    ["systemctl", "is-active", "--quiet", unit],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    systemd_active = True
+                    break
 
         # Track rising edge: service just became active (restart / fresh start)
         now_mono = _time.monotonic()
@@ -554,14 +640,23 @@ class HealthMonitor:
         # bound its port.
         snapshot_active = await self._probe_engine_http_health()
         snapshot_age: float | None = None
+        # Canonical liveness: the SQLite heartbeat (survives tmpfs reboot wipe).
+        # Consulted before the JSON file fallback.
+        if not snapshot_active:
+            _hb, hb_age = self._liveness_age(EventType.HEARTBEAT)
+            if hb_age is not None:
+                snapshot_age = hb_age
+                if hb_age <= 30:
+                    snapshot_active = True
         health_path = self._snapshot_dir / "latest_process_health.json"
         if not snapshot_active and health_path.exists():
             try:
                 data = json.loads(health_path.read_text(encoding="utf-8"))
                 written_at = _parse_ts(data.get("written_at"))
                 if written_at:
-                    snapshot_age = (_now_ist() - written_at).total_seconds()
-                    if snapshot_age <= 30:
+                    file_age = (_now_ist() - written_at).total_seconds()
+                    snapshot_age = file_age if snapshot_age is None else min(snapshot_age, file_age)
+                    if file_age <= 30:
                         snapshot_active = True
             except Exception as exc:
                 await self._alert("warning", "process", "process_health_parse_error", str(exc))
@@ -618,30 +713,44 @@ class HealthMonitor:
             await self._clear_alert("collector", "collector_writer_failed")
             await self._clear_alert("collector", "collector_writer_dropped")
             return None
-        path = self._snapshot_dir / "latest_depth_cache.json"
-        if not path.exists():
-            await self._alert(
-                "critical",
-                "collector",
-                "collector_heartbeat_missing",
-                "latest_depth_cache.json missing during feed-active window",
-            )
-            return False
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            written_at = _parse_ts(data.get("written_at"))
-            age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
-            if age > 30:
-                # Flag for engine_stall grouping rather than firing a standalone alert.
-                self._flag_stall("collector_heartbeat", f"age={age:.0f}s")
+        # Canonical source: SQLite depth_heartbeat (reboot-proof). Fall back to
+        # the tmpfs JSON snapshot when the event log has no heartbeat yet.
+        data, age = self._liveness_age(EventType.DEPTH_HEARTBEAT)
+        # Fall back to the JSON snapshot when there is no heartbeat OR the
+        # heartbeat carries no parseable age (a no-age heartbeat must not be
+        # trusted as a permanent stall — the JSON copy may have a good ts).
+        if data is None or age is None:
+            path = self._snapshot_dir / "latest_depth_cache.json"
+            if not path.exists():
+                if data is not None:
+                    # Heartbeat exists but has no usable timestamp and there is
+                    # no JSON to corroborate — flag a stall rather than crash.
+                    self._flag_stall("collector_heartbeat", "no_timestamp")
+                    return False
+                await self._alert(
+                    "critical",
+                    "collector",
+                    "collector_heartbeat_missing",
+                    "latest_depth_cache.json missing and no depth_heartbeat in event log during feed-active window",
+                )
                 return False
-            if not await self._check_collector_writer_state():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                written_at = _parse_ts(data.get("written_at"))
+                age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
+            except Exception as exc:
+                await self._alert("warning", "collector", "collector_heartbeat_parse_error", str(exc))
                 return False
-            await self._clear_alert("collector", "collector_heartbeat_missing")
-            return True
-        except Exception as exc:
-            await self._alert("warning", "collector", "collector_heartbeat_parse_error", str(exc))
+        if age is None:
+            age = 999999.0
+        if age > 30:
+            # Flag for engine_stall grouping rather than firing a standalone alert.
+            self._flag_stall("collector_heartbeat", f"age={age:.0f}s")
             return False
+        if not await self._check_collector_writer_state():
+            return False
+        await self._clear_alert("collector", "collector_heartbeat_missing")
+        return True
 
     async def _check_collector_writer_state(self) -> bool:
         state_path = self._durable_dir / "latest_depth_collector_state.json"
@@ -676,12 +785,25 @@ class HealthMonitor:
             await self._clear_alert("feed", "feed_state_missing")
             await self._clear_alert("feed", "feed_disconnected")
             return None
-        data = self._load_json_snapshot("latest_feed_state.json")
-        if data is None:
-            await self._alert("critical", "feed", "feed_state_missing", "latest_feed_state.json missing during feed-active window")
-            return False
-        written_at = _parse_ts(data.get("written_at"))
-        age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
+        # Canonical source: SQLite feed_heartbeat (reboot-proof). Fall back to
+        # the tmpfs JSON snapshot when the event log has no heartbeat yet.
+        data, age = self._liveness_age(EventType.FEED_HEARTBEAT)
+        # Fall back to JSON when there is no heartbeat OR it has no parseable
+        # age (a no-age heartbeat must not be trusted; the JSON copy may be
+        # fresh and also carries the authoritative `connected` flag).
+        if data is None or age is None:
+            json_data = self._load_json_snapshot("latest_feed_state.json")
+            if json_data is None:
+                if data is not None:
+                    self._flag_stall("feed_state", "no_timestamp")
+                    return False
+                await self._alert("critical", "feed", "feed_state_missing", "latest_feed_state.json missing and no feed_heartbeat in event log during feed-active window")
+                return False
+            data = json_data
+            written_at = _parse_ts(data.get("written_at"))
+            age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
+        if age is None:
+            age = 999999.0
         if age > 15:
             # Flag for engine_stall grouping rather than firing standalone.
             self._flag_stall("feed_state", f"age={age:.0f}s")
@@ -698,12 +820,23 @@ class HealthMonitor:
         if not _is_feed_active():
             await self._clear_alert("depth", "depth_snapshot_missing")
             return None
-        data = self._load_json_snapshot("latest_depth_cache.json")
-        if data is None:
-            await self._alert("critical", "depth", "depth_snapshot_missing", "latest_depth_cache.json missing during feed-active window")
-            return False
-        written_at = _parse_ts(data.get("written_at"))
-        age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
+        # Canonical source: SQLite depth_heartbeat (reboot-proof). Fall back to
+        # the tmpfs JSON snapshot when the event log has no heartbeat yet.
+        data, age = self._liveness_age(EventType.DEPTH_HEARTBEAT)
+        # Fall back to JSON when there is no heartbeat OR it has no parseable age.
+        if data is None or age is None:
+            json_data = self._load_json_snapshot("latest_depth_cache.json")
+            if json_data is None:
+                if data is not None:
+                    self._flag_stall("depth_snapshot", "no_timestamp")
+                    return False
+                await self._alert("critical", "depth", "depth_snapshot_missing", "latest_depth_cache.json missing and no depth_heartbeat in event log during feed-active window")
+                return False
+            data = json_data
+            written_at = _parse_ts(data.get("written_at"))
+            age = (_now_ist() - written_at).total_seconds() if written_at else 999999.0
+        if age is None:
+            age = 999999.0
         if age > 15:
             # Flag for engine_stall grouping rather than firing standalone.
             self._flag_stall("depth_snapshot", f"age={age:.0f}s")
@@ -1205,9 +1338,7 @@ class HealthMonitor:
             "session_date": self._date_str,
             "phase": self._phase,
         }
-        self._external_heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._external_heartbeat_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        _append_jsonl_durable(self._external_heartbeat_path, record)
 
     async def _alert(self, severity: str, component: str, reason: str, message: str) -> None:
         message = _scrub_message(message)
@@ -1232,9 +1363,7 @@ class HealthMonitor:
                 "reason": reason,
                 "message": message,
             }
-            self._alerts_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._alerts_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record) + "\n")
+            _append_jsonl_durable(self._alerts_path, record)
             self._alert_jsonl_write_times[key] = now_mono
             self._alert_counts[severity] = self._alert_counts.get(severity, 0) + 1
 
@@ -1275,9 +1404,7 @@ class HealthMonitor:
                 "reason": reason,
                 "message": recovered_message,
             }
-            self._alerts_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._alerts_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(resolved) + "\n")
+            _append_jsonl_durable(self._alerts_path, resolved)
             if alert_duration >= _RESOLVED_JSONL_MIN_DURATION_SECONDS:
                 await self._send_telegram(f"[RECOVERED] {component}/{reason}: {recovered_message}", severity="info")
 

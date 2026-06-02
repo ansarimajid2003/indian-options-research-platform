@@ -374,6 +374,10 @@ class PaperTradingEngine:
         self._log_dir = live_root / "logs"
 
         self._phase = "init"
+        # Monotonic stamp of the last phase transition. Read by the in-process
+        # supervisor watchdog to detect a wedged engine that stops advancing
+        # phases before the entry window (the 2026-06-02 `connecting` stall).
+        self._phase_changed_at = _time.monotonic()
         self._stop_event = asyncio.Event()
         self._resumed_after_crash = False
         self._resumed_after_manual_restart = False
@@ -395,6 +399,10 @@ class PaperTradingEngine:
         # ``log_*`` call.
         self._event_log_dir = live_root / "event_log"
         self._event_log: EventLog | None = None
+        # Guards lazy-open: the process-health loop and the snapshot/feed loop
+        # both call _ensure_event_log() from asyncio.to_thread workers, so the
+        # open must be serialised to avoid a double-open connection leak.
+        self._event_log_open_lock = threading.Lock()
 
         # In-process metrics endpoint — replaces the previous
         # "filesystem-mtime-as-liveness" pattern. The health monitor and
@@ -485,15 +493,19 @@ class PaperTradingEngine:
         """
         if self._event_log is not None:
             return self._event_log
-        try:
-            self._event_log_dir.mkdir(parents=True, exist_ok=True)
-            self._event_log = EventLog.open(
-                self._event_log_dir / f"{self._date_str}.sqlite",
-                session_date=self._session_date.isoformat(),
-            )
-        except Exception:
-            _log.exception("event_log: could not open SQLite log; continuing without it")
-            self._event_log = None
+        with self._event_log_open_lock:
+            # Re-check under the lock — another thread may have opened it.
+            if self._event_log is not None:
+                return self._event_log
+            try:
+                self._event_log_dir.mkdir(parents=True, exist_ok=True)
+                self._event_log = EventLog.open(
+                    self._event_log_dir / f"{self._date_str}.sqlite",
+                    session_date=self._session_date.isoformat(),
+                )
+            except Exception:
+                _log.exception("event_log: could not open SQLite log; continuing without it")
+                self._event_log = None
         return self._event_log
 
     def close(self) -> None:
@@ -528,6 +540,7 @@ class PaperTradingEngine:
         if self._phase == phase:
             return
         self._phase = phase
+        self._phase_changed_at = _time.monotonic()
         log = self._ensure_event_log()
         if log is not None:
             try:
@@ -1895,6 +1908,15 @@ class PaperTradingEngine:
             "chain_status": dict(self._chain_status),
         }
         _write_atomic(self._snapshot_dir / "latest_feed_state.json", state, sync=False)
+        # Mirror feed liveness to the event log (canonical source; survives
+        # tmpfs reboot wipe). _ensure_event_log() so a transient startup open
+        # failure self-heals rather than silently disabling mirroring.
+        log = self._ensure_event_log()
+        if log is not None:
+            try:
+                log.log_feed_heartbeat(state)
+            except Exception:
+                _log.debug("event_log: log_feed_heartbeat failed", exc_info=True)
 
         # Per-security quotes: merge last_tob + resolver quote snapshots + chain greeks
         for sid, tob in self._last_tob.items():
@@ -2248,7 +2270,19 @@ class PaperTradingEngine:
             _write_atomic(self._snapshot_dir / "latest_instrument_map.json", {"written_at": _ts_str(), "instruments": imap}, sync=False)
 
     def _write_process_health(self) -> None:
-        _write_atomic(self._snapshot_dir / "latest_process_health.json", self.health_snapshot(), sync=False)
+        snap = self.health_snapshot()
+        _write_atomic(self._snapshot_dir / "latest_process_health.json", snap, sync=False)
+        # Mirror to the SQLite event log as the canonical liveness source
+        # (consumed by the health monitor + dashboard; survives tmpfs reboot
+        # wipe, unlike the JSON snapshot above). Use _ensure_event_log() so a
+        # transient open failure at startup self-heals on a later tick rather
+        # than silently never mirroring liveness for the rest of the session.
+        log = self._ensure_event_log()
+        if log is not None:
+            try:
+                log.log_heartbeat(snap)
+            except Exception:
+                _log.debug("event_log: log_heartbeat failed", exc_info=True)
 
     # ──────────────────────────────────────────────────────────────────────────
     # HTTP /health and /metrics payloads
@@ -2283,6 +2317,10 @@ class PaperTradingEngine:
             "gap_minutes": self._crash_gap_minutes,
             "last_tick_age_seconds": last_tick_age,
             "last_tick_at": self._last_tick_at.isoformat() if self._last_tick_at is not None else None,
+            # Seconds since the last phase transition (monotonic). The
+            # supervisor watchdog uses this to detect a wedged engine that
+            # stalls before the entry window without advancing phase.
+            "phase_age_seconds": _time.monotonic() - self._phase_changed_at,
         }
 
     def metrics_snapshot(self) -> dict[str, Any]:
