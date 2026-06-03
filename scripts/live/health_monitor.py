@@ -74,8 +74,13 @@ _EOD_BUFFER_END = time(16, 5)
 _CHAIN_CHECK_START = time(9, 17)
 _ONE_MIN_CHECK_START = time(9, 30)
 
-_WD_MIN_GB_INTRADAY = 20.0
-_WD_MIN_GB_PRE_RUN = 100.0
+_WD_MIN_GB_INTRADAY = float(os.environ.get("WD_MIN_GB_INTRADAY", "20.0"))
+# Pre-run (off-hours) headroom warning. A session writes ~15-20 GB of raw
+# packets + parquet, so 40 GB keeps ~2-session headroom while staying well above
+# the 20 GB intraday-critical floor. The previous 100 GB threshold fired every
+# off-hours evaluation (every ~10 min) on a 466 GB drive that was merely 81%
+# full — pure standing-condition noise, not a per-session risk. Env-overridable.
+_WD_MIN_GB_PRE_RUN = float(os.environ.get("WD_MIN_GB_PRE_RUN", "40.0"))
 _QUOTE_FRESHNESS_MIN_PCT = 95.0
 _DEPTH_READY_MIN_PCT = 95.0
 _RAW_FLUSH_MAX_AGE_SECONDS = 90.0

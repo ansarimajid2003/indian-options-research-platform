@@ -95,6 +95,11 @@ def _resolve_live_root() -> Path:
 # Max in-process relaunches per session before deferring to systemd.
 _ENGINE_MAX_RELAUNCHES = int(os.environ.get("ENGINE_MAX_RELAUNCHES", "1"))
 
+# EOD account-ledger update timeout (mirrors run_paper_trading.py). The update
+# reads today's closed-trades JSON and re-walks the durable ledger; 15s is
+# generous for a single-session append.
+_ACCOUNT_LEDGER_TIMEOUT_SECONDS = float(os.environ.get("ACCOUNT_LEDGER_TIMEOUT_SECONDS", "15.0"))
+
 # Wall-clock time by which a healthy engine must have advanced past the early
 # (connecting) phases. The engine reaches chain_fetch ~09:15 and writes the
 # pre-entry gate at 09:18:30; if by this deadline it is still in an early phase
@@ -331,6 +336,15 @@ async def _run_integrated_engine(app: FastAPI, live_root: Path) -> None:
                     # watchdog is silently disarmed for the session with no
                     # diagnostic. (stalled stays False → no relaunch.)
                     log.error("integrated_engine: watchdog task crashed", exc_info=wd_exc)
+                # The engine completed CLEANLY (normal EOD) only if its own task
+                # finished without raising. A crash (engine_task raised) must NOT
+                # trigger the EOD account-ledger update — it would persist a row
+                # from an incomplete trade set. The legacy orchestrator avoids
+                # this by re-raising on `await engine_task` before its ledger
+                # block; we mirror that by gating on this flag.
+                engine_completed_clean = (
+                    engine_task in done and engine_task.exception() is None
+                )
                 for t in pending:
                     t.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
@@ -348,6 +362,43 @@ async def _run_integrated_engine(app: FastAPI, live_root: Path) -> None:
                 app.state.engine = None
 
             if not stalled:
+                # The engine task finished (not a watchdog stall) — this attempt
+                # is over and we leave the relaunch loop regardless of whether it
+                # was a clean EOD or a crash. Only a clean completion triggers the
+                # EOD account-ledger update.
+                if engine_completed_clean:
+                    # The engine writes its own EOD reports/snapshots, but the
+                    # account-ledger update was a post-engine step in the legacy
+                    # orchestrator (run_paper_trading.py) that the Phase-E1
+                    # in-process supervisor never inherited — so without this the
+                    # persistent balance / all-time PnL / margin stayed frozen at
+                    # the last manual backfill. Roll today's closed trades into
+                    # the durable ledger here, mirroring run_paper_trading.py's
+                    # block. Idempotent on session_date, so a re-run (or a later
+                    # backfill) is safe. Gated on engine_completed_clean so a
+                    # crash does not persist a row from an incomplete trade set.
+                    trades_json = live_root / "paper_trades" / f"{today.strftime('%Y%m%d')}.json"
+                    if trades_json.exists():
+                        try:
+                            from options_backtest.account_state import update_account_ledger
+
+                            latest = await asyncio.wait_for(
+                                asyncio.to_thread(update_account_ledger, live_root, today),
+                                timeout=_ACCOUNT_LEDGER_TIMEOUT_SECONDS,
+                            )
+                            log.info(
+                                "integrated_engine: account ledger updated "
+                                "closing_balance=%.2f net_pnl=%.2f",
+                                float(latest["closing_balance"]),
+                                float(latest["net_pnl"]),
+                            )
+                        except asyncio.TimeoutError:
+                            log.error(
+                                "integrated_engine: account ledger update timed out "
+                                "after %.1fs", _ACCOUNT_LEDGER_TIMEOUT_SECONDS,
+                            )
+                        except Exception:
+                            log.exception("integrated_engine: account ledger update failed")
                 break
             if attempt < _ENGINE_MAX_RELAUNCHES:
                 # Mark the relaunch so the fresh engine records it in the event
