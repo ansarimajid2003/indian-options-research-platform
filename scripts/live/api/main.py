@@ -59,6 +59,42 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def _emit_durable_alert(
+    live_root: Path, severity: str, component: str, reason: str, message: str
+) -> None:
+    """Append one alert record to today's durable alert JSONL, same shape the
+    health monitor writes, so the dashboard/monitor/Telegram surface it like any
+    other alert. Used by the engine supervisor to raise a *distinct* signal for a
+    startup/pre-entry crash — otherwise a startup crash is invisible behind the
+    stale-snapshot ``engine_stall`` storm the monitor emits all day (2026-06-04).
+    Best-effort and fully guarded: alerting must never crash the supervisor.
+    """
+    try:
+        import json as _json
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        ts = _dt.now(tz=_ZI("Asia/Kolkata"))
+        path = live_root / "alerts" / f"{ts.strftime('%Y%m%d')}_alerts.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": ts.isoformat(),
+            "severity": severity,
+            "component": component,
+            "reason": reason,
+            "message": message,
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(_json.dumps(record) + "\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+    except Exception:
+        log.exception("integrated_engine: failed to emit durable alert %s/%s", component, reason)
+
+
 def _resolve_live_root() -> Path:
     env = os.environ.get("LIVE_ROOT", "")
     if env:
@@ -129,6 +165,25 @@ def _parse_ist_time(value: str):
     from datetime import time as _time_cls
     h, m, s = (int(x) for x in value.split(":"))
     return _time_cls(h, m, s)
+
+
+def _before_entry_deadline(session_date) -> bool:
+    """True if there is still time to relaunch and make the 09:20 entry.
+
+    Uses the same cutoff as the watchdog's arm window
+    (``_ENGINE_WATCHDOG_ARM_UNTIL``, default 09:17): past it, re-initialising the
+    engine + collector can no longer reach the entry gate in time, so a crash
+    relaunch would be pointless (and would risk a half-initialised mid-session
+    engine). Before it, a one-shot relaunch is worthwhile.
+    """
+    from datetime import datetime as _datetime
+    from zoneinfo import ZoneInfo
+
+    ist = ZoneInfo("Asia/Kolkata")
+    cutoff = _datetime.combine(
+        session_date, _parse_ist_time(_ENGINE_WATCHDOG_ARM_UNTIL), tzinfo=ist
+    )
+    return _datetime.now(tz=ist) < cutoff
 
 
 async def _engine_progress_watchdog(engine, session_date) -> bool:
@@ -303,6 +358,8 @@ async def _run_integrated_engine(app: FastAPI, live_root: Path) -> None:
             # read in-memory state without HTTP round-trips.
             app.state.engine = engine
             stalled = False
+            crashed_pre_entry = False
+            engine_completed_clean = False
             try:
                 engine_task = asyncio.create_task(engine.run())
                 collector_task = asyncio.create_task(
@@ -345,15 +402,39 @@ async def _run_integrated_engine(app: FastAPI, live_root: Path) -> None:
                 engine_completed_clean = (
                     engine_task in done and engine_task.exception() is None
                 )
-                for t in pending:
-                    t.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+                # A pre-entry CRASH (engine or collector raised) is distinct from
+                # a clean EOD and from a watchdog stall. If it happens before the
+                # entry deadline, a one-shot relaunch can still make the 09:20
+                # entry — exactly the 2026-06-04 case (collector raised at
+                # 08:45:00.506 on the WD-space gate; the session was then lost for
+                # the day with no relaunch because relaunch was gated only on a
+                # *stall*). We now treat a pre-deadline crash like a stall: emit a
+                # DISTINCT durable alert (so it is not buried under the monitor's
+                # stale-snapshot engine_stall storm) and relaunch once.
+                crashed_pre_entry = False
                 for t in done:
                     if t is watchdog_task:
                         continue
                     exc = t.exception()
                     if exc is not None:
-                        log.exception("integrated_engine: task failed", exc_info=exc)
+                        which = "engine" if t is engine_task else "collector"
+                        log.exception(
+                            "integrated_engine: %s task failed", which, exc_info=exc
+                        )
+                        if not engine_completed_clean and _before_entry_deadline(today):
+                            crashed_pre_entry = True
+                            _emit_durable_alert(
+                                live_root,
+                                "critical",
+                                "engine",
+                                "engine_startup_crash",
+                                f"{which} task crashed before entry "
+                                f"(attempt {attempt + 1}/{_ENGINE_MAX_RELAUNCHES + 1}): "
+                                f"{type(exc).__name__}: {exc}",
+                            )
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
             finally:
                 try:
                     engine.close()
@@ -361,11 +442,16 @@ async def _run_integrated_engine(app: FastAPI, live_root: Path) -> None:
                     pass
                 app.state.engine = None
 
-            if not stalled:
-                # The engine task finished (not a watchdog stall) — this attempt
-                # is over and we leave the relaunch loop regardless of whether it
-                # was a clean EOD or a crash. Only a clean completion triggers the
-                # EOD account-ledger update.
+            # Relaunch on a watchdog stall OR a recoverable pre-entry crash; any
+            # other outcome (clean EOD, or a crash after the entry deadline when
+            # a relaunch can no longer help) ends this session.
+            should_relaunch = stalled or crashed_pre_entry
+            if not should_relaunch:
+                # The engine task finished (not a stall, not a recoverable
+                # pre-entry crash) — this attempt is over and we leave the
+                # relaunch loop regardless of whether it was a clean EOD or a
+                # post-deadline crash. Only a clean completion triggers the EOD
+                # account-ledger update.
                 if engine_completed_clean:
                     # The engine writes its own EOD reports/snapshots, but the
                     # account-ledger update was a post-engine step in the legacy
@@ -404,16 +490,28 @@ async def _run_integrated_engine(app: FastAPI, live_root: Path) -> None:
                 # Mark the relaunch so the fresh engine records it in the event
                 # log (restart accounting, Phase C1/C3). MUST be a dict —
                 # resume_from_checkpoint does ``(restart_reason or {}).get(...)``.
-                relaunch_reason = {"reason": "engine_stall_watchdog"}
+                cause = "engine_stall_watchdog" if stalled else "engine_startup_crash"
+                relaunch_reason = {"reason": cause}
                 log.warning(
-                    "integrated_engine: engine wedged before entry — relaunching "
-                    "(attempt %d/%d)", attempt + 1, _ENGINE_MAX_RELAUNCHES,
+                    "integrated_engine: %s before entry — relaunching "
+                    "(attempt %d/%d)", cause, attempt + 1, _ENGINE_MAX_RELAUNCHES,
                 )
             else:
+                reason_word = "stalled" if stalled else "crashed"
                 log.error(
-                    "integrated_engine: engine stalled again after relaunch — "
-                    "giving up for today (systemd Restart handles deeper failures)"
+                    "integrated_engine: engine %s again after relaunch — "
+                    "giving up for today (systemd Restart handles deeper failures)",
+                    reason_word,
                 )
+                if crashed_pre_entry:
+                    _emit_durable_alert(
+                        live_root,
+                        "critical",
+                        "engine",
+                        "engine_startup_crash",
+                        "engine crashed again after one-shot relaunch — "
+                        "no trade today; manual intervention required",
+                    )
 
 
 @asynccontextmanager

@@ -114,26 +114,53 @@ def _now_ist() -> pd.Timestamp:
     return pd.Timestamp.now(tz=_IST)
 
 
+# Minimum free space (GB) required at session start before the collector will
+# run. Env-overridable (``LIVE_MIN_FREE_GB``) and kept in sync with the health
+# monitor's pre-run threshold (``WD_MIN_GB_PRE_RUN``, also 40 GB) so the *warning*
+# and the *fatal gate* never disagree — a 2026-06-04 no-trade was caused by the
+# monitor warning being relaxed to 40 GB while this gate stayed at a fatal 100 GB.
+# A session needs ~15-20 GB; 40 GB keeps ~2-session headroom above the 20 GB
+# intraday-critical floor. The old 100 GB was a *month-long-run* sizing number
+# wrongly applied as a per-session abort.
+_LIVE_MIN_FREE_GB = float(os.environ.get("LIVE_MIN_FREE_GB", "40.0"))
+
+
 def _live_root() -> Path:
-    """Resolve data/live symlink and validate it points to WD storage."""
+    """Resolve the ``data/live`` symlink and validate it points at the
+    configured live-storage mount.
+
+    The live root must match ``LIVE_ROOT`` (the same value systemd passes to the
+    engine + monitor) so the collector can never silently write to the SSD/root
+    when the symlink is missing or misconfigured. ``LIVE_ROOT`` defaults to the
+    historical WD path; switching drives (e.g. WD->Toshiba) is a single env
+    change in the systemd unit plus repointing the symlink — no code edit.
+    """
     repo_root = Path(__file__).parents[2]
     live_path = (repo_root / "data" / "live").resolve()
-    expected = Path("/media/WD-Storage/indian-markets-live")
+    expected = Path(
+        os.environ.get("LIVE_ROOT", "/media/WD-Storage/indian-markets-live")
+    ).resolve()
     if live_path != expected:
         raise RuntimeError(
-            f"data/live resolves to {live_path}, expected {expected}. "
-            "Collector aborts to protect writable live storage."
+            f"data/live resolves to {live_path}, expected {expected} "
+            "(from LIVE_ROOT). Collector aborts to protect writable live storage."
         )
     return live_path
 
 
-def _check_wd_space(live_root: Path, min_gb: float = 100.0) -> None:
+def _check_wd_space(live_root: Path, min_gb: float | None = None) -> None:
+    """Abort the session if the live-storage mount is below the minimum free
+    space. ``min_gb`` defaults to ``_LIVE_MIN_FREE_GB`` (env ``LIVE_MIN_FREE_GB``,
+    40 GB) — applies to whichever drive ``live_root`` lives on (WD or Toshiba)."""
     import shutil
+    if min_gb is None:
+        min_gb = _LIVE_MIN_FREE_GB
     stat = shutil.disk_usage(str(live_root))
     free_gb = stat.free / (1024 ** 3)
     if free_gb < min_gb:
         raise RuntimeError(
-            f"WD storage has only {free_gb:.1f} GB free; need >= {min_gb} GB for month-long run."
+            f"live storage has only {free_gb:.1f} GB free at {live_root}; "
+            f"need >= {min_gb} GB to start a session."
         )
 
 
@@ -996,7 +1023,7 @@ async def collect_order_book(
         print("[collect_order_book] gap sentinel written for DRY_RUN")
         return
 
-    _check_wd_space(live_root, min_gb=100.0)
+    _check_wd_space(live_root)  # default _LIVE_MIN_FREE_GB (40 GB, env-overridable)
 
     depth_symbols, atm_offset_range, max_depth_connections = _depth_collection_settings(profile)
     if not depth_symbols:

@@ -1088,7 +1088,7 @@ class HealthMonitor:
 
     async def _check_wd_free_space_slow(self) -> bool:
         if self._wd_free_gb < _WD_MIN_GB_PRE_RUN and not _is_market_hours():
-            await self._alert("warning", "storage", "wd_low_space_warn", f"pre-run WD free {self._wd_free_gb:.1f} GB (< 100 GB)")
+            await self._alert("warning", "storage", "wd_low_space_warn", f"pre-run live-storage free {self._wd_free_gb:.1f} GB (< {_WD_MIN_GB_PRE_RUN:.0f} GB)")
             return False
         await self._clear_alert("storage", "wd_low_space_warn")
         return True
