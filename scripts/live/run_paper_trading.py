@@ -73,9 +73,14 @@ def _resolve_live_root() -> Path:
     live_path = _repo_root / "data" / "live"
     if sys.platform != "win32":
         resolved = live_path.resolve()
-        if not str(resolved).startswith("/media/WD-Storage"):
+        # Validate against LIVE_ROOT (the value systemd passes) rather than a
+        # hardcoded WD path so a storage-drive switch (WD->Toshiba) is config-only.
+        expected = str(
+            Path(os.environ.get("LIVE_ROOT", "/media/WD-Storage/indian-markets-live")).resolve()
+        )
+        if str(resolved) != expected:
             raise RuntimeError(
-                f"data/live resolves to {resolved}, expected /media/WD-Storage/... "
+                f"data/live resolves to {resolved}, expected {expected} (from LIVE_ROOT). "
                 "Aborting to protect writable live storage."
             )
     live_path.mkdir(parents=True, exist_ok=True)

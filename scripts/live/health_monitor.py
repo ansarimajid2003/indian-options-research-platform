@@ -256,8 +256,16 @@ def _resolve_live_root() -> Path:
     live_path = _repo_root / "data" / "live"
     if sys.platform != "win32":
         resolved = live_path.resolve()
-        if not str(resolved).startswith("/media/WD-Storage"):
-            raise RuntimeError(f"data/live resolves to {resolved}, expected /media/WD-Storage/...")
+        # Validate against LIVE_ROOT (the value systemd passes) rather than a
+        # hardcoded WD path, so a storage-drive switch (e.g. WD->Toshiba) is a
+        # config-only change. Defaults to the historical WD path.
+        expected = str(
+            Path(os.environ.get("LIVE_ROOT", "/media/WD-Storage/indian-markets-live")).resolve()
+        )
+        if str(resolved) != expected:
+            raise RuntimeError(
+                f"data/live resolves to {resolved}, expected {expected} (from LIVE_ROOT)"
+            )
     live_path.mkdir(parents=True, exist_ok=True)
     return live_path
 
@@ -970,8 +978,15 @@ class HealthMonitor:
         try:
             if sys.platform != "win32":
                 resolved = self._live_root.resolve()
-                if not str(resolved).startswith("/media/WD-Storage"):
-                    await self._alert("critical", "storage", "wd_mount_invalid", f"data/live resolves to {resolved}")
+                # The live root must sit on an external /media mount (WD or
+                # Toshiba), never the SSD/root, and must match the configured
+                # LIVE_ROOT. Validates against LIVE_ROOT env (default WD) so a
+                # storage-drive switch needs no code change.
+                expected = str(
+                    Path(os.environ.get("LIVE_ROOT", "/media/WD-Storage/indian-markets-live")).resolve()
+                )
+                if str(resolved) != expected or not str(resolved).startswith("/media/"):
+                    await self._alert("critical", "storage", "wd_mount_invalid", f"data/live resolves to {resolved}, expected {expected}")
                     return False
             probe = self._durable_dir / ".health_write_probe"
             probe.write_text("ok", encoding="utf-8")
