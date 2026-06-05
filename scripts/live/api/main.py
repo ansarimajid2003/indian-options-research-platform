@@ -160,6 +160,14 @@ _ENGINE_WATCHDOG_POLL_SECONDS = 10.0
 # waiting_preopen / connecting past the deadline is the wedge signal.)
 _EARLY_PHASES = frozenset({"init", "waiting_preopen", "connecting"})
 
+# Latest IST time a mid-session restart may still usefully resume an OPEN
+# position. The engine's own resume path (paper_engine.run) carries resumed
+# positions to the 15:20 time exit and 15:31 EOD, so resuming is worthwhile any
+# time before the exit completes. Use the stale-exit deadline (15:25) as the cap:
+# past it the engine would immediately force-stale-exit with no monitoring value,
+# and the supervisor should just write EOD on the next normal cycle.
+_RESUME_CUTOFF = os.environ.get("ENGINE_RESUME_CUTOFF", "15:25:00")
+
 
 def _parse_ist_time(value: str):
     from datetime import time as _time_cls
@@ -184,6 +192,35 @@ def _before_entry_deadline(session_date) -> bool:
         session_date, _parse_ist_time(_ENGINE_WATCHDOG_ARM_UNTIL), tzinfo=ist
     )
     return _datetime.now(tz=ist) < cutoff
+
+
+def _resumable_open_position(live_root: Path, session_date) -> bool:
+    """True if there is an open-position checkpoint for *today* worth resuming.
+
+    Used on supervisor startup/wake so that a mid-session restart (e.g. a host
+    reboot from a power outage) goes straight into the run/resume path instead of
+    sleeping until the next pre-open and abandoning a live trade. Bounded to the
+    session window [08:45, _RESUME_CUTOFF] so we never spuriously fire pre-open
+    (the normal sleep handles that) or after the stale-exit deadline.
+    """
+    from datetime import datetime as _datetime
+    from zoneinfo import ZoneInfo
+
+    ist = ZoneInfo("Asia/Kolkata")
+    now = _datetime.now(tz=ist)
+    open_t = _datetime.combine(session_date, _parse_ist_time("08:45:00"), tzinfo=ist)
+    cutoff = _datetime.combine(session_date, _parse_ist_time(_RESUME_CUTOFF), tzinfo=ist)
+    if not (open_t <= now <= cutoff):
+        return False
+    try:
+        from scripts.live.run_paper_trading import _load_checkpoint
+        from options_backtest.calendar import is_trading_day
+    except Exception:
+        return False
+    if not is_trading_day(session_date):
+        return False
+    cp = _load_checkpoint(live_root, session_date)
+    return bool(cp and cp.get("open_positions"))
 
 
 async def _engine_progress_watchdog(engine, session_date) -> bool:
@@ -279,17 +316,41 @@ async def _run_integrated_engine(app: FastAPI, live_root: Path) -> None:
     log.info("integrated_engine: supervisor starting; profile=%s", profile_name)
     while True:
         now = _datetime.now(tz=ist)
-        # Wait until 08:45 IST of the next trading day.
-        target = _datetime.combine(now.date(), _time_cls(8, 45), tzinfo=ist)
-        if now >= target:
-            target = target + timedelta(days=1)
-        sleep_s = (target - now).total_seconds()
-        log.info("integrated_engine: sleeping %.0fs until next pre-open at %s", sleep_s, target.isoformat())
-        try:
-            await asyncio.sleep(sleep_s)
-        except asyncio.CancelledError:
-            log.info("integrated_engine: supervisor cancelled")
-            return
+        today = _date.today()
+        # Mid-session restart recovery: if the supervisor (re)starts during the
+        # trading window and finds an open-position checkpoint for today, skip
+        # the sleep-until-next-pre-open and fall straight into the run/resume
+        # block below. Without this, an intraday host reboot (e.g. the 2026-06-05
+        # 12:35 power outage) computes "next pre-open = tomorrow", sleeps ~20h,
+        # and abandons the live position — the checkpoint-resume machinery below
+        # never gets a chance to run. The engine's own run() handles the resumed
+        # positions (skips entry, monitors to 15:20 exit, writes EOD).
+        if _resumable_open_position(live_root, today):
+            log.warning(
+                "integrated_engine: mid-session restart at %s with open-position "
+                "checkpoint for %s — RESUMING now (skipping sleep-until-pre-open)",
+                now.time().isoformat(), today,
+            )
+            _emit_durable_alert(
+                live_root,
+                "warning",
+                "engine",
+                "midsession_resume",
+                f"supervisor restarted mid-session at {now.time().isoformat()}; "
+                f"resuming open position(s) from checkpoint for {today}",
+            )
+        else:
+            # Wait until 08:45 IST of the next trading day.
+            target = _datetime.combine(now.date(), _time_cls(8, 45), tzinfo=ist)
+            if now >= target:
+                target = target + timedelta(days=1)
+            sleep_s = (target - now).total_seconds()
+            log.info("integrated_engine: sleeping %.0fs until next pre-open at %s", sleep_s, target.isoformat())
+            try:
+                await asyncio.sleep(sleep_s)
+            except asyncio.CancelledError:
+                log.info("integrated_engine: supervisor cancelled")
+                return
 
         # Time to potentially trade. Re-read calendar / token state via
         # the same routines the daily orchestrator uses.
