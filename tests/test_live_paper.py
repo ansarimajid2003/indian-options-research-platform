@@ -313,6 +313,7 @@ class LivePaperTests(unittest.TestCase):
 
     def test_health_monitor_skips_token_expiry_alerts_on_non_trading_day(self) -> None:
         async def run_case() -> tuple[bool | None, bool, dict[str, dict]]:
+            import os
             root = Path("tmp_live_tests") / "token_non_trading_day"
             shutil.rmtree(root, ignore_errors=True)
             monitor = HealthMonitor(profile={}, live_root=root)
@@ -323,7 +324,11 @@ class LivePaperTests(unittest.TestCase):
             monitor._session_date = session_date
             monitor._date_str = session_date.strftime("%Y%m%d")
             monitor._alerts_path = root / "alerts" / f"{monitor._date_str}_alerts.jsonl"
-            with patch("scripts.live.health_monitor._ist_time", return_value=time(16, 9)), \
+            # Isolate from any real .env.live on the dev box: the cross-process
+            # token refresh reads DHAN_TOKEN_FILE; point it at a nonexistent path
+            # so the in-memory test token is the one under test.
+            with patch.dict(os.environ, {"DHAN_TOKEN_FILE": str(root / "no_such.env")}), \
+                    patch("scripts.live.health_monitor._ist_time", return_value=time(16, 9)), \
                     patch("scripts.live.health_monitor._now_ist", return_value=datetime(2026, 5, 16, 16, 9, tzinfo=ZoneInfo("Asia/Kolkata"))):
                 result = await monitor._check_token_expiry()
             return result, monitor._alerts_path.exists(), dict(monitor._active_alerts)
@@ -335,6 +340,7 @@ class LivePaperTests(unittest.TestCase):
 
     def test_health_monitor_flags_token_expiry_before_eod_on_trading_day(self) -> None:
         async def run_case() -> dict:
+            import os
             root = Path("tmp_live_tests") / "token_trading_day"
             shutil.rmtree(root, ignore_errors=True)
             monitor = HealthMonitor(profile={}, live_root=root)
@@ -345,7 +351,9 @@ class LivePaperTests(unittest.TestCase):
             monitor._session_date = session_date
             monitor._date_str = session_date.strftime("%Y%m%d")
             monitor._alerts_path = root / "alerts" / f"{monitor._date_str}_alerts.jsonl"
-            with patch("scripts.live.health_monitor._ist_time", return_value=time(9, 1)), \
+            # Isolate from any real .env.live on the dev box (see sibling test).
+            with patch.dict(os.environ, {"DHAN_TOKEN_FILE": str(root / "no_such.env")}), \
+                    patch("scripts.live.health_monitor._ist_time", return_value=time(9, 1)), \
                     patch("scripts.live.health_monitor._now_ist", return_value=datetime(2026, 5, 15, 9, 1, tzinfo=ZoneInfo("Asia/Kolkata"))):
                 await monitor._check_token_expiry()
             return json.loads(monitor._alerts_path.read_text().splitlines()[-1])
@@ -353,6 +361,55 @@ class LivePaperTests(unittest.TestCase):
         alert = asyncio.run(run_case())
         self.assertEqual(alert["component"], "token")
         self.assertEqual(alert["reason"], "token_expires_before_eod")
+
+    def test_health_monitor_adopts_cross_process_renewed_token(self) -> None:
+        """A stale in-memory token must not false-fire when the engine has written
+        a fresh token to .env.live (2026-06-05 regression: 22 false criticals)."""
+        async def run_case() -> tuple[bool | None, bool, dict[str, dict]]:
+            import os
+            root = Path("tmp_live_tests") / "token_cross_process_renew"
+            shutil.rmtree(root, ignore_errors=True)
+            root.mkdir(parents=True, exist_ok=True)
+            monitor = HealthMonitor(profile={}, live_root=root)
+            session_date = date(2026, 5, 15)  # Friday, trading day
+            ist = ZoneInfo("Asia/Kolkata")
+
+            def _jwt(exp_dt: datetime) -> str:
+                body = base64.urlsafe_b64encode(
+                    json.dumps({"exp": int(exp_dt.timestamp())}).encode()
+                ).decode().rstrip("=")
+                return f"header.{body}.sig"
+
+            # In-memory: yesterday's token, already expired at 08:45 today (would
+            # fire token_expires_before_eod when checked against today's EOD).
+            stale_exp = datetime(2026, 5, 15, 8, 45, tzinfo=ist)
+            monitor._access_token = _jwt(stale_exp)
+            # On disk: engine renewed at pre-open — valid until tomorrow morning.
+            fresh_exp = datetime(2026, 5, 16, 8, 45, tzinfo=ist)
+            token_file = root / ".env.live"
+            token_file.write_text(
+                "DHAN_CLIENT_ID=1111\n"
+                f"DHAN_ACCESS_TOKEN={_jwt(fresh_exp)}\n"
+                f"# Token expiry: {fresh_exp.isoformat()}\n"
+            )
+
+            monitor._session_date = session_date
+            monitor._date_str = session_date.strftime("%Y%m%d")
+            monitor._alerts_path = root / "alerts" / f"{monitor._date_str}_alerts.jsonl"
+            with patch.dict(os.environ, {"DHAN_TOKEN_FILE": str(token_file)}), \
+                    patch("scripts.live.health_monitor._ist_time", return_value=time(9, 30)), \
+                    patch("scripts.live.health_monitor._now_ist", return_value=datetime(2026, 5, 15, 9, 30, tzinfo=ist)):
+                result = await monitor._check_token_expiry()
+            adopted = monitor._access_token == _jwt(fresh_exp)
+            return result, adopted, dict(monitor._active_alerts)
+
+        result, adopted, active = asyncio.run(run_case())
+        self.assertTrue(adopted, "monitor should adopt the fresher on-disk token")
+        self.assertTrue(result, "fresh token valid through EOD should pass")
+        self.assertFalse(
+            any("token_expires_before_eod" in k for k in active),
+            f"must not fire token_expires_before_eod after adopting fresh token; active={active}",
+        )
 
     def test_clock_sync_status_flags_high_drift(self) -> None:
         def runner(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str]:

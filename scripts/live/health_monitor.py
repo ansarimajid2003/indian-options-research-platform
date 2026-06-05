@@ -234,6 +234,34 @@ def _jwt_expiry(token: str) -> datetime | None:
         return None
 
 
+def _read_token_from_file(token_file: Path) -> str:
+    """Return the latest DHAN_ACCESS_TOKEN value from a .env-style file, or "".
+
+    The monitor and the paper engine are SEPARATE processes. The engine renews
+    the Dhan token at 08:45 pre-open and rewrites .env.live (renew_token.write_
+    token_file appends a fresh ``DHAN_ACCESS_TOKEN=`` line). The monitor, however,
+    only ever read the token from os.environ at init / its own midnight renewal —
+    so after a cross-process renewal it kept checking the PREVIOUS (now expired)
+    token and fired ``token_expires_before_eod`` all session (2026-06-05: 22 false
+    criticals on a token that was valid until the next morning). Re-reading the
+    file before each expiry check lets the monitor pick up the engine's renewal.
+
+    Reads the LAST ``DHAN_ACCESS_TOKEN=`` line (write_token_file strips old lines
+    and appends, but be robust to any stale duplicates).
+    """
+    try:
+        if not token_file.exists():
+            return ""
+        latest = ""
+        for line in token_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("DHAN_ACCESS_TOKEN="):
+                latest = line.split("=", 1)[1].strip()
+        return latest
+    except Exception:
+        return ""
+
+
 def _write_atomic_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -1140,6 +1168,8 @@ class HealthMonitor:
         if self._token_renewal_last_attempt_mono is not None:
             if now_mono - self._token_renewal_last_attempt_mono < 300.0:
                 return
+        # Pick up any cross-process renewal before deciding to renew ourselves.
+        self._refresh_access_token_from_file()
         # Already valid for the full session — nothing to do.
         if self._access_token:
             exp = _jwt_expiry(self._access_token)
@@ -1175,7 +1205,33 @@ class HealthMonitor:
                     f"Dhan token renewal failed after 2 attempts — manual intervention required: {exc!s:.100}",
                 )
 
+    def _refresh_access_token_from_file(self) -> None:
+        """Adopt a newer DHAN_ACCESS_TOKEN written by the engine to .env.live.
+
+        The engine (separate process) renews the token at pre-open and rewrites
+        the token file; the monitor must re-read it or it keeps checking the
+        previous (expired) token and false-fires ``token_expires_before_eod``
+        (2026-06-05, 22 alerts). Only adopt a token that parses to a LATER expiry
+        than the one in memory, so a malformed/partial file write can never make
+        us drop a good token.
+        """
+        token_file = Path(os.environ.get("DHAN_TOKEN_FILE", str(_DEFAULT_TOKEN_FILE)))
+        file_token = _read_token_from_file(token_file)
+        if not file_token or file_token == self._access_token:
+            return
+        file_exp = _jwt_expiry(file_token)
+        if file_exp is None:
+            return
+        cur_exp = _jwt_expiry(self._access_token) if self._access_token else None
+        if cur_exp is None or file_exp > cur_exp:
+            self._access_token = file_token
+            _log.info("adopted refreshed Dhan token from %s (expiry=%s)", token_file, file_exp.isoformat())
+
     async def _check_token_expiry(self) -> bool | None:
+        # Pick up a cross-process renewal first: the paper engine renews the token
+        # at pre-open and rewrites .env.live. Without re-reading it the monitor
+        # checks the previous (expired) token and false-fires (2026-06-05).
+        self._refresh_access_token_from_file()
         if not self._access_token:
             return None
         if not _is_trading_day(self._session_date):
