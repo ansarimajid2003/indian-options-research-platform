@@ -1568,6 +1568,134 @@ class HealthMonitor:
         await self._send_telegram(msg, severity="info")
         _log.info("eod summary written: %s", self._uptime_summary_path)
 
+        # Second EOD message: the actual trading outcome (what we traded + PnL).
+        # The health summary above is about reliability; the operator also wants
+        # to see the day's trades and session PnL at a glance.
+        await self._send_trading_outcome(paper_trades)
+
+        # Sanity check the post-engine ledger update actually ran. On 2026-06-08
+        # the engine recorded a clean +1,952.91 win (paper_trades JSON + EOD
+        # report written) but the supervisor hung in teardown and never appended
+        # the account-ledger row — silently, with HTTP 200 the whole time. If a
+        # completed-trade session has no matching ledger row by EOD, that is a
+        # wedged supervisor / starved ledger update; alert on it loudly.
+        await self._check_ledger_row_present(paper_trades)
+
+    def _load_session_trades(self, paper_trades: Path) -> list[dict]:
+        """Closed-trade records for today, or [] if none / unreadable."""
+        if not paper_trades.exists():
+            return []
+        try:
+            raw = json.loads(paper_trades.read_text(encoding="utf-8"))
+        except Exception:
+            _log.warning("could not parse paper_trades %s", paper_trades, exc_info=True)
+            return []
+        return raw if isinstance(raw, list) else []
+
+    async def _send_trading_outcome(self, paper_trades: Path) -> None:
+        trades = self._load_session_trades(paper_trades)
+        if not trades:
+            # No trade is a legitimate, common outcome (DTE/VIX filters); still
+            # report it so a silent no-trade day is distinguishable from a failure.
+            await self._send_telegram(
+                f"[EOD] Trading outcome {self._session_date}\n"
+                f"No trades taken today (all symbols filtered/skipped or no qualifying entry).",
+                severity="info",
+            )
+            return
+
+        def _num(t: dict, key: str) -> float:
+            # A null / missing / non-numeric field must never crash the EOD
+            # summary loop (it would silently kill the summary + ledger check for
+            # the rest of the session).
+            try:
+                v = t.get(key, 0.0)
+                return float(v) if v is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        total_gross = sum(_num(t, "gross_pnl") for t in trades)
+        total_charges = sum(_num(t, "charges") for t in trades)
+        total_net = sum(_num(t, "net_pnl") for t in trades)
+        wins = sum(1 for t in trades if _num(t, "net_pnl") > 0)
+
+        lines = [
+            f"[EOD] Trading outcome {self._session_date}",
+            f"Trades: {len(trades)} | Wins: {wins}/{len(trades)}",
+            f"Gross: {total_gross:+,.2f} | Charges: {total_charges:,.2f} | Net: {total_net:+,.2f}",
+        ]
+        for t in trades:
+            sym = t.get("symbol", "?")
+            net = _num(t, "net_pnl")
+            credit = _num(t, "entry_credit")
+            exit_reason = t.get("exit_reason", "?")
+            lines.append(f"- {sym}: net {net:+,.2f} (credit {credit:,.2f}, exit {exit_reason})")
+
+        # Running account context, if the ledger has been updated.
+        state = self._read_account_state()
+        if state is not None:
+            try:
+                bal = float(state.get("current_balance", 0.0) or 0.0)
+                allt = float(state.get("all_time_net_pnl", 0.0) or 0.0)
+                lines.append(f"Balance: {bal:,.2f} | All-time: {allt:+,.2f}")
+            except (TypeError, ValueError):
+                pass
+
+        await self._send_telegram("\n".join(lines), severity="info")
+        _log.info("trading outcome sent: %d trade(s), net=%.2f", len(trades), total_net)
+
+    def _read_account_state(self) -> dict | None:
+        state_path = self._live_root / "account" / "latest_account_state.json"
+        if not state_path.exists():
+            return None
+        try:
+            return json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _ledger_has_row_for_today(self) -> bool:
+        ledger_path = self._live_root / "account" / "account_ledger.jsonl"
+        if not ledger_path.exists():
+            return False
+        iso = self._session_date.isoformat()
+        try:
+            lines = ledger_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            _log.warning("could not read account ledger for row check", exc_info=True)
+            return False
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Tolerate a single malformed line (e.g. a partial write) rather than
+            # aborting the whole scan — a valid row elsewhere must still count, or
+            # we'd fire a false ledger_row_missing critical.
+            try:
+                if json.loads(line).get("session_date") == iso:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _check_ledger_row_present(self, paper_trades: Path) -> None:
+        trades = self._load_session_trades(paper_trades)
+        if not trades:
+            # No completed trades → no ledger row expected. Not an anomaly.
+            return
+        if self._ledger_has_row_for_today():
+            return
+        # Completed trades exist but the ledger has no row for today — the
+        # supervisor's post-engine ledger update did not run (likely a wedged
+        # teardown). This is the alert that was missing on 2026-06-08.
+        await self._alert(
+            "critical",
+            "engine",
+            "ledger_row_missing",
+            f"{len(trades)} completed trade(s) for {self._session_date} but no "
+            f"account-ledger row — supervisor post-engine ledger update did not run "
+            f"(possible wedged teardown; check live-stack / restart if engine not re-armed)",
+        )
+
     def _data_gap_minutes(self) -> float:
         gap_path = self._live_root / "alerts" / f"{self._date_str}_gaps.jsonl"
         if not gap_path.exists():

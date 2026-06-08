@@ -1758,5 +1758,175 @@ class OptionChainMetaTests(unittest.TestCase):
             self.assertEqual(row["pe"]["ltp"], 92.10)
 
 
+class EODTradingOutcomeTests(unittest.TestCase):
+    """EOD trading-outcome Telegram message + ledger-row-missing detection.
+
+    Regression coverage for the 2026-06-08 wedged-teardown defect: a clean
+    completed-trade session whose account-ledger row was never written must
+    raise a ``ledger_row_missing`` critical, and the operator must get a
+    second EOD message showing the day's trades + PnL.
+    """
+
+    def _make_monitor(self, name: str) -> "HealthMonitor":
+        root = Path("tmp_live_tests") / name
+        shutil.rmtree(root, ignore_errors=True)
+        monitor = HealthMonitor(profile={}, live_root=root)
+        monitor._session_date = date(2026, 6, 8)
+        monitor._date_str = "20260608"
+        monitor._alerts_path = root / "alerts" / "20260608_alerts.jsonl"
+        return monitor
+
+    def _write_trades(self, monitor: "HealthMonitor", trades: list[dict]) -> Path:
+        pt = monitor._live_root / "paper_trades" / "20260608.json"
+        pt.parent.mkdir(parents=True, exist_ok=True)
+        pt.write_text(json.dumps(trades), encoding="utf-8")
+        return pt
+
+    def _write_ledger_row(self, monitor: "HealthMonitor") -> None:
+        led = monitor._live_root / "account" / "account_ledger.jsonl"
+        led.parent.mkdir(parents=True, exist_ok=True)
+        led.write_text(json.dumps({"session_date": "2026-06-08", "net_pnl": 1952.91}) + "\n", encoding="utf-8")
+
+    def test_trading_outcome_message_lists_trades_and_pnl(self) -> None:
+        async def run_case() -> list[str]:
+            monitor = self._make_monitor("eod_outcome_with_trade")
+            pt = self._write_trades(monitor, [{
+                "symbol": "NIFTY", "net_pnl": 1952.91, "gross_pnl": 2073.5,
+                "charges": 120.59, "entry_credit": 8154.25, "exit_reason": "time_exit",
+            }])
+            sent: list[str] = []
+            with patch.object(monitor, "_send_telegram", new=AsyncMock(side_effect=lambda text, **k: sent.append(text))):
+                await monitor._send_trading_outcome(pt)
+            return sent
+
+        sent = asyncio.run(run_case())
+        self.assertEqual(len(sent), 1)
+        msg = sent[0]
+        self.assertIn("Trading outcome 2026-06-08", msg)
+        self.assertIn("Trades: 1 | Wins: 1/1", msg)
+        self.assertIn("NIFTY", msg)
+        self.assertIn("1,952.91", msg)
+        self.assertIn("time_exit", msg)
+
+    def test_trading_outcome_message_reports_no_trade_day(self) -> None:
+        async def run_case() -> list[str]:
+            monitor = self._make_monitor("eod_outcome_no_trade")
+            pt = monitor._live_root / "paper_trades" / "20260608.json"  # absent
+            sent: list[str] = []
+            with patch.object(monitor, "_send_telegram", new=AsyncMock(side_effect=lambda text, **k: sent.append(text))):
+                await monitor._send_trading_outcome(pt)
+            return sent
+
+        sent = asyncio.run(run_case())
+        self.assertEqual(len(sent), 1)
+        self.assertIn("No trades taken today", sent[0])
+
+    def test_ledger_row_missing_raises_critical_for_completed_trade(self) -> None:
+        async def run_case() -> dict:
+            monitor = self._make_monitor("eod_ledger_missing")
+            pt = self._write_trades(monitor, [{"symbol": "NIFTY", "net_pnl": 1952.91}])
+            # No ledger row written → the wedged-teardown signature.
+            with patch.object(monitor, "_send_telegram", new=AsyncMock()):
+                await monitor._check_ledger_row_present(pt)
+            return dict(monitor._active_alerts)
+
+        active = asyncio.run(run_case())
+        keys = list(active.keys())
+        self.assertTrue(any("ledger_row_missing" in k for k in keys), keys)
+        alert = next(v for v in active.values() if v["reason"] == "ledger_row_missing")
+        self.assertEqual(alert["severity"], "critical")
+
+    def test_ledger_row_present_no_alert(self) -> None:
+        async def run_case() -> dict:
+            monitor = self._make_monitor("eod_ledger_present")
+            pt = self._write_trades(monitor, [{"symbol": "NIFTY", "net_pnl": 1952.91}])
+            self._write_ledger_row(monitor)
+            with patch.object(monitor, "_send_telegram", new=AsyncMock()):
+                await monitor._check_ledger_row_present(pt)
+            return dict(monitor._active_alerts)
+
+        active = asyncio.run(run_case())
+        self.assertEqual(active, {})
+
+    def test_ledger_row_present_tolerates_malformed_line(self) -> None:
+        async def run_case() -> dict:
+            monitor = self._make_monitor("eod_ledger_malformed")
+            pt = self._write_trades(monitor, [{"symbol": "NIFTY", "net_pnl": 1952.91}])
+            led = monitor._live_root / "account" / "account_ledger.jsonl"
+            led.parent.mkdir(parents=True, exist_ok=True)
+            # A partial/garbage line followed by the valid row — must still count.
+            led.write_text(
+                '{"session_date": "2026-06-03", "net_pnl": -931}\n'
+                'this is not json{{{\n'
+                + json.dumps({"session_date": "2026-06-08", "net_pnl": 1952.91}) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(monitor, "_send_telegram", new=AsyncMock()):
+                await monitor._check_ledger_row_present(pt)
+            return dict(monitor._active_alerts)
+
+        active = asyncio.run(run_case())
+        self.assertEqual(active, {})
+
+    def test_trading_outcome_tolerates_null_pnl_field(self) -> None:
+        async def run_case() -> list[str]:
+            monitor = self._make_monitor("eod_outcome_null_pnl")
+            pt = self._write_trades(monitor, [{
+                "symbol": "NIFTY", "net_pnl": None, "gross_pnl": "bad",
+                "charges": 10.0, "entry_credit": 8154.25, "exit_reason": "time_exit",
+            }])
+            sent: list[str] = []
+            with patch.object(monitor, "_send_telegram", new=AsyncMock(side_effect=lambda text, **k: sent.append(text))):
+                await monitor._send_trading_outcome(pt)  # must not raise
+            return sent
+
+        sent = asyncio.run(run_case())
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Trading outcome", sent[0])
+
+    def test_ledger_check_skips_no_trade_day(self) -> None:
+        async def run_case() -> dict:
+            monitor = self._make_monitor("eod_ledger_no_trade")
+            pt = monitor._live_root / "paper_trades" / "20260608.json"  # absent
+            with patch.object(monitor, "_send_telegram", new=AsyncMock()):
+                await monitor._check_ledger_row_present(pt)
+            return dict(monitor._active_alerts)
+
+        active = asyncio.run(run_case())
+        self.assertEqual(active, {})
+
+
+class CollectorTeardownTests(unittest.TestCase):
+    """The depth heartbeat loop must stop promptly on cancellation.
+
+    Regression coverage for the 2026-06-08 hang where ``_depth_snapshot_loop``
+    kept emitting heartbeats after cancel because the cancel handler awaited it
+    without cancelling it first.
+    """
+
+    def test_depth_snapshot_loop_stops_on_cancel(self) -> None:
+        from scripts.live.collect_order_book import _depth_snapshot_loop
+
+        async def run_case() -> bool:
+            root = Path("tmp_live_tests") / "snapshot_loop_cancel"
+            shutil.rmtree(root, ignore_errors=True)
+            (root / "snapshots").mkdir(parents=True, exist_ok=True)
+            depth_cache = DepthCache()
+            task = asyncio.create_task(_depth_snapshot_loop(
+                root, "20260608", depth_cache, [], {}, interval_seconds=0.05,
+            ))
+            await asyncio.sleep(0.12)  # let it spin at least once
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=2.0)
+            except asyncio.CancelledError:
+                return True
+            except asyncio.TimeoutError:
+                return False
+            return task.cancelled()
+
+        self.assertTrue(asyncio.run(run_case()))
+
+
 if __name__ == "__main__":
     unittest.main()

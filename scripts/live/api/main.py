@@ -136,6 +136,13 @@ _ENGINE_MAX_RELAUNCHES = int(os.environ.get("ENGINE_MAX_RELAUNCHES", "1"))
 # generous for a single-session append.
 _ACCOUNT_LEDGER_TIMEOUT_SECONDS = float(os.environ.get("ACCOUNT_LEDGER_TIMEOUT_SECONDS", "15.0"))
 
+# Hard cap on tearing down the pending (collector / watchdog) tasks after the
+# engine task completes. Must be >= the collector's own teardown bound
+# (COLLECTOR_TEARDOWN_TIMEOUT, default 30s) so the collector normally finishes
+# first; this is the supervisor-side safety net that guarantees the post-engine
+# account-ledger update + next-day re-arm always run (2026-06-08 hang fix).
+_ENGINE_TEARDOWN_TIMEOUT = float(os.environ.get("ENGINE_TEARDOWN_TIMEOUT", "45.0"))
+
 # Wall-clock time by which a healthy engine must have advanced past the early
 # (connecting) phases. The engine reaches chain_fetch ~09:15 and writes the
 # pre-entry gate at 09:18:30; if by this deadline it is still in an early phase
@@ -495,7 +502,38 @@ async def _run_integrated_engine(app: FastAPI, live_root: Path) -> None:
                             )
                 for t in pending:
                     t.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+                # BOUND the teardown. A pending task that does not honour
+                # cancellation promptly (the collector's heartbeat loop sits in
+                # non-cancellable `asyncio.to_thread` writes) must NOT be able to
+                # pin this coroutine — on 2026-06-08 an unbounded
+                # `gather(*pending)` here blocked forever after a clean EOD, so
+                # the account-ledger update + next-day re-arm below were never
+                # reached (the engine ran the full session and recorded a +1,952.91
+                # win, but the durable balance stayed frozen and the supervisor
+                # never re-armed). The collector itself now also bounds its own
+                # teardown (collect_order_book.py); this is the belt-and-braces
+                # supervisor-side cap so a stuck child can never starve the two
+                # post-engine duties.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=_ENGINE_TEARDOWN_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.error(
+                        "integrated_engine: teardown of pending tasks timed out "
+                        "after %.1fs — proceeding to ledger update / re-arm "
+                        "(a child task may be orphaned until process restart)",
+                        _ENGINE_TEARDOWN_TIMEOUT,
+                    )
+                    _emit_durable_alert(
+                        live_root,
+                        "warning",
+                        "engine",
+                        "teardown_timeout",
+                        f"post-engine teardown exceeded {_ENGINE_TEARDOWN_TIMEOUT:.0f}s; "
+                        "ledger update + re-arm proceeded anyway",
+                    )
             finally:
                 try:
                     engine.close()

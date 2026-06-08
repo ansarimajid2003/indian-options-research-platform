@@ -100,6 +100,11 @@ _PING_INTERVAL = 10         # seconds between server pings
 _WRITER_QUEUE_MAX_ITEMS = 100_000
 _WRITER_STOP_TIMEOUT = 10.0
 _WRITER_DROP_LOG_INTERVAL = 30.0
+# Hard upper bound on how long the collector teardown (cancel-then-gather of the
+# DepthCollector + heartbeat tasks) may take. A non-cancellable `to_thread` write
+# can briefly outlive a cancel; this bound guarantees the coroutine returns so the
+# supervisor's own teardown + ledger update are never starved (2026-06-08 hang).
+_COLLECTOR_TEARDOWN_TIMEOUT = float(os.environ.get("COLLECTOR_TEARDOWN_TIMEOUT", "25.0"))
 _ATOMIC_WRITE_LOCKS: dict[Path, threading.Lock] = {}
 _ATOMIC_WRITE_LOCKS_GUARD = threading.Lock()
 
@@ -640,20 +645,31 @@ async def _depth_snapshot_loop(
     interval_seconds: float = 10.0,
     event_log: "EventLog | None" = None,
 ) -> None:
-    while True:
-        await asyncio.to_thread(_write_depth_cache_snapshot, live_root, date_str, depth_cache, security_ids, id_to_meta, event_log)
-        writer_status = writer_status_getter() if writer_status_getter else None
-        await asyncio.to_thread(
-            _write_collector_state,
-            live_root,
-            date_str,
-            "running",
-            security_ids,
-            configured_symbols,
-            failed_symbols,
-            writer_status,
-        )
-        await asyncio.sleep(interval_seconds)
+    # Cancellation-responsive heartbeat loop. The two `to_thread` writes are NOT
+    # interruptible (a `CancelledError` cannot interrupt a running worker thread),
+    # so cancellation is only ever delivered at one of the `await` points. We keep
+    # the loop bounded by checking for cancellation explicitly and re-raising so a
+    # cancel issued by the supervisor at EOD tears this loop down promptly rather
+    # than letting it spin forever (the 2026-06-08 hang). See the cancel handler
+    # in `collect_order_book` for the companion fix.
+    try:
+        while True:
+            await asyncio.to_thread(_write_depth_cache_snapshot, live_root, date_str, depth_cache, security_ids, id_to_meta, event_log)
+            writer_status = writer_status_getter() if writer_status_getter else None
+            await asyncio.to_thread(
+                _write_collector_state,
+                live_root,
+                date_str,
+                "running",
+                security_ids,
+                configured_symbols,
+                failed_symbols,
+                writer_status,
+            )
+            await asyncio.sleep(interval_seconds)
+    except asyncio.CancelledError:
+        # Normal shutdown path — stop emitting heartbeats immediately.
+        raise
 
 
 class DepthCollector:
@@ -1167,22 +1183,55 @@ async def collect_order_book(
         for task in done:
             await task
     except asyncio.CancelledError:
+        # On cancellation we MUST cancel the child tasks before gathering — the
+        # `_depth_snapshot_loop` is a bare `while True:` with no other stop signal
+        # (`collector.stop()` only stops the DepthCollector = tasks[0]). Awaiting
+        # `gather(*tasks)` without cancelling tasks[1:] first waits for that loop
+        # to finish *naturally*, which it never does — it just keeps emitting
+        # depth_heartbeat events forever. That is exactly the 2026-06-08 hang:
+        # the supervisor cancelled this coroutine at EOD, this handler blocked on
+        # the never-ending snapshot loop, and the supervisor's own
+        # `gather(*pending)` (api/main.py) never returned → the account-ledger
+        # update + next-day re-arm were starved. Cancel everything, then gather
+        # with a bound so a stuck `to_thread` can't pin us either.
+        # Tasks already cancelled here — they are also cancelled in `finally`,
+        # so just propagate; the bounded gather lives in `finally` (single budget)
+        # to avoid double-spending the teardown window and overrunning the
+        # supervisor's own ENGINE_TEARDOWN_TIMEOUT (reviewer 2026-06-09).
         collector.stop()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
         raise
     finally:
+        # Single teardown budget. The whole collector shutdown (collector-task
+        # drain + heartbeat-loop cancel + stopped-state write) must finish well
+        # inside the supervisor's ENGINE_TEARDOWN_TIMEOUT (default 45s) so the
+        # supervisor's bounded gather(*pending) never has to time out and orphan
+        # us. We share one wall-clock deadline across the steps below.
+        teardown_deadline = _time.monotonic() + _COLLECTOR_TEARDOWN_TIMEOUT
+
+        def _remaining() -> float:
+            return max(0.5, teardown_deadline - _time.monotonic())
+
         collector.stop()
         collector_task = tasks[0]
         if not collector_task.done():
             try:
-                await asyncio.wait_for(collector_task, timeout=_WRITER_STOP_TIMEOUT + 5.0)
+                await asyncio.wait_for(collector_task, timeout=min(_WRITER_STOP_TIMEOUT + 5.0, _remaining()))
             except asyncio.TimeoutError:
                 _log.error("collect_order_book: collector stop timed out; cancelling task")
                 collector_task.cancel()
         for task in tasks[1:]:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=_remaining(),
+            )
+        except asyncio.TimeoutError:
+            _log.error("collect_order_book: finally gather timed out during teardown")
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
@@ -1195,7 +1244,7 @@ async def collect_order_book(
                     failed_symbols,
                     collector.writer_status(),
                 ),
-                timeout=5.0,
+                timeout=min(5.0, _remaining()),
             )
         except asyncio.TimeoutError:
             _log.error("collect_order_book: stopped-state write timed out")
